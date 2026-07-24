@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# uku — the Uku command-line client.
+# A thin, dependency-light wrapper over the Uku public API v3
+# (https://app.getuku.com/api/v3). Gives terminals, scripts, CI, and coding
+# agents (Claude Code, Cursor, Codex) a native way to operate a firm's Uku data
+# within the exact permissions of the API key you hand it.
+#
+# Design goals:
+#   • Portable: bash + curl only. `jq` is used for pretty output if present,
+#     never required (raw JSON is always available with --json).
+#   • Safe: credentials stored 0600; the key is never printed; writes are
+#     deliberate (a non-interactive write needs --yes); money needs an All key,
+#     which the API — not this CLI — enforces.
+#   • Agent-friendly: --json is the default when stdout is not a TTY, stable
+#     exit codes, and `uku api` passes through to any endpoint.
+set -euo pipefail
+
+UKU_VERSION="0.1.0"
+UKU_BASE_DEFAULT="https://app.getuku.com"
+UKU_CONFIG_HOME="${UKU_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/uku}"
+UKU_CRED_FILE="$UKU_CONFIG_HOME/credentials"
+
+# ── Exit codes (stable) ──────────────────────────────────────────────
+EX_OK=0        # success
+EX_USAGE=1     # bad usage / unknown command
+EX_AUTH=2      # not authenticated / auth rejected
+EX_API=3       # API returned an error status
+EX_CONFIRM=4   # a deliberate write was refused (no --yes, no TTY)
+
+# ── Small helpers ────────────────────────────────────────────────────
+_is_tty()  { [ -t 1 ]; }
+_color()   { if _is_tty && [ -z "${NO_COLOR:-}" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
+_bold()    { _color "1" "$1"; }
+_green()   { _color "32" "$1"; }
+_red()     { _color "31" "$1"; }
+_dim()     { _color "2" "$1"; }
+info()  { printf '%s %s\n' "$(_green '✓')" "$1" >&2; }
+warn()  { printf '%s %s\n' "$(_color 33 '!')" "$1" >&2; }
+die()   { printf '%s %s\n' "$(_red '✗')" "$1" >&2; exit "${2:-$EX_USAGE}"; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+
+require_curl() { have curl || die "curl is required but not installed." "$EX_USAGE"; }
+
+# ── Config / credentials ─────────────────────────────────────────────
+# Precedence: environment variables > stored credentials file.
+load_creds() {
+  UKU_BASE="${UKU_BASE_URL:-$UKU_BASE_DEFAULT}"
+  UKU_COMPANY="${UKU_COMPANY:-}"
+  UKU_KEY="${UKU_API_KEY:-}"
+  if [ -f "$UKU_CRED_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$UKU_CRED_FILE"
+    UKU_BASE="${UKU_BASE_URL:-${UKU_BASE:-$UKU_BASE_DEFAULT}}"
+    UKU_COMPANY="${UKU_COMPANY_ENV:-${UKU_COMPANY:-}}"
+    UKU_KEY="${UKU_KEY_ENV:-${UKU_KEY:-}}"
+    # env always wins
+    [ -n "${UKU_BASE_URL:-}" ] && UKU_BASE="$UKU_BASE_URL"
+    [ -n "${UKU_COMPANY_OVERRIDE:-}" ] && UKU_COMPANY="$UKU_COMPANY_OVERRIDE"
+    [ -n "${UKU_API_KEY:-}" ] && UKU_KEY="$UKU_API_KEY"
+  fi
+  [ -n "${UKU_BASE_CLI:-}" ] && UKU_BASE="$UKU_BASE_CLI"
+  return 0
+}
+
+save_creds() {
+  mkdir -p "$UKU_CONFIG_HOME"
+  umask 077
+  cat > "$UKU_CRED_FILE" <<EOF
+# Uku CLI credentials — keep this file private (mode 0600).
+UKU_BASE="$1"
+UKU_COMPANY="$2"
+UKU_KEY="$3"
+EOF
+  chmod 600 "$UKU_CRED_FILE"
+}
+
+need_auth() {
+  [ -n "${UKU_COMPANY:-}" ] && [ -n "${UKU_KEY:-}" ] && return 0
+  die "Not authenticated. Run: uku auth login  (or set UKU_COMPANY + UKU_API_KEY)." "$EX_AUTH"
+}
+
+# ── HTTP core ────────────────────────────────────────────────────────
+# do_request METHOD PATH [DATA]  →  sets REPLY_BODY + REPLY_STATUS in the
+# CURRENT shell (never call this inside $( ) — a subshell would swallow the
+# status). Adds the two auth headers.
+REPLY_BODY=""
+REPLY_STATUS=0
+do_request() {
+  local method="$1" path="$2" data="${3:-}"
+  local url="$UKU_BASE$path"
+  local tmp; tmp="$(mktemp)"
+  local -a args=(-sS -X "$method" "$url"
+    -H "X-Uku-Company: $UKU_COMPANY"
+    -H "X-API-Key: $UKU_KEY"
+    -H "Accept: application/json"
+    -H "User-Agent: uku-cli/$UKU_VERSION"
+    -w '%{http_code}' -o "$tmp")
+  if [ -n "$data" ]; then
+    args+=(-H "Content-Type: application/json" --data-binary "$data")
+  fi
+  REPLY_STATUS="$(curl "${args[@]}")" || { rm -f "$tmp"; die "network error contacting $UKU_BASE" "$EX_API"; }
+  REPLY_BODY="$(cat "$tmp")"; rm -f "$tmp"
+  return 0
+}
+
+# render BODY  — pretty JSON when jq is present and TTY; raw otherwise.
+render() {
+  local body="$1"
+  if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then
+    printf '%s\n' "$body"; return
+  fi
+  if have jq; then printf '%s\n' "$body" | jq .; else printf '%s\n' "$body"; fi
+}
+
+# table BODY COL1 COL2 ...  — compact table of .data[] fields when jq present.
+table() {
+  local body="$1"; shift
+  if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty || ! have jq; then
+    render "$body"; return
+  fi
+  local hdr="" jqfields=""
+  for f in "$@"; do hdr="$hdr$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')\t"; jqfields="$jqfields (.$f // \"-\"),"; done
+  jqfields="[${jqfields%,}] | @tsv"
+  { printf '%b\n' "$(_bold "${hdr%\\t}")"
+    printf '%s' "$body" | jq -r ".data[]? | $jqfields" 2>/dev/null || printf '%s' "$body" | jq -r "$jqfields" 2>/dev/null
+  } | column -t -s "$(printf '\t')"
+}
+
+# check_status BODY — die with a helpful message on 4xx/5xx (uses REPLY_STATUS).
+check_status() {
+  local body="$1" s="$REPLY_STATUS"
+  case "$s" in
+    2*) return 0 ;;
+    401|403)
+      local msg; msg="$(printf '%s' "$body" | (have jq && jq -r '.error // .message // .code // empty' 2>/dev/null || true))"
+      if printf '%s' "$body" | grep -qi 'scope\|financial\|FINANCIAL_SCOPE'; then
+        warn "$(_bold "HTTP $s") — this key can't perform that action."
+        warn "Financial actions need an All-scope key; read/operate keys can't touch money."
+      else
+        warn "$(_bold "HTTP $s") — ${msg:-authentication or permission denied.}"
+      fi
+      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
+    *)
+      warn "$(_bold "HTTP $s") — request failed."
+      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
+  esac
+}
+
+# confirm_write ACTION — deliberate-write gate.
+confirm_write() {
+  [ "${UKU_YES:-0}" = "1" ] && return 0
+  if ! _is_tty; then
+    die "Refusing a non-interactive write ($1). Re-run with --yes to confirm." "$EX_CONFIRM"
+  fi
+  printf '%s %s [y/N] ' "$(_bold 'Confirm write:')" "$1" >&2
+  read -r reply < /dev/tty || true
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) die "Cancelled." "$EX_CONFIRM" ;; esac
+}
+
+# build_query k=v ...  → "?k=v&k2=v2" (URL-encoded values)
+build_query() {
+  local q=""
+  for kv in "$@"; do
+    local k="${kv%%=*}" v="${kv#*=}"
+    [ "$k" = "$kv" ] && continue
+    v="$(printf '%s' "$v" | curl -Gso /dev/null -w '%{url_effective}' --data-urlencode @- "" 2>/dev/null | sed 's/^[?]//')" || v="${kv#*=}"
+    q="$q&$k=$v"
+  done
+  [ -n "$q" ] && printf '?%s' "${q#&}"
+  return 0
+}
+
+# read_data ARG  — resolve --data value: @file, @- (stdin), or literal JSON.
+read_data() {
+  case "$1" in
+    @-) cat ;;
+    @*) local f="${1#@}"; [ -f "$f" ] || die "data file not found: $f" "$EX_USAGE"; cat "$f" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ── Commands ─────────────────────────────────────────────────────────
+cmd_auth() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    login)
+      load_creds
+      local base="${UKU_BASE:-$UKU_BASE_DEFAULT}" company key
+      printf 'Uku base URL [%s]: ' "$base" >&2; read -r reply < /dev/tty || true; [ -n "$reply" ] && base="$reply"
+      printf 'Company UUID (Settings → API): ' >&2; read -r company < /dev/tty || true
+      [ -n "$company" ] || die "Company UUID is required." "$EX_USAGE"
+      printf 'API key (uku_live_…): ' >&2
+      if _is_tty; then stty -echo 2>/dev/null || true; fi
+      read -r key < /dev/tty || true
+      if _is_tty; then stty echo 2>/dev/null || true; printf '\n' >&2; fi
+      [ -n "$key" ] || die "API key is required." "$EX_USAGE"
+      # validate before saving — try an authenticated endpoint (members)
+      UKU_BASE="$base"; UKU_COMPANY="$company"; UKU_KEY="$key"
+      do_request GET /api/v3/members
+      case "$REPLY_STATUS" in
+        2*) : ;;
+        401|403) die "Those credentials were rejected (HTTP $REPLY_STATUS). Nothing saved." "$EX_AUTH" ;;
+        *) warn "Could not verify credentials (HTTP $REPLY_STATUS) — saving anyway." ;;
+      esac
+      save_creds "$base" "$company" "$key"
+      info "Signed in. Key stored in $UKU_CRED_FILE (mode 0600)."
+      ;;
+    status)
+      load_creds
+      [ -n "${UKU_KEY:-}" ] || { warn "Not signed in. Run: uku auth login"; exit "$EX_AUTH"; }
+      local masked="${UKU_KEY:0:9}…${UKU_KEY: -4}"
+      do_request GET /api/v3/members
+      if [ "${REPLY_STATUS:0:1}" = "2" ]; then
+        info "Signed in to $(_bold "$UKU_BASE")"
+        printf '  company: %s\n  key:     %s  %s\n' "$UKU_COMPANY" "$masked" "$(_green 'valid')" >&2
+      else
+        warn "Credentials stored but the API rejected them (HTTP $REPLY_STATUS)"
+        printf '  company: %s\n  key:     %s\n' "$UKU_COMPANY" "$masked" >&2
+        exit "$EX_AUTH"
+      fi
+      ;;
+    logout)
+      rm -f "$UKU_CRED_FILE" && info "Signed out (removed $UKU_CRED_FILE)." || warn "No stored credentials."
+      ;;
+    *) die "Unknown: uku auth $sub  (login|status|logout)" "$EX_USAGE" ;;
+  esac
+}
+
+# generic list helper: list_resource PATH COL...
+list_resource() {
+  local path="$1"; shift
+  local -a cols=("$@")
+  load_creds; need_auth
+  local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
+  do_request GET "$path$q"
+  check_status "$REPLY_BODY"
+  if [ "${#cols[@]}" -gt 0 ]; then table "$REPLY_BODY" "${cols[@]}"; else render "$REPLY_BODY"; fi
+}
+
+get_resource() {
+  local path="$1"
+  load_creds; need_auth
+  do_request GET "$path"
+  check_status "$REPLY_BODY"; render "$REPLY_BODY"
+}
+
+cmd_clients() {
+  case "${1:-list}" in
+    list) shift || true; parse_list_flags "$@"; list_resource /api/v3/clients id name status type ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku clients get <client_id>" "$EX_USAGE"; get_resource "/api/v3/clients/$2" ;;
+    *) die "usage: uku clients <list|get>" "$EX_USAGE" ;;
+  esac
+}
+cmd_tasks() {
+  case "${1:-list}" in
+    list) shift || true; parse_list_flags "$@"; list_resource /api/v3/tasks id title status client_id ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id>" "$EX_USAGE"; get_resource "/api/v3/tasks/$2" ;;
+    *) die "usage: uku tasks <list|get>" "$EX_USAGE" ;;
+  esac
+}
+cmd_time() {
+  case "${1:-list}" in
+    list) shift || true; parse_list_flags "$@"; list_resource /api/v3/time-entries id date minutes client_id ;;
+    *) die "usage: uku time list" "$EX_USAGE" ;;
+  esac
+}
+cmd_invoices() {
+  case "${1:-list}" in
+    list) shift || true; parse_list_flags "$@"; list_resource /api/v3/invoices id invoice_number status client_id ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku invoices get <invoice_id>" "$EX_USAGE"; get_resource "/api/v3/invoices/$2" ;;
+    create)
+      shift || true; parse_list_flags "$@"
+      [ -n "${UKU_DATA:-}" ] || die "usage: uku invoices create --data @file.json  (or --data '{...}')" "$EX_USAGE"
+      load_creds; need_auth
+      local payload; payload="$(read_data "$UKU_DATA")"
+      confirm_write "create an invoice"
+      do_request POST /api/v3/invoices "$payload"
+      check_status "$REPLY_BODY"; render "$REPLY_BODY"; info "Invoice created." ;;
+    *) die "usage: uku invoices <list|get|create>" "$EX_USAGE" ;;
+  esac
+}
+
+cmd_api() {
+  # uku api METHOD PATH [--data X] [--query k=v]...
+  local method="${1:-}" path="${2:-}"; shift 2 || true
+  [ -n "$method" ] && [ -n "$path" ] || die "usage: uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f] [--query k=v]" "$EX_USAGE"
+  method="$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')"
+  parse_list_flags "$@"
+  load_creds; need_auth
+  case "$path" in /*) : ;; *) path="/$path" ;; esac
+  local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
+  local payload=""; [ -n "${UKU_DATA:-}" ] && payload="$(read_data "$UKU_DATA")"
+  case "$method" in
+    GET|HEAD) : ;;
+    *) confirm_write "$method $path" ;;
+  esac
+  do_request "$method" "$path$q" "$payload"
+  check_status "$REPLY_BODY"; render "$REPLY_BODY"
+}
+
+# ── Flag parsing for sub-commands (fills UKU_QUERY, UKU_DATA) ─────────
+parse_list_flags() {
+  UKU_QUERY=(); UKU_DATA="${UKU_DATA:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit) UKU_QUERY+=("limit=${2:-}"); shift 2 ;;
+      --offset) UKU_QUERY+=("offset=${2:-}"); shift 2 ;;
+      --q|--search) UKU_QUERY+=("q=${2:-}"); shift 2 ;;
+      --status) UKU_QUERY+=("status=${2:-}"); shift 2 ;;
+      --sort) UKU_QUERY+=("sort=${2:-}"); shift 2 ;;
+      --query) UKU_QUERY+=("${2:-}"); shift 2 ;;
+      --data|-d) UKU_DATA="${2:-}"; shift 2 ;;
+      *) die "unknown flag: $1" "$EX_USAGE" ;;
+    esac
+  done
+}
+
+usage() {
+  cat >&2 <<EOF
+$(_bold "uku") — the Uku command-line client (v$UKU_VERSION)
+
+$(_bold "USAGE")
+  uku <command> [subcommand] [flags]
+
+$(_bold "AUTH")
+  uku auth login              Sign in (stores a scoped API key, 0600)
+  uku auth status             Show who you're signed in as
+  uku auth logout             Remove stored credentials
+
+$(_bold "RESOURCES")  (read with any key)
+  uku clients list [--q X] [--status S] [--limit N]
+  uku clients get <id>
+  uku tasks list [--limit N]
+  uku time list [--limit N]
+  uku invoices list [--limit N]
+  uku invoices get <id>
+
+$(_bold "WRITES")  (deliberate — need a TTY or --yes; money needs an All key)
+  uku invoices create --data @invoice.json [--yes]
+
+$(_bold "ESCAPE HATCH")  (any endpoint in the API v3)
+  uku api GET  /api/v3/members --query limit=5
+  uku api POST /api/v3/tasks --data @task.json --yes
+
+$(_bold "GLOBAL FLAGS")
+  --json            Raw JSON (default when stdout is not a TTY)
+  --yes, -y         Confirm a non-interactive write
+  --base <url>      Override the API base URL
+  -h, --help        This help
+  --version         Print version
+
+$(_bold "ENVIRONMENT")  (override stored creds; ideal for CI / agents)
+  UKU_API_KEY, UKU_COMPANY, UKU_BASE_URL
+
+Docs: https://app.getuku.com/api/v3/docs   ·   https://getuku.com/agents/
+EOF
+}
+
+# ── Global pre-parse (pull out global flags anywhere) ────────────────
+UKU_JSON=0; UKU_YES=0; UKU_QUERY=(); UKU_DATA=""
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) UKU_JSON=1; shift ;;
+    -y|--yes) UKU_YES=1; shift ;;
+    --base) UKU_BASE_CLI="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit "$EX_OK" ;;
+    --version|-V) printf 'uku %s\n' "$UKU_VERSION"; exit "$EX_OK" ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+require_curl
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  auth)     cmd_auth "$@" ;;
+  clients)  cmd_clients "$@" ;;
+  tasks)    cmd_tasks "$@" ;;
+  time)     cmd_time "$@" ;;
+  invoices) cmd_invoices "$@" ;;
+  api)      cmd_api "$@" ;;
+  version)  printf 'uku %s\n' "$UKU_VERSION" ;;
+  help|"")  usage ;;
+  *) die "unknown command: $cmd  (run 'uku help')" "$EX_USAGE" ;;
+esac
