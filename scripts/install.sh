@@ -71,7 +71,12 @@ if DL "$SRC.sha256" > "$SUM" 2>/dev/null && [ -s "$SUM" ] && [ -n "$SHA_CMD" ]; 
   fi
   info "Checksum verified  $(dim "sha256 $(printf '%s' "$got" | cut -c1-12)…")"
 else
-  step "$(dim 'Checksum file not published for this version — skipping verify.')"
+  # A missing checksum is a hard failure for a pinned version (an attacker can
+  # simply omit it) and when the caller demands one; otherwise a loud warning.
+  if [ -n "$VERSION" ] || [ "${UKU_REQUIRE_CHECKSUM:-0}" = "1" ]; then
+    err "no checksum published for uku${VERSION:+ v$VERSION} — refusing to install unverified. (set UKU_REQUIRE_CHECKSUM=0 to override at your own risk)"
+  fi
+  step "$(red '! checksum not published — installing UNVERIFIED. Pin a version for a verified install.')"
 fi
 
 # ── install ───────────────────────────────────────────────────────────
@@ -79,16 +84,20 @@ mv "$TMP" "$TARGET"; chmod +x "$TARGET"
 trap 'rm -f "$SUM"' EXIT
 info "Installed → $(bold "$TARGET")"
 
-# ── PATH, handled (append to the right rc file, idempotent) ───────────
+# ── PATH, handled (append to the right rc, idempotent; fish/nushell aware) ──
 if ! on_path "$BIN_DIR"; then
-  RC=""
   case "${SHELL:-}" in
-    *zsh) RC="$HOME/.zshrc" ;;
-    *bash) [ -f "$HOME/.bash_profile" ] && RC="$HOME/.bash_profile" || RC="$HOME/.bashrc" ;;
-    *) RC="$HOME/.profile" ;;
+    *fish)
+      LINE="fish_add_path $BIN_DIR"; RC="$HOME/.config/fish/config.fish" ;;
+    *nu)
+      LINE="\$env.PATH = (\$env.PATH | prepend '$BIN_DIR')"; RC="$HOME/.config/nushell/config.nu" ;;
+    *zsh)  LINE="export PATH=\"$BIN_DIR:\$PATH\""; RC="$HOME/.zshrc" ;;
+    *bash) LINE="export PATH=\"$BIN_DIR:\$PATH\""; [ -f "$HOME/.bash_profile" ] && RC="$HOME/.bash_profile" || RC="$HOME/.bashrc" ;;
+    *)     LINE="export PATH=\"$BIN_DIR:\$PATH\""; RC="$HOME/.profile" ;;
   esac
-  LINE="export PATH=\"$BIN_DIR:\$PATH\""
-  if [ -n "$RC" ] && { [ -f "$RC" ] || : > "$RC"; } && ! grep -qF "$BIN_DIR" "$RC" 2>/dev/null; then
+  if [ -n "$RC" ] && grep -qF "$BIN_DIR" "$RC" 2>/dev/null; then
+    info "PATH already configured in $(dim "$RC") — restart your shell (or: $(dim "source $RC"))"
+  elif [ -n "$RC" ] && mkdir -p "$(dirname "$RC")" 2>/dev/null && { [ -f "$RC" ] || : > "$RC"; }; then
     printf '\n# added by uku installer\n%s\n' "$LINE" >> "$RC"
     info "Added $(bold "$BIN_DIR") to PATH ($(dim "$RC")) — new terminals get it automatically"
     step "This shell: $(dim "source $RC")"
@@ -96,6 +105,16 @@ if ! on_path "$BIN_DIR"; then
     step "Add $(bold "$BIN_DIR") to your PATH:  $(dim "$LINE")"
   fi
 fi
+
+# ── shadow check — a shell function named `uku` would eclipse the binary ──
+for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+  [ -f "$rc" ] || continue
+  if grep -Eq '(^|[[:space:]])(function[[:space:]]+)?uku[[:space:]]*(\(\)|=)' "$rc" 2>/dev/null; then
+    step "$(red "! a shell function/alias 'uku' in $rc will shadow this binary")"
+    step "  $(dim "rename it, or call") $(bold 'command uku')"
+    break
+  fi
+done
 
 # ── verify + handoff ──────────────────────────────────────────────────
 "$TARGET" --version >/dev/null 2>&1 && info "$("$TARGET" --version) ready" || err "installed but 'uku --version' failed (is bash available?)."
