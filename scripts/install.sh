@@ -73,10 +73,12 @@ if DL "$SRC.sha256" > "$SUM" 2>/dev/null && [ -s "$SUM" ] && [ -n "$SHA_CMD" ]; 
 else
   # A missing checksum is a hard failure for a pinned version (an attacker can
   # simply omit it) and when the caller demands one; otherwise a loud warning.
-  if [ -n "$VERSION" ] || [ "${UKU_REQUIRE_CHECKSUM:-0}" = "1" ]; then
-    err "no checksum published for uku${VERSION:+ v$VERSION} — refusing to install unverified. (set UKU_REQUIRE_CHECKSUM=0 to override at your own risk)"
+  if [ -n "$VERSION" ]; then
+    err "no checksum published for uku v$VERSION — refusing to install a pinned version unverified."
+  elif [ "${UKU_REQUIRE_CHECKSUM:-0}" = "1" ]; then
+    err "no checksum published and UKU_REQUIRE_CHECKSUM=1 — refusing to install unverified."
   fi
-  step "$(red '! checksum not published — installing UNVERIFIED. Pin a version for a verified install.')"
+  step "$(red '! checksum not published — installing UNVERIFIED. Pin a version (UKU_VERSION=x.y.z) for a verified install.')"
 fi
 
 # ── install ───────────────────────────────────────────────────────────
