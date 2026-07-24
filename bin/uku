@@ -179,9 +179,40 @@ table() {
   local hdr="" jqfields=""
   for f in "$@"; do hdr="$hdr$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')\t"; jqfields="$jqfields (.$f // \"-\"),"; done
   jqfields="[${jqfields%,}] | @tsv"
-  { printf '%b\n' "$(_bold "${hdr%\\t}")"
-    printf '%s' "$body" | jq -r ".data[]? | $jqfields" 2>/dev/null || printf '%s' "$body" | jq -r "$jqfields" 2>/dev/null
-  } | column -t -s "$(printf '\t')"
+  local rows; rows="$(printf '%s' "$body" | jq -r ".data[]? | $jqfields" 2>/dev/null || true)"
+  if have column; then
+    { printf '%b\n' "$(_bold "${hdr%\\t}")"; printf '%s\n' "$rows"; } | column -t -s "$(printf '\t')"
+  else
+    printf '%b\n' "$(_bold "${hdr%\\t}")"; printf '%s\n' "$rows" | tr '\t' ' '
+  fi
+  _pagination_footer "$body"
+}
+
+# _pagination_footer BODY — "— N of TOTAL · more: --offset X" from meta.
+_pagination_footer() {
+  have jq || return 0
+  local total offset limit shown
+  total="$(printf '%s' "$1" | jq -r '.meta.total // empty' 2>/dev/null)"
+  offset="$(printf '%s' "$1" | jq -r '.meta.offset // 0' 2>/dev/null)"
+  limit="$(printf '%s' "$1" | jq -r '.meta.limit // empty' 2>/dev/null)"
+  shown="$(printf '%s' "$1" | jq -r '(.data | length) // 0' 2>/dev/null)"
+  [ -n "$total" ] || return 0
+  local seen=$(( offset + shown ))
+  if [ "$seen" -lt "$total" ] 2>/dev/null; then
+    printf '  %s\n' "$(_dim "— $seen of $total · more: add --offset $seen  (or --all)")" >&2
+  else
+    printf '  %s\n' "$(_dim "— $total of $total")" >&2
+  fi
+}
+
+# _urlencode STRING — RFC-3986 percent-encode, pure bash, byte-correct (LC_ALL=C).
+_urlencode() {
+  local LC_ALL=C s="$1" out="" i c
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in [a-zA-Z0-9.~_-]) out="$out$c" ;; *) out="$out$(printf '%%%02X' "'$c")" ;; esac
+  done
+  printf '%s' "$out"
 }
 
 # check_status BODY — die with a helpful message on 4xx/5xx (uses REPLY_STATUS).
@@ -217,14 +248,13 @@ confirm_write() {
   case "$reply" in y|Y|yes|YES) return 0 ;; *) die "Cancelled." "$EX_CONFIRM" ;; esac
 }
 
-# build_query k=v ...  → "?k=v&k2=v2" (URL-encoded values)
+# build_query k=v ...  → "?k=v&k2=v2" (values RFC-3986 percent-encoded)
 build_query() {
   local q=""
   for kv in "$@"; do
     local k="${kv%%=*}" v="${kv#*=}"
     [ "$k" = "$kv" ] && continue
-    v="$(printf '%s' "$v" | curl -Gso /dev/null -w '%{url_effective}' --data-urlencode @- "" 2>/dev/null | sed 's/^[?]//')" || v="${kv#*=}"
-    q="$q&$k=$v"
+    q="$q&$k=$(_urlencode "$v")"
   done
   [ -n "$q" ] && printf '?%s' "${q#&}"
   return 0
@@ -376,10 +406,29 @@ list_resource() {
   local path="$1"; shift
   local -a cols=("$@")
   load_creds; need_auth
+  if [ "${UKU_ALL:-0}" = "1" ] && have jq; then _list_all "$path" "${cols[@]}"; return; fi
   local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
   do_request GET "$path$q"
   check_status "$REPLY_BODY"
   if [ "${#cols[@]}" -gt 0 ]; then table "$REPLY_BODY" "${cols[@]}"; else render "$REPLY_BODY"; fi
+}
+
+# --all: page through every row via offset, then emit one combined result.
+_list_all() {
+  local path="$1"; shift; local -a cols=("$@")
+  local offset=0 page=200 total=0 acc="[]" more=1
+  while [ "$more" = "1" ]; do
+    do_request GET "$path$(build_query limit=$page offset=$offset)"
+    check_status "$REPLY_BODY"
+    local chunk; chunk="$(printf '%s' "$REPLY_BODY" | jq -c '.data // []' 2>/dev/null || echo '[]')"
+    acc="$(jq -c --argjson a "$acc" --argjson b "$chunk" -n '$a + $b')"
+    total="$(printf '%s' "$REPLY_BODY" | jq -r '.meta.total // 0')"
+    local got; got="$(printf '%s' "$chunk" | jq 'length')"
+    offset=$(( offset + got ))
+    [ "$got" -ge 1 ] && [ "$offset" -lt "$total" ] && more=1 || more=0
+  done
+  local combined; combined="$(jq -c -n --argjson d "$acc" --argjson t "$total" '{data:$d, meta:{total:$t, limit:$t, offset:0, has_more:false}}')"
+  if [ "${#cols[@]}" -gt 0 ]; then table "$combined" "${cols[@]}"; else render "$combined"; fi
 }
 
 get_resource() {
@@ -389,26 +438,50 @@ get_resource() {
   check_status "$REPLY_BODY"; render "$REPLY_BODY"
 }
 
+# write_resource METHOD PATH ACTION-LABEL — deliberate-gated write (needs --yes
+# or a TTY confirm); the payload comes from --data (@file, @-, or literal JSON).
+write_resource() {
+  local method="$1" path="$2" label="$3"
+  load_creds; need_auth
+  [ -n "${UKU_DATA:-}" ] || die "$label needs a body: --data @file.json (or --data '{...}', or --data @-)" "$EX_USAGE"
+  local payload; payload="$(read_data "$UKU_DATA")"
+  confirm_write "$label"
+  do_request "$method" "$path" "$payload"
+  check_status "$REPLY_BODY"; render "$REPLY_BODY"
+}
+
 cmd_clients() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/clients id name status type ;;
     get)  [ -n "${2:-}" ] || die "usage: uku clients get <client_id>" "$EX_USAGE"; get_resource "/api/v3/clients/$2" ;;
-    *) die "usage: uku clients <list|get>" "$EX_USAGE" ;;
+    create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/clients "create a client" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku clients patch <id> --data @f" "$EX_USAGE"; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/clients/$id" "update client $id" ;;
+    *) die "usage: uku clients <list|get|create|patch>" "$EX_USAGE" ;;
   esac
 }
 cmd_tasks() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/tasks id title status client_id ;;
     get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id>" "$EX_USAGE"; get_resource "/api/v3/tasks/$2" ;;
-    *) die "usage: uku tasks <list|get>" "$EX_USAGE" ;;
+    create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/tasks "create a task" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id> --data @f  (e.g. status/date)" "$EX_USAGE"; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
+    *) die "usage: uku tasks <list|get|create|patch>" "$EX_USAGE" ;;
   esac
 }
 cmd_time() {
   case "${1:-list}" in
-    list) shift || true; parse_list_flags "$@"; list_resource /api/v3/time-entries id date minutes client_id ;;
-    *) die "usage: uku time list" "$EX_USAGE" ;;
+    list) shift || true; parse_list_flags "$@"; list_resource /api/v3/time-entries id task_id duration billable ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku time get <id>" "$EX_USAGE"; get_resource "/api/v3/time-entries/$2" ;;
+    create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/time-entries "create a time entry" ;;
+    *) die "usage: uku time <list|get|create>  (create needs --data with task_id, person_id, start)" "$EX_USAGE" ;;
   esac
 }
+cmd_members()   { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/members id name role status ;; get) [ -n "${2:-}" ]||die "usage: uku members get <id>" "$EX_USAGE"; get_resource "/api/v3/members/$2" ;; *) die "usage: uku members <list|get>" "$EX_USAGE" ;; esac; }
+cmd_products()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/products id name ;; get) [ -n "${2:-}" ]||die "usage: uku products get <id>" "$EX_USAGE"; get_resource "/api/v3/products/$2" ;; *) die "usage: uku products <list|get>" "$EX_USAGE" ;; esac; }
+cmd_contracts() { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/contracts id client_id status ;; get) [ -n "${2:-}" ]||die "usage: uku contracts get <id>" "$EX_USAGE"; get_resource "/api/v3/contracts/$2" ;; *) die "usage: uku contracts <list|get>" "$EX_USAGE" ;; esac; }
+cmd_projects()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/projects id name client_id ;; get) [ -n "${2:-}" ]||die "usage: uku projects get <id>" "$EX_USAGE"; get_resource "/api/v3/projects/$2" ;; *) die "usage: uku projects <list|get>" "$EX_USAGE" ;; esac; }
+# `uku me` — the identity behind this key/account (reuses the validated status).
+cmd_me() { cmd_auth status "$@"; }
 cmd_invoices() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/invoices id invoice_number status client_id ;;
@@ -426,7 +499,9 @@ cmd_invoices() {
 }
 
 cmd_api() {
+  # uku api --describe            → the endpoint catalog (agent self-orientation)
   # uku api METHOD PATH [--data X] [--query k=v]...
+  if [ "${1:-}" = "--describe" ]; then _api_describe; return 0; fi
   local method="${1:-}" path="${2:-}"; shift 2 || true
   [ -n "$method" ] && [ -n "$path" ] || die "usage: uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f] [--query k=v]" "$EX_USAGE"
   method="$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')"
@@ -441,6 +516,113 @@ cmd_api() {
   esac
   do_request "$method" "$path$q" "$payload"
   check_status "$REPLY_BODY"; render "$REPLY_BODY"
+}
+
+# _api_describe — a static map of the main v3 resources so an agent can orient
+# without fetching docs. The full spec lives at /api/v3/openapi.json.
+_api_describe() {
+  cat <<'MAP'
+Uku API v3 — resource map (base: https://app.getuku.com)
+  clients        GET,POST  /api/v3/clients            · GET,PATCH,DELETE /clients/{id}
+  tasks          GET,POST  /api/v3/tasks              · GET,PATCH,DELETE /tasks/{id}
+  time-entries   GET,POST  /api/v3/time-entries       · GET,PATCH,DELETE /time-entries/{id}
+  invoices       GET,POST  /api/v3/invoices           · GET,PATCH /invoices/{id} · POST /{id}/send · /{id}/mark-paid
+  contacts       GET,POST  /api/v3/contacts           · members GET /api/v3/members
+  products       GET,POST  /api/v3/products           · contracts GET,POST /api/v3/contracts
+  projects       GET,POST  /api/v3/projects           · topics GET,POST /api/v3/topics
+  client-groups  GET,POST  /api/v3/client-groups      · agreements GET,POST /api/v3/agreements
+Full spec: https://app.getuku.com/api/v3/openapi.json  ·  docs: /api/v3/docs
+Reach any of them: uku api <METHOD> <path> [--data @f] [--query k=v] [--yes]
+MAP
+}
+
+# uku update — re-run the installer for the latest (or a pinned) version.
+cmd_update() {
+  local url="${UKU_INSTALL_URL:-https://getuku.com/install-cli}"
+  info "Updating uku (current $UKU_VERSION) via $url"
+  if have curl; then curl -fsSL "$url" | sh; else die "curl is required to update." "$EX_USAGE"; fi
+}
+
+# uku completions <bash|zsh> — source-able completion for the top-level commands.
+cmd_completions() {
+  local shell="${1:-}"
+  local cmds="auth account setup clients tasks time invoices members products contracts projects me api update completions help version"
+  case "$shell" in
+    bash) printf 'complete -W "%s" uku\n' "$cmds" ;;
+    zsh)  printf '#compdef uku\n_arguments "1:command:(%s)"\n' "$cmds" ;;
+    *) die "usage: uku completions <bash|zsh>   (add to your shell rc: eval \"\$(uku completions zsh)\")" "$EX_USAGE" ;;
+  esac
+}
+
+# uku help [command] — per-command card, or the global usage.
+cmd_help() {
+  local topic="${1:-}"
+  case "$topic" in
+    "") usage; return 0 ;;
+    auth) cat >&2 <<EOF
+$(_bold "uku auth") — sign in and inspect the active account
+  uku auth login [--account NAME] [--company UUID] [--base URL] [--key-stdin]
+  uku auth status [--json]        who you're acting as (validates the key)
+  uku auth logout [--account NAME]
+Non-interactive:  printf '%s' "\$KEY" | uku auth login --account ci --company <uuid> --key-stdin
+EOF
+    ;;
+    account|accounts) cat >&2 <<EOF
+$(_bold "uku account") — one login, many companies (keep a sandbox beside your main firm)
+  uku account list                 ● marks the active account
+  uku account use <name>           switch the active account
+  uku account current              print the active account
+  uku account add <name> …         = uku auth login --account <name>
+  uku account remove <name>
+  uku --account <name> <command>   run one command against a specific account
+EOF
+    ;;
+    clients|tasks|time|invoices|members|products|contracts|projects) cat >&2 <<EOF
+$(_bold "uku $topic") — list/get$( [ "$topic" = time ] && printf '/create' || printf '/create/patch' 2>/dev/null || true)
+  uku $topic list [--q X] [--status S] [--limit N] [--offset N] [--all] [--json]
+  uku $topic get <id>
+Examples:
+  uku $topic list --limit 5
+  uku $topic list --json | jq '.data[] | {id}'
+EOF
+    ;;
+    api) cat >&2 <<EOF
+$(_bold "uku api") — reach any endpoint in the API v3
+  uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]
+  uku api --describe               the resource map
+Writes are deliberate (need --yes or a TTY). Example:
+  echo '{"client_id":211310}' | uku api POST /api/v3/invoices --data @- --yes
+EOF
+    ;;
+    setup) cat >&2 <<EOF
+$(_bold "uku setup agents") — teach your coding agents the uku contract, once
+  Installs a skill for Claude Code (~/.claude/skills/uku), Cursor (.cursor/rules),
+  and a block in ./AGENTS.md. UKU_SETUP_AGENT=claude|cursor|codex|all|none.
+EOF
+    ;;
+    *) die "No help for '$topic'. Try: uku help  (or uku <command> --help)" "$EX_USAGE" ;;
+  esac
+}
+
+# First-run wizard — bare `uku` with a TTY and no credentials. Turns the empty
+# state into: welcome → sign in → run the first command for them.
+first_run() {
+  load_creds
+  if [ -n "${UKU_KEY:-}" ]; then
+    # already signed in → short status + the top commands
+    cmd_auth status || true
+    printf '\n  %s\n  %s\n' "$(_dim 'Try:')" "$(_bold 'uku clients list') · $(_bold 'uku tasks list') · $(_bold 'uku --help')" >&2
+    return 0
+  fi
+  if ! _is_tty; then usage; exit "$EX_USAGE"; fi   # scripts get usage + a nonzero code
+  printf '\n  %s\n  %s\n\n' "$(_bold 'uku') — operate your firm'\''s Uku from the terminal." "$(_dim 'Agents welcome. Reads are free · writes ask first · money has its own key.')" >&2
+  printf '  Your API key lives in Uku → Settings → API (scoped Read / Edit / All).\n\n' >&2
+  printf '  Sign in now? [Y/n] ' >&2; local r; read -r r < /dev/tty || true
+  case "$r" in n|N|no|NO) printf '\n  When ready: %s\n' "$(_bold 'uku auth login')  ·  $(_bold 'uku setup agents')" >&2; return 0 ;; esac
+  cmd_auth login
+  printf '\n  %s\n' "$(_dim 'Here'\''s your firm:')" >&2
+  cmd_clients list --limit 5 || true
+  printf '\n  %s %s\n' "$(_green '✓')" "$(_dim 'That'\''s your data. Try:') $(_bold 'uku tasks list') · $(_bold 'uku setup agents')" >&2
 }
 
 # ── setup: connect coding agents (the agent-native handshake) ────────
@@ -554,8 +736,10 @@ parse_list_flags() {
       --status) UKU_QUERY+=("status=${2:-}"); shift 2 ;;
       --sort) UKU_QUERY+=("sort=${2:-}"); shift 2 ;;
       --query) UKU_QUERY+=("${2:-}"); shift 2 ;;
+      --cursor) UKU_QUERY+=("cursor=${2:-}"); shift 2 ;;
+      --all) UKU_ALL=1; shift ;;
       --data|-d) UKU_DATA="${2:-}"; shift 2 ;;
-      *) die "unknown flag: $1" "$EX_USAGE" ;;
+      *) die "unknown flag: $1  (try: uku <command> --help)" "$EX_USAGE" ;;
     esac
   done
 }
@@ -609,7 +793,7 @@ EOF
 }
 
 # ── Global pre-parse (pull out global flags anywhere) ────────────────
-UKU_JSON=0; UKU_YES=0; UKU_QUERY=(); UKU_DATA=""
+UKU_JSON=0; UKU_YES=0; UKU_ALL=0; UKU_HELP=0; UKU_QUERY=(); UKU_DATA=""
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -617,7 +801,7 @@ while [ $# -gt 0 ]; do
     -y|--yes) UKU_YES=1; shift ;;
     --account) UKU_ACCOUNT_CLI="${2:-}"; shift 2 ;;
     --base) UKU_BASE_CLI="${2:-}"; shift 2 ;;
-    -h|--help) usage; exit "$EX_OK" ;;
+    -h|--help) UKU_HELP=1; shift ;;   # routed to per-command help below
     --version|-V) printf 'uku %s\n' "$UKU_VERSION"; exit "$EX_OK" ;;
     *) ARGS+=("$1"); shift ;;
   esac
@@ -625,8 +809,12 @@ done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
 require_curl
-cmd="${1:-help}"; shift || true
+# --help anywhere → the card for the named command (or global usage)
+[ "$UKU_HELP" = "1" ] && { cmd_help "${1:-}"; exit "$EX_OK"; }
+
+cmd="${1:-__firstrun__}"; shift || true
 case "$cmd" in
+  __firstrun__) first_run ;;
   auth)     cmd_auth "$@" ;;
   account|accounts) cmd_account "$@" ;;
   setup)    cmd_setup "$@" ;;
@@ -634,8 +822,16 @@ case "$cmd" in
   tasks)    cmd_tasks "$@" ;;
   time)     cmd_time "$@" ;;
   invoices) cmd_invoices "$@" ;;
+  members)  cmd_members "$@" ;;
+  products) cmd_products "$@" ;;
+  contracts) cmd_contracts "$@" ;;
+  projects) cmd_projects "$@" ;;
+  me)       cmd_me "$@" ;;
   api)      cmd_api "$@" ;;
+  setup-agents) cmd_setup agents "$@" ;;
+  update)   cmd_update "$@" ;;
+  completions) cmd_completions "$@" ;;
   version)  printf 'uku %s\n' "$UKU_VERSION" ;;
-  help|"")  usage ;;
+  help)     cmd_help "${1:-}" ;;
   *) die "unknown command: $cmd  (run 'uku help')" "$EX_USAGE" ;;
 esac
