@@ -115,6 +115,17 @@ without ever being able to move money.
 | `UKU_CONFIG_HOME` | credentials directory (default `~/.config/uku`) |
 | `NO_COLOR` | disable colored output |
 
+## Troubleshooting
+
+```sh
+uku doctor    # checks PATH, shadowing, curl/jq/bash, config perms, key validity, skill
+```
+
+**`uku` runs something else?** A shell function or alias named `uku` in your
+`~/.zshrc` (or `~/.bashrc`) shadows the binary — shell functions win over `PATH`.
+Rename the function, or call the CLI explicitly as `command uku`. `uku doctor`
+and the installer both detect and warn about this.
+
 ## What's next
 
 - Official **MCP server** (chat assistants operate Uku with no glue code) — coming.
