@@ -18,7 +18,9 @@ set -euo pipefail
 UKU_VERSION="0.1.0"
 UKU_BASE_DEFAULT="https://app.getuku.com"
 UKU_CONFIG_HOME="${UKU_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/uku}"
-UKU_CRED_FILE="$UKU_CONFIG_HOME/credentials"
+UKU_PROFILE_DIR="$UKU_CONFIG_HOME/profiles"   # one file per account (0600)
+UKU_ACTIVE_FILE="$UKU_CONFIG_HOME/active"     # holds the active profile name
+UKU_ACCOUNT_CLI=""                            # set by the global --account flag
 
 # ── Exit codes (stable) ──────────────────────────────────────────────
 EX_OK=0        # success
@@ -41,42 +43,95 @@ have()  { command -v "$1" >/dev/null 2>&1; }
 
 require_curl() { have curl || die "curl is required but not installed." "$EX_USAGE"; }
 
-# ── Config / credentials ─────────────────────────────────────────────
-# Precedence: environment variables > stored credentials file.
+# ── Config / accounts ────────────────────────────────────────────────
+# Uku lets one person hold several companies under a single login — a real
+# "main" firm plus a sandbox to rehearse changes (price edits, invoices) before
+# committing them for real. The CLI mirrors that: each account is a named
+# profile file under ~/.config/uku/profiles/<name> (mode 0600), and `active`
+# names the current one. `--account <name>` targets one command; env vars
+# (UKU_API_KEY + UKU_COMPANY) override everything for CI/agents.
+#
+# Files are PARSED, never sourced — a tampered profile is data, not code.
+
+_profile_path() { printf '%s/%s' "$UKU_PROFILE_DIR" "$1"; }
+# POSIX class, not an a-z range: bracket ranges are locale/collation-dependent
+# (en_US.UTF-8 makes [a-z] skip letters), which silently rejected valid names.
+_valid_name()   { case "$1" in ""|*[![:alnum:]._-]*) return 1 ;; *) return 0 ;; esac; }
+
+# read one KEY from a profile file (grep/sed, no sourcing)
+_profile_get() {
+  local file="$1" key="$2" line
+  [ -f "$file" ] || return 0
+  line="$(grep -m1 "^$key=" "$file" 2>/dev/null || true)"
+  # strip KEY= and one layer of surrounding quotes
+  line="${line#*=}"; line="${line%\"}"; line="${line#\"}"
+  printf '%s' "$line"
+}
+
+active_profile() {
+  if [ -f "$UKU_ACTIVE_FILE" ]; then head -n1 "$UKU_ACTIVE_FILE" 2>/dev/null | tr -d '[:space:]'; else printf 'default'; fi
+}
+
+# Resolve credentials into UKU_BASE / UKU_COMPANY / UKU_KEY / UKU_PROFILE.
+# Precedence: --account flag → env (both key+company) → active profile.
 load_creds() {
-  UKU_BASE="${UKU_BASE_URL:-$UKU_BASE_DEFAULT}"
-  UKU_COMPANY="${UKU_COMPANY:-}"
-  UKU_KEY="${UKU_API_KEY:-}"
-  if [ -f "$UKU_CRED_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$UKU_CRED_FILE"
-    UKU_BASE="${UKU_BASE_URL:-${UKU_BASE:-$UKU_BASE_DEFAULT}}"
-    UKU_COMPANY="${UKU_COMPANY_ENV:-${UKU_COMPANY:-}}"
-    UKU_KEY="${UKU_KEY_ENV:-${UKU_KEY:-}}"
-    # env always wins
-    [ -n "${UKU_BASE_URL:-}" ] && UKU_BASE="$UKU_BASE_URL"
-    [ -n "${UKU_COMPANY_OVERRIDE:-}" ] && UKU_COMPANY="$UKU_COMPANY_OVERRIDE"
-    [ -n "${UKU_API_KEY:-}" ] && UKU_KEY="$UKU_API_KEY"
+  # snapshot the environment BEFORE touching any file (fixes cross-account bleed)
+  local env_key="${UKU_API_KEY:-}" env_company="${UKU_COMPANY:-}" env_base="${UKU_BASE_URL:-}"
+  UKU_BASE="$UKU_BASE_DEFAULT"; UKU_COMPANY=""; UKU_KEY=""; UKU_PROFILE=""
+
+  if [ -n "$UKU_ACCOUNT_CLI" ]; then
+    UKU_PROFILE="$UKU_ACCOUNT_CLI"
+    local f; f="$(_profile_path "$UKU_PROFILE")"
+    [ -f "$f" ] || die "No such account: $UKU_PROFILE  (uku account list)" "$EX_AUTH"
+    UKU_BASE="$(_profile_get "$f" UKU_BASE)"; UKU_BASE="${UKU_BASE:-$UKU_BASE_DEFAULT}"
+    UKU_COMPANY="$(_profile_get "$f" UKU_COMPANY)"
+    UKU_KEY="$(_profile_get "$f" UKU_KEY)"
+  elif [ -n "$env_key" ] && [ -n "$env_company" ]; then
+    # a complete env identity wins outright — the CI / agent path
+    UKU_PROFILE="env"
+    UKU_BASE="${env_base:-$UKU_BASE_DEFAULT}"; UKU_COMPANY="$env_company"; UKU_KEY="$env_key"
+  else
+    UKU_PROFILE="$(active_profile)"
+    local f; f="$(_profile_path "$UKU_PROFILE")"
+    if [ -f "$f" ]; then
+      UKU_BASE="$(_profile_get "$f" UKU_BASE)"; UKU_BASE="${UKU_BASE:-$UKU_BASE_DEFAULT}"
+      UKU_COMPANY="$(_profile_get "$f" UKU_COMPANY)"
+      UKU_KEY="$(_profile_get "$f" UKU_KEY)"
+    fi
+    # partial env still overrides individual fields
+    [ -n "$env_company" ] && UKU_COMPANY="$env_company"
+    [ -n "$env_key" ] && UKU_KEY="$env_key"
+    [ -n "$env_base" ] && UKU_BASE="$env_base"
   fi
   [ -n "${UKU_BASE_CLI:-}" ] && UKU_BASE="$UKU_BASE_CLI"
   return 0
 }
 
-save_creds() {
-  mkdir -p "$UKU_CONFIG_HOME"
-  umask 077
-  cat > "$UKU_CRED_FILE" <<EOF
-# Uku CLI credentials — keep this file private (mode 0600).
-UKU_BASE="$1"
-UKU_COMPANY="$2"
-UKU_KEY="$3"
-EOF
-  chmod 600 "$UKU_CRED_FILE"
+# save_profile NAME BASE COMPANY KEY  — writes a 0600 profile file safely.
+save_profile() {
+  local name="$1" base="$2" company="$3" key="$4"
+  _valid_name "$name" || die "Invalid account name: '$name' (use letters, digits, . _ -)" "$EX_USAGE"
+  mkdir -p "$UKU_PROFILE_DIR"; chmod 700 "$UKU_CONFIG_HOME" "$UKU_PROFILE_DIR" 2>/dev/null || true
+  local f; f="$(_profile_path "$name")"
+  ( umask 077
+    { printf '# Uku CLI account "%s" — private (0600). Do not share.\n' "$name"
+      printf 'UKU_BASE=%s\n' "$base"
+      printf 'UKU_COMPANY=%s\n' "$company"
+      printf 'UKU_KEY=%s\n' "$key"
+    } > "$f" )
+  chmod 600 "$f"
+}
+
+set_active() { mkdir -p "$UKU_CONFIG_HOME"; printf '%s\n' "$1" > "$UKU_ACTIVE_FILE"; }
+
+list_profiles() {
+  [ -d "$UKU_PROFILE_DIR" ] || return 0
+  local f; for f in "$UKU_PROFILE_DIR"/*; do [ -f "$f" ] && basename "$f"; done 2>/dev/null
 }
 
 need_auth() {
   [ -n "${UKU_COMPANY:-}" ] && [ -n "${UKU_KEY:-}" ] && return 0
-  die "Not authenticated. Run: uku auth login  (or set UKU_COMPANY + UKU_API_KEY)." "$EX_AUTH"
+  die "Not signed in for account '$UKU_PROFILE'. Run: uku auth login  (or set UKU_COMPANY + UKU_API_KEY)." "$EX_AUTH"
 }
 
 # ── HTTP core ────────────────────────────────────────────────────────
@@ -94,7 +149,10 @@ do_request() {
     -H "X-API-Key: $UKU_KEY"
     -H "Accept: application/json"
     -H "User-Agent: uku-cli/$UKU_VERSION"
+    --connect-timeout 10 --max-time 120
     -w '%{http_code}' -o "$tmp")
+  # retry idempotent reads only — never replay a write
+  case "$method" in GET|HEAD) args+=(--retry 2 --retry-connrefused) ;; esac
   if [ -n "$data" ]; then
     args+=(-H "Content-Type: application/json" --data-binary "$data")
   fi
@@ -132,14 +190,16 @@ check_status() {
   case "$s" in
     2*) return 0 ;;
     401|403)
+      # Exit codes are the agent's API: auth/permission failures are EX_AUTH (2),
+      # distinct from a generic API error (3), so an agent knows to re-auth.
       local msg; msg="$(printf '%s' "$body" | (have jq && jq -r '.error // .message // .code // empty' 2>/dev/null || true))"
       if printf '%s' "$body" | grep -qi 'scope\|financial\|FINANCIAL_SCOPE'; then
         warn "$(_bold "HTTP $s") — this key can't perform that action."
         warn "Financial actions need an All-scope key; read/operate keys can't touch money."
       else
-        warn "$(_bold "HTTP $s") — ${msg:-authentication or permission denied.}"
+        warn "$(_bold "HTTP $s") — ${msg:-authentication or permission denied.}  Try: uku auth status"
       fi
-      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
+      printf '%s\n' "$body" >&2; exit "$EX_AUTH" ;;
     *)
       warn "$(_bold "HTTP $s") — request failed."
       printf '%s\n' "$body" >&2; exit "$EX_API" ;;
@@ -180,49 +240,134 @@ read_data() {
 }
 
 # ── Commands ─────────────────────────────────────────────────────────
+_mask_key() { local k="$1"; if [ "${#k}" -le 12 ]; then printf '••••'; else printf '%s…%s' "${k:0:9}" "${k: -4}"; fi; }
+_trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
 cmd_auth() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     login)
-      load_creds
-      local base="${UKU_BASE:-$UKU_BASE_DEFAULT}" company key
-      printf 'Uku base URL [%s]: ' "$base" >&2; read -r reply < /dev/tty || true; [ -n "$reply" ] && base="$reply"
-      printf 'Company UUID (Settings → API): ' >&2; read -r company < /dev/tty || true
-      [ -n "$company" ] || die "Company UUID is required." "$EX_USAGE"
-      printf 'API key (uku_live_…): ' >&2
-      if _is_tty; then stty -echo 2>/dev/null || true; fi
-      read -r key < /dev/tty || true
-      if _is_tty; then stty echo 2>/dev/null || true; printf '\n' >&2; fi
+      # uku auth login [--account NAME] [--company UUID] [--base URL] [--key-stdin]
+      local acct="" company="" base="" key_stdin=0
+      while [ $# -gt 0 ]; do case "$1" in
+        --account) acct="${2:-}"; shift 2 ;;
+        --company) company="${2:-}"; shift 2 ;;
+        --base) base="${2:-}"; shift 2 ;;
+        --key-stdin) key_stdin=1; shift ;;
+        *) die "unknown flag for auth login: $1" "$EX_USAGE" ;;
+      esac; done
+      [ -n "$acct" ] || acct="${UKU_ACCOUNT_CLI:-$(active_profile)}"
+      [ -n "$base" ] || base="$UKU_BASE_DEFAULT"
+      local key=""
+      if [ "$key_stdin" = "1" ] || [ -n "${UKU_API_KEY:-}" ] || { [ -n "$company" ] && ! _is_tty; }; then
+        # ── non-interactive path (CI / provisioning / agents) ──
+        [ -n "$company" ] || die "Non-interactive login needs --company <uuid>." "$EX_USAGE"
+        if [ "$key_stdin" = "1" ]; then key="$(_trim "$(cat)")"; else key="${UKU_API_KEY:-}"; fi
+        [ -n "$key" ] || die "Non-interactive login needs the key on stdin (--key-stdin) or \$UKU_API_KEY." "$EX_USAGE"
+      else
+        # ── interactive prompts (reads /dev/tty so it works under curl | sh) ──
+        local reply
+        printf 'Uku base URL [%s]: ' "$base" >&2; read -r reply < /dev/tty || true; [ -n "$reply" ] && base="$(_trim "$reply")"
+        printf 'Company UUID (Uku → Settings → API): ' >&2; read -r company < /dev/tty || true; company="$(_trim "$company")"
+        [ -n "$company" ] || die "Company UUID is required." "$EX_USAGE"
+        printf 'API key (uku_live_…): ' >&2
+        stty -echo 2>/dev/null || true
+        read -r key < /dev/tty || true
+        stty echo 2>/dev/null || true; printf '\n' >&2
+        key="$(_trim "$key")"
+      fi
       [ -n "$key" ] || die "API key is required." "$EX_USAGE"
-      # validate before saving — try an authenticated endpoint (members)
+      # validate BEFORE writing anything — bad creds never hit disk
       UKU_BASE="$base"; UKU_COMPANY="$company"; UKU_KEY="$key"
       do_request GET /api/v3/members
       case "$REPLY_STATUS" in
         2*) : ;;
-        401|403) die "Those credentials were rejected (HTTP $REPLY_STATUS). Nothing saved." "$EX_AUTH" ;;
-        *) warn "Could not verify credentials (HTTP $REPLY_STATUS) — saving anyway." ;;
+        401|403) die "Those credentials were rejected (HTTP $REPLY_STATUS). Nothing saved. Check the Company UUID matches the key's company (Settings → API)." "$EX_AUTH" ;;
+        *) warn "Could not verify credentials (HTTP $REPLY_STATUS) — saving anyway; run 'uku auth status' later." ;;
       esac
-      save_creds "$base" "$company" "$key"
-      info "Signed in. Key stored in $UKU_CRED_FILE (mode 0600)."
+      save_profile "$acct" "$base" "$company" "$key"
+      set_active "$acct"
+      info "Signed in to account $(_bold "$acct") · key $(_mask_key "$key") · stored 0600 in $UKU_PROFILE_DIR/$acct"
       ;;
     status)
       load_creds
-      [ -n "${UKU_KEY:-}" ] || { warn "Not signed in. Run: uku auth login"; exit "$EX_AUTH"; }
-      local masked="${UKU_KEY:0:9}…${UKU_KEY: -4}"
+      if [ -z "${UKU_KEY:-}" ]; then
+        if [ "${UKU_JSON:-0}" = "1" ]; then printf '{"account":"%s","signed_in":false}\n' "$UKU_PROFILE"; else warn "Account '$UKU_PROFILE' is not signed in. Run: uku auth login"; fi
+        exit "$EX_AUTH"
+      fi
       do_request GET /api/v3/members
-      if [ "${REPLY_STATUS:0:1}" = "2" ]; then
-        info "Signed in to $(_bold "$UKU_BASE")"
-        printf '  company: %s\n  key:     %s  %s\n' "$UKU_COMPANY" "$masked" "$(_green 'valid')" >&2
+      local valid=false; [ "${REPLY_STATUS:0:1}" = "2" ] && valid=true
+      if [ "${UKU_JSON:-0}" = "1" ]; then
+        printf '{"account":"%s","base":"%s","company":"%s","key_masked":"%s","valid":%s}\n' \
+          "$UKU_PROFILE" "$UKU_BASE" "$UKU_COMPANY" "$(_mask_key "$UKU_KEY")" "$valid"
+        [ "$valid" = true ] || exit "$EX_AUTH"; return
+      fi
+      if [ "$valid" = true ]; then
+        info "Signed in · account $(_bold "$UKU_PROFILE") → $(_bold "$UKU_BASE")"
+        printf '  company: %s\n  key:     %s  %s\n' "$UKU_COMPANY" "$(_mask_key "$UKU_KEY")" "$(_green 'valid')" >&2
       else
-        warn "Credentials stored but the API rejected them (HTTP $REPLY_STATUS)"
-        printf '  company: %s\n  key:     %s\n' "$UKU_COMPANY" "$masked" >&2
+        warn "Account '$UKU_PROFILE' stored but the API rejected it (HTTP $REPLY_STATUS)"
         exit "$EX_AUTH"
       fi
       ;;
     logout)
-      rm -f "$UKU_CRED_FILE" && info "Signed out (removed $UKU_CRED_FILE)." || warn "No stored credentials."
+      load_creds
+      local target="${UKU_ACCOUNT_CLI:-$UKU_PROFILE}" f
+      f="$(_profile_path "$target")"
+      if [ -f "$f" ]; then rm -f "$f"; info "Signed out of account '$target' (removed profile)."; else warn "No stored credentials for account '$target'."; fi
+      [ "$(active_profile)" = "$target" ] && rm -f "$UKU_ACTIVE_FILE" 2>/dev/null || true
       ;;
     *) die "Unknown: uku auth $sub  (login|status|logout)" "$EX_USAGE" ;;
+  esac
+}
+
+# ── Accounts — Uku's one-login-many-companies, in the CLI ─────────────
+# Keep a real firm and a sandbox side by side; rehearse changes on the
+# sandbox, then run the same command against the main account.
+cmd_account() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list|ls)
+      local act; act="$(active_profile)"
+      local any=0 name
+      while IFS= read -r name; do
+        [ -z "$name" ] && continue; any=1
+        local f; f="$(_profile_path "$name")"
+        local co; co="$(_profile_get "$f" UKU_COMPANY)"
+        local mark="  "; [ "$name" = "$act" ] && mark="$(_green '●')"
+        if _is_tty; then printf '%s %s  %s\n' "$mark" "$(_bold "$name")" "$(_dim "$co")"
+        else printf '%s\t%s\t%s\n' "$([ "$name" = "$act" ] && echo active || echo -)" "$name" "$co"; fi
+      done <<EOF
+$(list_profiles)
+EOF
+      [ "$any" = "1" ] || warn "No accounts yet. Add one: uku auth login --account <name>"
+      ;;
+    add)
+      # sugar for: uku auth login --account NAME (+ any extra flags)
+      local name="${1:-}"; shift || true
+      [ -n "$name" ] || die "usage: uku account add <name> [--company <uuid>] [--key-stdin]" "$EX_USAGE"
+      _valid_name "$name" || die "Invalid account name '$name' (letters, digits, . _ -)." "$EX_USAGE"
+      cmd_auth login --account "$name" "$@"
+      ;;
+    use|switch)
+      local name="${1:-}"
+      [ -n "$name" ] || die "usage: uku account use <name>" "$EX_USAGE"
+      [ -f "$(_profile_path "$name")" ] || die "No such account: $name  (uku account list)" "$EX_AUTH"
+      set_active "$name"; info "Now using account $(_bold "$name")."
+      ;;
+    current|who)
+      local act; act="$(active_profile)"
+      if [ "${UKU_JSON:-0}" = "1" ]; then printf '{"active":"%s"}\n' "$act"; else printf '%s\n' "$act"; fi
+      ;;
+    remove|rm)
+      local name="${1:-}"
+      [ -n "$name" ] || die "usage: uku account remove <name>" "$EX_USAGE"
+      local f; f="$(_profile_path "$name")"
+      [ -f "$f" ] || die "No such account: $name" "$EX_AUTH"
+      rm -f "$f"; info "Removed account '$name'."
+      [ "$(active_profile)" = "$name" ] && rm -f "$UKU_ACTIVE_FILE" 2>/dev/null || true
+      ;;
+    *) die "usage: uku account <list|add|use|current|remove>" "$EX_USAGE" ;;
   esac
 }
 
@@ -342,9 +487,16 @@ $(_bold "ESCAPE HATCH")  (any endpoint in the API v3)
   uku api GET  /api/v3/members --query limit=5
   uku api POST /api/v3/tasks --data @task.json --yes
 
+$(_bold "ACCOUNTS")  (one login, many companies — keep a sandbox beside your main firm)
+  uku auth login --account sandbox    Sign a second company in
+  uku account list                    Show accounts (● = active)
+  uku account use <name>              Switch the active account
+  uku --account main invoices list    Run one command against a specific account
+
 $(_bold "GLOBAL FLAGS")
   --json            Raw JSON (default when stdout is not a TTY)
   --yes, -y         Confirm a non-interactive write
+  --account <name>  Run against a specific account (default: the active one)
   --base <url>      Override the API base URL
   -h, --help        This help
   --version         Print version
@@ -363,6 +515,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --json) UKU_JSON=1; shift ;;
     -y|--yes) UKU_YES=1; shift ;;
+    --account) UKU_ACCOUNT_CLI="${2:-}"; shift 2 ;;
     --base) UKU_BASE_CLI="${2:-}"; shift 2 ;;
     -h|--help) usage; exit "$EX_OK" ;;
     --version|-V) printf 'uku %s\n' "$UKU_VERSION"; exit "$EX_OK" ;;
@@ -375,6 +528,7 @@ require_curl
 cmd="${1:-help}"; shift || true
 case "$cmd" in
   auth)     cmd_auth "$@" ;;
+  account|accounts) cmd_account "$@" ;;
   clients)  cmd_clients "$@" ;;
   tasks)    cmd_tasks "$@" ;;
   time)     cmd_time "$@" ;;
