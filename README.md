@@ -126,6 +126,14 @@ uku doctor    # checks PATH, shadowing, curl/jq/bash, config perms, key validity
 Rename the function, or call the CLI explicitly as `command uku`. `uku doctor`
 and the installer both detect and warn about this.
 
+## Documentation
+
+- `uku --help` — the command surface · `uku help <command>` — a focused card
+- `uku api --describe [resource]` — the API v3 endpoint map + required fields
+- [`SECURITY.md`](SECURITY.md) — how credentials are protected + the scope model
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — development ground rules (bash 3.2, safety)
+- API reference: <https://app.getuku.com/api/v3/docs> · agent guide: <https://getuku.com/agents/>
+
 ## What's next
 
 - Official **MCP server** (chat assistants operate Uku with no glue code) — coming.
