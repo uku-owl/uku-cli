@@ -21,22 +21,49 @@ never required (`--json` always gives you raw JSON).
 
 To install somewhere specific: `UKU_BIN_DIR=~/bin curl -fsSL https://getuku.com/install-cli | sh`
 
+On a terminal the installer offers to sign you in and connect your coding agents
+right away. Or run it yourself:
+
 ## Sign in
 
 ```sh
 uku auth login      # prompts for your Company UUID + API key (Uku → Settings → API)
-uku auth status     # confirms the key works, shows the company (key is masked)
+uku auth status     # confirms the key works, shows the account (key is masked)
 uku auth logout
 ```
 
-Credentials are stored at `~/.config/uku/credentials`, mode `0600`. The key is
-never printed. In CI or an agent sandbox, skip `login` and pass credentials as
-environment variables instead:
+Credentials are stored per account at `~/.config/uku/profiles/<name>`, mode `0600`;
+the key is never printed. In CI or an agent sandbox, skip `login` and pass
+credentials as environment variables (they override the stored account):
 
 ```sh
 export UKU_COMPANY="…company-uuid…"
 export UKU_API_KEY="uku_live_…"
+# or non-interactively persist an account:
+printf '%s' "$KEY" | uku auth login --account ci --company <uuid> --key-stdin
 ```
+
+## Accounts — one login, many companies
+
+Uku lets one person hold several companies. Keep a **sandbox** beside your main
+firm: rehearse a change (price edits, invoices) on the sandbox, then run the same
+command against the real account.
+
+```sh
+uku auth login --account sandbox     # sign a second company in
+uku account list                     # ● marks the active account
+uku account use main                 # switch the active account
+uku --account sandbox invoices list  # run one command against a specific account
+```
+
+## Connect your coding agents
+
+```sh
+uku setup agents    # installs a skill for Claude Code / Cursor + an AGENTS.md block
+```
+
+This teaches your agents the `uku` contract once — the commands, the JSON/exit-code
+model, and above all the safety rules — so every future session knows the tool.
 
 ## Use it
 
