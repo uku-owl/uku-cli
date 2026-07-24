@@ -443,6 +443,106 @@ cmd_api() {
   check_status "$REPLY_BODY"; render "$REPLY_BODY"
 }
 
+# ── setup: connect coding agents (the agent-native handshake) ────────
+# Writes a skill/rule file that teaches an agent the uku contract ONCE, so
+# every future session knows the tool — and, above all, the safety model.
+_uku_skill_md() {
+cat <<'SKILL'
+---
+name: uku
+description: Operate a firm's Uku (accounting practice management) from the terminal with the `uku` CLI — read clients, tasks, time entries and invoices, and make scoped writes. Use whenever the user asks to look up, list, count, log, draft, send or update anything in their Uku account.
+---
+
+# uku — operate Uku from the terminal
+
+`uku` is a command-line client over the Uku API v3. Prefer it for any Uku data task; it is faster and safer than raw HTTP.
+
+## The safety contract — read this first
+- **Reads are free.** `uku clients list`, `uku tasks list`, `uku invoices list`, `uku <res> get <id>`.
+- **Writes ask first.** A write needs `--yes` (or an interactive confirm). Before you add `--yes`, state in plain words exactly what you are about to change, and prefer to let the human confirm.
+- **Money has its own key.** Financial actions need an *All*-scope key. A `HTTP 403 … scope` error is the system working as designed — surface it to the user, do **not** retry or try to work around it.
+- **Accounts.** A user may have several: a real firm and a **sandbox**. Run `uku account current` before any write, and confirm you are on the intended account. `--account <name>` targets one command.
+
+## Output & exit codes (this is your API)
+- `--json` is the default when output is not a TTY — you already receive JSON. Lists wrap as `{ "data": [ … ], "meta": { "total", "limit", "offset", "has_more", "next_cursor" } }`; a single get wraps as `{ "data": { … } }`. Parse `.data`.
+- Exit codes: **0** ok · **1** usage · **2** auth (tell the user to run `uku auth login`) · **3** API error · **4** a write was refused because `--yes` was missing.
+
+## Commands
+- `uku auth status [--json]` — who/which account you're acting as.
+- `uku account list | current | use <name>` — accounts.
+- `uku clients list [--q X] [--status S] [--limit N]` · `uku clients get <id>`
+- `uku tasks list` · `uku time list` · `uku invoices list [--status draft]` · `uku invoices get <id>`
+- `uku invoices create --data @file.json --yes` — a deliberate write.
+- `uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]` — every one of the 80+ v3 endpoints. Use this for anything without a first-class command.
+
+## Examples
+```
+uku clients list --q "acme" --limit 5
+uku tasks list --status open --json | jq '.data[] | {id, title}'
+uku api GET /api/v3/time-entries --query client_id=211310 --json
+# a write — describe it, then confirm:
+echo '{"client_id":211310}' | uku api POST /api/v3/invoices --data @- --yes
+```
+
+Docs: https://app.getuku.com/api/v3/docs
+SKILL
+}
+
+_detect_agent() { # prints: claude / cursor / codex if detectable, else nothing
+  { [ -d "$HOME/.claude" ] || have claude; } && printf 'claude\n' || true
+  { [ -d ".cursor" ] || have cursor; } && printf 'cursor\n' || true
+  { [ -f "AGENTS.md" ] || have codex; } && printf 'codex\n' || true
+  return 0
+}
+
+_setup_claude() {
+  local dir="$HOME/.claude/skills/uku"
+  mkdir -p "$dir" || { warn "Could not create $dir"; return 1; }
+  _uku_skill_md > "$dir/SKILL.md"
+  info "Claude Code — skill installed ($dir/SKILL.md)"
+}
+_setup_cursor() {
+  mkdir -p ".cursor/rules" 2>/dev/null || { warn "No writable .cursor/rules here (run in your project)"; return 1; }
+  _uku_skill_md > ".cursor/rules/uku.mdc"
+  info "Cursor — rule installed (.cursor/rules/uku.mdc)"
+}
+_setup_codex() {
+  local f="AGENTS.md"
+  if [ -f "$f" ] && grep -q '<!-- uku:begin -->' "$f" 2>/dev/null; then
+    info "AGENTS.md — uku block already present (left as-is)"; return 0
+  fi
+  { printf '\n<!-- uku:begin -->\n'; _uku_skill_md; printf '<!-- uku:end -->\n'; } >> "$f"
+  info "Generic — appended uku block to ./AGENTS.md"
+}
+
+cmd_setup() {
+  local sub="${1:-agents}"; shift || true
+  [ "$sub" = "agents" ] || die "usage: uku setup agents" "$EX_USAGE"
+  local want="${UKU_SETUP_AGENT:-auto}"
+  case "$want" in
+    none) info "Skipping agent setup (UKU_SETUP_AGENT=none)."; return 0 ;;
+    all) _setup_claude; _setup_cursor; _setup_codex ;;
+    claude) _setup_claude ;;
+    cursor) _setup_cursor ;;
+    codex) _setup_codex ;;
+    auto|*)
+      local found; found="$(_detect_agent | sort -u)"
+      if [ -z "$found" ]; then
+        warn "No coding agent detected — installing the shared Claude Code skill anyway."
+        _setup_claude
+        printf '  %s\n' "$(_dim 'Cursor: uku setup agents (in your project) · Codex/other: adds an AGENTS.md block')" >&2
+      else
+        printf '%s\n' "$found" | while IFS= read -r a; do case "$a" in
+          claude) _setup_claude ;; cursor) _setup_cursor ;; codex) _setup_codex ;;
+        esac; done
+      fi ;;
+  esac
+  printf '\n  %s\n  %s %s %s\n' \
+    "$(_bold 'Your agent can now operate Uku.')" \
+    "$(_dim 'Reads are free · writes ask first ·')" "$(_color 33 'money has its own key.')" "" >&2
+  return 0
+}
+
 # ── Flag parsing for sub-commands (fills UKU_QUERY, UKU_DATA) ─────────
 parse_list_flags() {
   UKU_QUERY=(); UKU_DATA="${UKU_DATA:-}"
@@ -529,6 +629,7 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   auth)     cmd_auth "$@" ;;
   account|accounts) cmd_account "$@" ;;
+  setup)    cmd_setup "$@" ;;
   clients)  cmd_clients "$@" ;;
   tasks)    cmd_tasks "$@" ;;
   time)     cmd_time "$@" ;;
