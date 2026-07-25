@@ -682,6 +682,26 @@ cmd_doctor() {
   _DOC_ROWS=""; _DOC_FAILS=0; _DOC_WARNS=0
   local resolved; resolved="$(command -v uku 2>/dev/null || true)"
   [ -n "$resolved" ] && _doc ok "uku on PATH → $resolved" || _doc warn "uku is not on your PATH (installed but PATH not set?)"
+  # Version + where updates come from. doctor is the one place that always
+  # asks the network, so drift between the shipped constant and the published
+  # VERSION shows up here rather than silently.
+  if have curl; then
+    # || true is load-bearing: set -euo pipefail is on, and doctor is
+    # documented offline-safe (T3) — a failed probe must never abort the report.
+    local remote_v; remote_v="$(curl -fsS --max-time 3 "$UKU_UPDATE_URL" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -z "$remote_v" ]; then
+      _doc warn "version $UKU_VERSION — could not reach the update source"
+    elif [ "$remote_v" = "$UKU_VERSION" ]; then
+      _doc ok "version $UKU_VERSION (latest)"
+    else
+      _doc warn "version $UKU_VERSION — $remote_v is available; run 'uku update'"
+    fi
+  fi
+  if [ "${UKU_NO_AUTO_UPDATE:-0}" = "1" ]; then
+    _doc ok "auto-update off (UKU_NO_AUTO_UPDATE=1)"
+  else
+    _doc ok "auto-update on — checks once a day, updates when VERSION is bumped"
+  fi
   local sh; sh="$(_detect_shadow)"
   [ -n "$sh" ] && _doc warn "a shell function/alias 'uku' in $sh shadows this binary — rename it, or call 'command uku'"
   have curl && _doc ok "curl present" || _doc fail "curl missing (required)"
@@ -740,7 +760,7 @@ cmd_update() {
   have curl || die "curl is required to update." "$EX_USAGE"
   info "Updating uku (current $UKU_VERSION) → newest, into $dir"
   # pin the install dir to where uku already lives (no second binary, T11) + skip the sign-in re-prompt (N14)
-  UKU_BIN_DIR="$dir" UKU_SKIP_SETUP=1 curl -fsSL "$url" | sh
+  UKU_BIN_DIR="$dir" UKU_SKIP_SETUP=1 UKU_NO_AUTO_UPDATE=1 curl -fsSL "$url" | sh
 }
 
 # uku completions <bash|zsh> — source-able completion for the top-level commands.
@@ -1049,11 +1069,53 @@ while [ $# -gt 0 ]; do
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
+# ── auto-update ───────────────────────────────────────────────────────
+# Updates should reach people without them thinking about it, but not by
+# following main HEAD: that would put every push, including work in progress,
+# on every machine within a day. So the gate is the VERSION file in the repo —
+# we push freely and clients only move when we deliberately bump the number.
+#
+# Checked at most once a day (a timestamp under UKU_CONFIG_HOME), with a hard
+# 3s timeout, and every failure is silent: a CLI must not break because a
+# version check could not reach the network.
+#
+# The replace is safe mid-run because the installer renames into place; the
+# running bash keeps reading the old inode. Never overwrite the file in place.
+UKU_UPDATE_URL="${UKU_UPDATE_URL:-https://raw.githubusercontent.com/uku-owl/uku-cli/main/VERSION}"
+auto_update() {
+  [ "${UKU_NO_AUTO_UPDATE:-0}" = "1" ] && return 0
+  have curl || return 0
+  local stamp="$UKU_CONFIG_HOME/last-update-check" now today
+  now="$(date +%s 2>/dev/null)" || return 0
+  today="$((now - 86400))"
+  if [ -f "$stamp" ]; then
+    local last; last="$(cat "$stamp" 2>/dev/null || printf '0')"
+    case "$last" in (*[!0-9]*|'') last=0 ;; esac
+    [ "$last" -gt "$today" ] && return 0
+  fi
+  mkdir -p "$UKU_CONFIG_HOME" 2>/dev/null || return 0
+  # Stamp BEFORE acting: a bumped VERSION that does not match the shipped
+  # constant must retry tomorrow, never loop on every invocation.
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || return 0
+  local remote
+  remote="$(curl -fsS --max-time 3 "$UKU_UPDATE_URL" 2>/dev/null | tr -d '[:space:]')" || return 0
+  [ -n "$remote" ] || return 0
+  case "$remote" in (*[!0-9.]*) return 0 ;; esac   # ignore anything that is not a version
+  [ "$remote" = "$UKU_VERSION" ] && return 0
+  warn "uku $remote is available (you have $UKU_VERSION) — updating…"
+  cmd_update >&2 2>/dev/null && warn "updated to $remote; it applies to your next command." || true
+  return 0
+}
+
 require_curl
 # --help anywhere → the card for the named command (or global usage)
 [ "$UKU_HELP" = "1" ] && { cmd_help "${1:-}"; exit "$EX_OK"; }
 
 cmd="${1:-__firstrun__}"; shift || true
+case "$cmd" in
+  update|version|help|completions|doctor) : ;;   # never self-update these
+  *) auto_update ;;
+esac
 case "$cmd" in
   __firstrun__) first_run ;;
   auth)     cmd_auth "$@" ;;
