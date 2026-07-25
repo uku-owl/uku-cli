@@ -11,16 +11,22 @@
 # Options (via environment):
 #   UKU_BIN_DIR       Where to install (default: ~/.local/bin, or ~/bin if on PATH)
 #   UKU_VERSION       Pin a version (default: latest served at the base URL)
-#   UKU_BASE_URL_DL   Where to fetch uku + uku.sha256 (default: https://getuku.com)
+#   UKU_BASE_URL_DL   Raw repo base to fetch bin/uku from
+#                     (default: https://raw.githubusercontent.com/uku-owl/uku-cli)
 #   UKU_SKIP_SETUP    Set to 1 to skip the post-install sign-in + agent setup
 #   UKU_SETUP_AGENT   claude | cursor | codex | all | none  (forwarded to `uku setup agents`)
 #   NO_COLOR          Disable colored output
 set -eu
 
-DL_BASE="${UKU_BASE_URL_DL:-https://getuku.com}"
+# The repo is the single source of truth: the script you are reading and the
+# binary it installs both come from raw.githubusercontent, so there is no
+# second copy on the website to drift out of sync. getuku.com/install-cli is a
+# vanity redirect to this same file — the published one-liner never changes
+# even if this target does.
+DL_BASE="${UKU_BASE_URL_DL:-https://raw.githubusercontent.com/uku-owl/uku-cli}"
 VERSION="${UKU_VERSION:-}"
-# versioned path (/uku/v1.2.3) when pinned, else the rolling /uku
-if [ -n "$VERSION" ]; then SRC="$DL_BASE/uku/v$VERSION"; else SRC="$DL_BASE/uku"; fi
+# A pinned version resolves to that git tag; unpinned follows main.
+if [ -n "$VERSION" ]; then SRC="$DL_BASE/v$VERSION/bin/uku"; else SRC="$DL_BASE/main/bin/uku"; fi
 
 # ── output helpers (respect NO_COLOR + non-tty) ───────────────────────
 if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then
@@ -78,7 +84,14 @@ else
   elif [ "${UKU_REQUIRE_CHECKSUM:-0}" = "1" ]; then
     err "no checksum published and UKU_REQUIRE_CHECKSUM=1 — refusing to install unverified."
   fi
-  step "$(red '! checksum not published — installing UNVERIFIED. Pin a version (UKU_VERSION=x.y.z) for a verified install.')"
+  # No checksum on the rolling install, and that is deliberate rather than an
+  # oversight: a checksum served from the same repo and commit as the file it
+  # describes verifies transport, not authenticity — anyone who could swap the
+  # binary could swap the checksum with it. The real anchor here is TLS to
+  # GitHub plus a public, auditable repo. A published checksum starts meaning
+  # something at a tagged release, which is why a pinned version still refuses
+  # to install without one.
+  step "$(dim 'Source:') $(bold 'github.com/uku-owl/uku-cli') $(dim '(public, over HTTPS) — read it before you run it.')"
 fi
 
 # ── install ───────────────────────────────────────────────────────────
