@@ -3,14 +3,18 @@
 #
 #   curl -fsSL https://getuku.com/install-cli | sh
 #
-# Downloads a single self-contained script to a directory on your PATH,
-# verifies its checksum, adds the directory to PATH, and — when run in a
-# terminal — offers to sign you in. No compilation, no dependencies beyond
-# `curl` (and `bash`, which `uku` itself uses).
+# Downloads a single self-contained script to a directory on your PATH, adds
+# that directory to PATH, and — when run in a terminal — offers to sign you in.
+# It does NOT verify a checksum: none is published for the rolling install, and
+# one served from the same repo and commit as the file would prove transport,
+# not authenticity. The anchor is HTTPS to a public, readable repo.
+# No compilation, no dependencies beyond `curl` (and `bash`, which `uku` uses).
 #
 # Options (via environment):
 #   UKU_BIN_DIR       Where to install (default: ~/.local/bin, or ~/bin if on PATH)
-#   UKU_VERSION       Pin a version (default: latest served at the base URL)
+#   UKU_VERSION       Pin a git tag (e.g. 0.1.0). No tags are published yet,
+#                     so this currently fails by design rather than silently
+#                     installing something unpinned.
 #   UKU_BASE_URL_DL   Raw repo base to fetch bin/uku from
 #                     (default: https://raw.githubusercontent.com/uku-owl/uku-cli)
 #   UKU_SKIP_SETUP    Set to 1 to skip the post-install sign-in + agent setup
