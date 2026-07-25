@@ -112,6 +112,7 @@ without ever being able to move money.
 | `UKU_API_KEY`, `UKU_COMPANY` | credentials (override the stored file — ideal for CI/agents) |
 | `UKU_BASE_URL` | override the API base (default `https://app.getuku.com`) |
 | `UKU_BIN_DIR` | install location (installer) |
+| `UKU_SKIP_PATH` | set to `1` so the installer leaves your shell rc files alone (sandboxed / CI installs) |
 | `UKU_CONFIG_HOME` | credentials directory (default `~/.config/uku`) |
 | `NO_COLOR` | disable colored output |
 

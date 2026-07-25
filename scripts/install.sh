@@ -87,7 +87,13 @@ trap 'rm -f "$SUM"' EXIT
 info "Installed → $(bold "$TARGET")"
 
 # ── PATH, handled (append to the right rc, idempotent; fish/nushell aware) ──
-if ! on_path "$BIN_DIR"; then
+# UKU_SKIP_PATH=1 leaves the user's shell rc files untouched. Needed for
+# sandboxed installs (CI, testing a throwaway UKU_BIN_DIR): appending a PATH
+# line to a real ~/.zshrc for a temp directory is a side effect nobody asked
+# for, and it outlives the temp dir.
+if [ "${UKU_SKIP_PATH:-0}" = "1" ]; then
+  step "Skipping PATH setup (UKU_SKIP_PATH=1). Add it yourself:  $(dim "export PATH=\"$BIN_DIR:\$PATH\"")"
+elif ! on_path "$BIN_DIR"; then
   case "${SHELL:-}" in
     *fish)
       LINE="fish_add_path $BIN_DIR"; RC="$HOME/.config/fish/config.fish" ;;
