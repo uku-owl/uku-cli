@@ -122,11 +122,18 @@ uku api POST /api/v3/contracts/41219/rows --data @row.json --yes
 # 428 → re-sent once with If-Match from /api/v3/contracts/41219
 ```
 
-The ETag lives on the **parent resource**, not the sub-collection: for
-`POST /contracts/{id}/rows` the server accepts the ETag of `GET /contracts/{id}`
-(`GET /contracts/{id}/rows` carries no ETag at all). The CLI tries the most
-specific `GET`able path first and walks up, so it follows the API rather than a
-hardcoded table.
+Which resource's ETag applies depends on the write, so the CLI tries the most
+specific `GET`able path first and walks up rather than following a hardcoded
+table. Measured against the live API:
+
+| Write | ETag the server accepts |
+|---|---|
+| `POST /contracts/{id}/rows` | the **parent**, `GET /contracts/{id}` — the collection `GET /contracts/{id}/rows` carries no ETag at all |
+| `DELETE /contracts/{id}/rows/{row_id}` | the **row's own**, `GET /contracts/{id}/rows/{row_id}` |
+| `POST /invoices/{id}/send`, `/mark-paid` | `GET /invoices/{id}` (the trailing verb is stripped) |
+
+The ETag is the record's own `updated_at`, so adding or removing a contract row
+does not change the parent contract's ETag, and neither does a no-op `PATCH`.
 
 Assert a version yourself with `--if-match '<etag>'`. Then a 428 is **not**
 healed — the value you chose is what the server rejected, and only you can fix it.

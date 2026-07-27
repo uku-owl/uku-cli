@@ -288,15 +288,21 @@ _guard_time_entry() {
 # _etag_candidates PATH — the GET paths that might carry this write's ETag,
 # most specific first.
 #
-# EMPIRICAL (verified 2026-07-27 against app.getuku.com): a sub-collection GET
-# does NOT carry an ETag — `GET /api/v3/contracts/41219/rows` returns no ETag
-# header at all, while `GET /api/v3/contracts/41219` returns
-# `etag: W/"2026-07-27T09:23:28.783836+00:00"`, and THAT is the value the
-# server accepts for `POST /api/v3/contracts/41219/rows`. So the guarded
-# resource for a sub-collection write is the PARENT. We still try the most
-# specific GETable path first and walk up, because the API is the authority —
-# a static "financial paths" table would be wrong (If-Match is declared
-# optional on 18 endpoints and 428 is declared on nearly every DELETE).
+# EMPIRICAL (measured 2026-07-27 against app.getuku.com, contract 41219):
+#   GET /contracts/41219            → etag: W/"2026-07-27T09:23:28.783836+00:00"
+#   GET /contracts/41219/rows       → NO ETag header at all  (a collection)
+#   GET /contracts/41219/rows/66131 → etag: W/"2026-07-27T09:03:29.242577+00:00"
+# and the server accepted, respectively: the PARENT contract's ETag for
+# `POST /contracts/41219/rows`, and the ROW's own ETag for
+# `DELETE /contracts/41219/rows/{row_id}`. So neither "always the parent" nor
+# "always the path you wrote to" is right — the rule that holds is: try the most
+# specific GETable path, then walk up. The API stays the authority. A static
+# "financial paths" table would be wrong anyway: If-Match is declared optional
+# on all 18 endpoints that take it, and 428 is declared on nearly every DELETE.
+#
+# Note the ETag is the resource's own updated_at: adding or removing a contract
+# row does NOT bump the parent contract's ETag, and a no-op PATCH does not bump
+# it either. Only a real field change does.
 _looks_like_id() { case "$1" in ''|*[!0-9a-fA-F-]*) return 1 ;; *[0-9]*) return 0 ;; *) return 1 ;; esac; }
 _etag_candidates() {
   local p="${1%%\?*}"; p="${p%/}"
