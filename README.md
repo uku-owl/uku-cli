@@ -5,7 +5,7 @@ It gives terminals, scripts, CI, and coding agents (Claude Code, Cursor, Codex) 
 native way to operate a firm's Uku data — within the exact permissions of the API
 key you hand it.
 
-> **Status:** v0.1.0 — MVP. Read + the essential writes, plus an `api` escape
+> **Status:** v0.2.0 — MVP. Read + the essential writes, plus an `api` escape
 > hatch to every endpoint. Built on the real API v3 (no invented endpoints).
 
 ## Install
@@ -104,6 +104,78 @@ without ever being able to move money.
 | `2`  | not authenticated / credentials rejected |
 | `3`  | the API returned an error status (4xx/5xx) |
 | `4`  | a deliberate write was refused (no `--yes`, no TTY) |
+| `5`  | network error, or rate limited (HTTP 429) |
+| `6`  | conflict — someone else changed the record (HTTP 412). Re-read and re-apply. |
+
+## Concurrency: version checks (If-Match / ETag)
+
+Financial records — invoices, contracts and their rows, agreements, members,
+monitors — are guarded so two people can't silently overwrite each other. A
+guarded write must carry an `If-Match` header holding the `ETag` from the
+resource's `GET`.
+
+You do not have to manage this. If a write comes back **428**, the CLI fetches
+the current ETag and re-sends the request **once**:
+
+```sh
+uku api POST /api/v3/contracts/41219/rows --data @row.json --yes
+# 428 → re-sent once with If-Match from /api/v3/contracts/41219
+```
+
+The ETag lives on the **parent resource**, not the sub-collection: for
+`POST /contracts/{id}/rows` the server accepts the ETag of `GET /contracts/{id}`
+(`GET /contracts/{id}/rows` carries no ETag at all). The CLI tries the most
+specific `GET`able path first and walks up, so it follows the API rather than a
+hardcoded table.
+
+Assert a version yourself with `--if-match '<etag>'`. Then a 428 is **not**
+healed — the value you chose is what the server rejected, and only you can fix it.
+
+## Retry doctrine
+
+The status code tells you whether the write happened. Treat them differently:
+
+| Status | What happened | What to do |
+|---|---|---|
+| **428** `PRECONDITION_REQUIRED` | The write was refused for want of `If-Match`. **Nothing happened.** | Safe to re-send **once** with the ETag. The CLI does this for you. |
+| **412** `STALE_WRITE` (exit `6`) | Someone else changed the record after you read it. **Nothing was written.** | **Stop.** Re-read, re-apply your change on top of the current values, write again. Never automatic — a blind retry overwrites their edit. |
+| **429** rate limited (exit `5`) | For a write, the outcome is **unknown**. | **Never auto-retry a write.** `GET` to check whether it landed. The error says how many seconds until the window resets — wait, don't poll. |
+| **5xx / timeout** | Outcome **unknown**. | Same as 429: `GET` first. |
+| **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `TIMER_ALREADY_RUNNING`). | Re-sending the same request fails the same way. Change the request. |
+
+**Reads are idempotent and may be retried. Writes are not.**
+
+## Rate limits
+
+Every response carries `X-RateLimit-Limit / Remaining / Reset / Tier`; reads and
+writes are metered in separate buckets. The CLI reads them — there is no
+hardcoded local budget — and remembers the latest per account under
+`~/.config/uku` (mode `0600`). Before a write, if the last response said the
+write budget was spent and the window hasn't turned over, it waits for `Reset`
+rather than spending a 429 it could never safely retry. It waits at most
+`UKU_RL_MAX_WAIT` seconds (default `60`) and refuses rather than hanging.
+
+## Time entries — the one payload shape to avoid
+
+Uku reads a time entry with a `start` and **no `end`** as a *running timer*. So
+sending `duration` without `end` starts a timer instead of logging the work, and
+fails with `409 TIMER_ALREADY_RUNNING` if one is already running. The CLI
+refuses that payload **before** sending it. To log finished work, send `start`
+and `end`. Send `start` alone only when you really do mean to start a timer.
+
+## Dropping to curl
+
+When `uku api` can't express something, get the auth headers instead of digging
+them out of the profile file:
+
+```sh
+curl -K <(uku auth print-header) https://app.getuku.com/api/v3/health   # curl config form
+eval "$(uku auth print-header --shell)"                                 # UKU_COMPANY + UKU_API_KEY
+uku auth print-header --format plain                                    # "X-API-Key: …" lines
+```
+
+This prints a **live credential** on stdout — it warns you on stderr. Add
+`--dry-run` to see the shape with the key masked.
 
 ## Environment
 
@@ -114,6 +186,7 @@ without ever being able to move money.
 | `UKU_BIN_DIR` | install location (installer) |
 | `UKU_SKIP_PATH` | set to `1` so the installer leaves your shell rc files alone (sandboxed / CI installs) |
 | `UKU_CONFIG_HOME` | credentials directory (default `~/.config/uku`) |
+| `UKU_RL_MAX_WAIT` | longest the CLI will wait for a rate-limit window to reset (default `60`s; beyond it, it refuses instead of blocking) |
 | `NO_COLOR` | disable colored output |
 
 ## Troubleshooting

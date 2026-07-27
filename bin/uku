@@ -15,7 +15,7 @@
 #     exit codes, and `uku api` passes through to any endpoint.
 set -euo pipefail
 
-UKU_VERSION="0.1.0"
+UKU_VERSION="0.2.0"
 UKU_BASE_DEFAULT="https://app.getuku.com"
 UKU_CONFIG_HOME="${UKU_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/uku}"
 UKU_PROFILE_DIR="$UKU_CONFIG_HOME/profiles"   # one file per account (0600)
@@ -29,6 +29,7 @@ EX_AUTH=2      # not authenticated / auth rejected
 EX_API=3       # API returned an error status (4xx/5xx)
 EX_CONFIRM=4   # a deliberate write was refused (no --yes, no TTY)
 EX_NET=5       # network error / could not reach the API (retry-worthy)
+EX_CONFLICT=6  # HTTP 412 — the record changed under you. Re-read, re-apply. NEVER auto-retried.
 
 # ── Small helpers ────────────────────────────────────────────────────
 _is_tty()  { [ -t 1 ]; }
@@ -167,23 +168,200 @@ need_auth() {
 # status). Adds the two auth headers.
 REPLY_BODY=""
 REPLY_STATUS=0
+REPLY_HEADERS=""
 # curl -K config values live inside "…"; backslash-escape \ and " so a key or
 # company containing them can't silently corrupt the header (T12).
 _cfg_esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
 
+# _reply_header NAME — the trimmed value of one response header.
+# Names are case-insensitive per RFC 9110 (HTTP/2 sends them lowercased, so
+# "ETag" arrives as "etag"), the dump is CRLF-terminated, and a redirect leaves
+# several header blocks in one file — so: lowercase both sides, strip CR, and
+# keep the LAST match.
+_reply_header() {
+  [ -n "$REPLY_HEADERS" ] || return 0
+  printf '%s\n' "$REPLY_HEADERS" | tr -d '\r' | awk -v want="$1" '
+    BEGIN { want = tolower(want); val = "" }
+    { i = index($0, ":"); if (i < 2) next
+      k = tolower(substr($0, 1, i - 1))
+      if (k == want) val = substr($0, i + 1) }
+    END { gsub(/^[ \t]+/, "", val); gsub(/[ \t]+$/, "", val); if (val != "") print val }'
+}
+
+# ── Rate limits — the server declares them, we read them ──────────────
+# Every response carries X-RateLimit-{Limit,Remaining,Reset,Tier}. Reset is
+# epoch seconds. Reads and writes are metered in SEPARATE buckets (the `Tier`
+# header names the server's), so state is filed per request class — otherwise a
+# cheap `clients list` would keep resetting what we believe about the write
+# budget. No hardcoded local budget: guessing "30/min" would be wrong the day
+# the server changes.
+UKU_RL_MAX_WAIT="${UKU_RL_MAX_WAIT:-60}"   # never block longer than this; refuse instead
+_rl_file() { printf '%s/ratelimit-%s-%s' "$UKU_CONFIG_HOME" "${UKU_PROFILE:-default}" "$1"; }
+_rl_class() { case "$1" in GET|HEAD) printf 'read' ;; *) printf 'write' ;; esac; }
+_rl_capture() {
+  local lim rem rst tier f
+  lim="$(_reply_header X-RateLimit-Limit)";     rem="$(_reply_header X-RateLimit-Remaining)"
+  rst="$(_reply_header X-RateLimit-Reset)";     tier="$(_reply_header X-RateLimit-Tier)"
+  [ -n "$rem$rst" ] || return 0
+  f="$(_rl_file "$(_rl_class "$1")")"
+  mkdir -p "$UKU_CONFIG_HOME" 2>/dev/null || return 0
+  ( umask 077; printf 'limit=%s\nremaining=%s\nreset=%s\ntier=%s\n' "$lim" "$rem" "$rst" "$tier" > "$f" ) 2>/dev/null || true
+  chmod 600 "$f" 2>/dev/null || true
+  return 0
+}
+# _rl_when EPOCH — human time for a Reset value (BSD date first, then GNU).
+_rl_when() {
+  case "$1" in ''|*[!0-9]*) printf 'unknown' ; return 0 ;; esac
+  date -u -r "$1" +%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%H:%M:%SZ 2>/dev/null || printf 'epoch %s' "$1"
+}
+# _rl_wait_secs — seconds until the Reset in the CURRENT response, or "" .
+_rl_wait_secs() {
+  local rst now
+  rst="$(_reply_header X-RateLimit-Reset)"
+  case "$rst" in ''|*[!0-9]*) return 0 ;; esac
+  now="$(date +%s 2>/dev/null)" || return 0
+  local w=$(( rst - now )); [ "$w" -lt 0 ] && w=0
+  printf '%s' "$w"
+}
+# Pace BEFORE a write: if the last write response said the budget is spent and
+# the window has not turned over yet, wait it out rather than spend a 429 —
+# because a 429'd write can never be safely retried.
+_pace_write() {
+  local f rem rst now w
+  f="$(_rl_file write)"; [ -f "$f" ] || return 0
+  rem="$(_profile_get "$f" remaining)"; rst="$(_profile_get "$f" reset)"
+  case "$rem" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$rem" -gt 0 ] && return 0
+  case "$rst" in ''|*[!0-9]*) return 0 ;; esac
+  now="$(date +%s 2>/dev/null)" || return 0
+  w=$(( rst - now ))
+  [ "$w" -le 0 ] && return 0
+  if [ "$w" -gt "$UKU_RL_MAX_WAIT" ]; then
+    die "write rate limit is spent and does not reset for ${w}s (at $(_rl_when "$rst")). Refusing to block that long — nothing was sent. Re-run after then, or raise UKU_RL_MAX_WAIT." "$EX_NET"
+  fi
+  warn "write rate limit spent — waiting ${w}s for the window to reset ($(_rl_when "$rst"))…"
+  sleep "$w"
+  return 0
+}
+
+# Local ledger of every change (no bodies, no keys) — a receipt for accountants (#6).
+_audit() {
+  mkdir -p "$UKU_CONFIG_HOME" 2>/dev/null || return 0
+  local log="$UKU_CONFIG_HOME/audit.log"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)" \
+    "${UKU_PROFILE:-?}" "$1" "$2" "$3" >> "$log" 2>/dev/null || true
+  chmod 600 "$log" 2>/dev/null || true
+  return 0
+}
+
+# The single most expensive client-side mistake by volume: a time-entry write
+# carrying `duration` but no `end`. Uku reads "start, no end" as *open a running
+# timer*, so instead of logging the duration you asked for it starts a timer —
+# and 409s with TIMER_ALREADY_RUNNING when one already runs (14 such failures in
+# one day of Rain's audit log, more than 428 and 429 combined). Deliberately an
+# explicit, greppable check: generic client-side schema validation is a later wave.
+_guard_time_entry() {
+  local method="$1" path="$2" data="$3"
+  [ -n "$data" ] || return 0
+  case "$method" in POST|PATCH|PUT) : ;; *) return 0 ;; esac
+  case "${path%%\?*}" in /api/v3/time-entries|/api/v3/time-entries/*) : ;; *) return 0 ;; esac
+  local has_dur=0 has_end=0
+  if have jq; then
+    if printf '%s' "$data" | jq -e 'has("duration") and (.duration != null)' >/dev/null 2>&1; then has_dur=1; fi
+    if printf '%s' "$data" | jq -e 'has("end") and (.end != null)' >/dev/null 2>&1; then has_end=1; fi
+  else
+    # jq is optional — fall back to matching the KEY (not free text), so a
+    # description mentioning "end" can't trip the guard.
+    if printf '%s' "$data" | grep -Eq '"duration"[[:space:]]*:[[:space:]]*[0-9]'; then has_dur=1; fi
+    if printf '%s' "$data" | grep -Eq '"end"[[:space:]]*:[[:space:]]*"'; then has_end=1; fi
+  fi
+  [ "$has_dur" = "1" ] || return 0
+  [ "$has_end" = "0" ] || return 0
+  die "this time-entry write sets \"duration\" but no \"end\" — nothing was sent.
+    Uku treats a time entry with a start and no end as a RUNNING TIMER, so this
+    would open a timer instead of logging the duration, and fail with
+    409 TIMER_ALREADY_RUNNING if a timer is already running.
+    • To log finished work:      send \"start\" and \"end\" (drop \"duration\").
+    • To start a timer on purpose: send \"start\" only (drop \"duration\")." "$EX_USAGE"
+}
+
+# _etag_candidates PATH — the GET paths that might carry this write's ETag,
+# most specific first.
+#
+# EMPIRICAL (verified 2026-07-27 against app.getuku.com): a sub-collection GET
+# does NOT carry an ETag — `GET /api/v3/contracts/41219/rows` returns no ETag
+# header at all, while `GET /api/v3/contracts/41219` returns
+# `etag: W/"2026-07-27T09:23:28.783836+00:00"`, and THAT is the value the
+# server accepts for `POST /api/v3/contracts/41219/rows`. So the guarded
+# resource for a sub-collection write is the PARENT. We still try the most
+# specific GETable path first and walk up, because the API is the authority —
+# a static "financial paths" table would be wrong (If-Match is declared
+# optional on 18 endpoints and 428 is declared on nearly every DELETE).
+_looks_like_id() { case "$1" in ''|*[!0-9a-fA-F-]*) return 1 ;; *[0-9]*) return 0 ;; *) return 1 ;; esac; }
+_etag_candidates() {
+  local p="${1%%\?*}"; p="${p%/}"
+  # trailing action segments are verbs on the resource, not resources
+  case "$p" in */send) p="${p%/send}" ;; */mark-paid) p="${p%/mark-paid}" ;; */rotate) p="${p%/rotate}" ;; */undo) p="${p%/undo}" ;; esac
+  local out="" up up2
+  if _looks_like_id "${p##*/}"; then out="$p"; fi
+  up="${p%/*}"
+  if [ "$up" != "$p" ] && _looks_like_id "${up##*/}"; then out="$out${out:+ }$up"; fi
+  up2="${up%/*}"
+  if [ "$up2" != "$up" ] && _looks_like_id "${up2##*/}"; then out="$out${out:+ }$up2"; fi
+  printf '%s' "$out"
+}
+
+# 428 = PRECONDITION_REQUIRED: the server refused the write for want of an
+# If-Match, so NOTHING happened — which makes exactly one automatic resend safe.
+# Fetch the current ETag, resend the original request once. Never a loop
+# (_UKU_NO_HEAL guards the recursion), and never when the user supplied their
+# own --if-match: then the value they chose was rejected and only they can fix it.
+_heal_428() {
+  local method="$1" path="$2" data="$3"
+  if [ -n "${UKU_IF_MATCH:-}" ]; then _UKU_428_SUPPLIED=1; return 1; fi
+  local cands; cands="$(_etag_candidates "$path")"
+  [ -n "$cands" ] || return 1
+  local save_body="$REPLY_BODY" save_status="$REPLY_STATUS" save_hdrs="$REPLY_HEADERS"
+  local c etag="" src=""
+  for c in $cands; do
+    _UKU_NO_HEAL=1 UKU_SOFT=1 do_request GET "$c" || true
+    etag=""
+    case "$REPLY_STATUS" in 2*) etag="$(_reply_header ETag)" ;; esac
+    if [ -n "$etag" ]; then src="$c"; break; fi
+  done
+  if [ -z "$etag" ]; then
+    REPLY_BODY="$save_body"; REPLY_STATUS="$save_status"; REPLY_HEADERS="$save_hdrs"
+    return 1
+  fi
+  # stdout belongs to the caller's JSON — the heal is a stderr/audit-log event only.
+  _audit "HEAL428" "$path" "if-match-from=$src"
+  if _is_tty; then printf '  %s\n' "$(_dim "428 → re-sent once with If-Match from $src")" >&2; fi
+  _UKU_NO_HEAL=1 _UKU_IF_MATCH_SEND="$etag" do_request "$method" "$path" "$data"
+  return 0
+}
+
 do_request() {
   local method="$1" path="$2" data="${3:-}"
   local url="$UKU_BASE$path"
-  local tmp cfg; tmp="$(_mktemp)"; cfg="$(_mktemp)"; chmod 600 "$cfg" 2>/dev/null || true
+  _guard_time_entry "$method" "$path" "$data"
+  case "$method" in GET|HEAD) : ;; *) _pace_write ;; esac
+  local tmp cfg hdrf; tmp="$(_mktemp)"; cfg="$(_mktemp)"; hdrf="$(_mktemp)"
+  chmod 600 "$cfg" "$hdrf" 2>/dev/null || true
   # Auth headers go through a 0600 curl config file (-K), never argv — so the
-  # API key can't be read from `ps` on a multi-user host.
+  # API key can't be read from `ps` on a multi-user host. --header values get the
+  # same treatment: a user-supplied header may itself be a credential.
+  local im="${_UKU_IF_MATCH_SEND:-${UKU_IF_MATCH:-}}"
   { printf 'header = "X-Uku-Company: %s"\n' "$(_cfg_esc "$UKU_COMPANY")"
     printf 'header = "X-API-Key: %s"\n' "$(_cfg_esc "$UKU_KEY")"
+    local h
+    for h in ${UKU_HEADERS[@]+"${UKU_HEADERS[@]}"}; do printf 'header = "%s"\n' "$(_cfg_esc "$h")"; done
+    if [ -n "$im" ]; then printf 'header = "If-Match: %s"\n' "$(_cfg_esc "$im")"; fi
   } > "$cfg"
   local -a args=(-sS -X "$method" "$url" -K "$cfg"
     -H "Accept: application/json"
     -H "User-Agent: uku-cli/$UKU_VERSION"
     --connect-timeout 10 --max-time 120
+    -D "$hdrf"
     -w '%{http_code}' -o "$tmp")
   case "$url" in https://*) args+=(--proto '=https' --tlsv1.2) ;; esac  # pin TLS for https bases; allow http dev base
   case "$method" in GET|HEAD) args+=(--retry 2 --retry-connrefused) ;; esac  # retry idempotent reads only
@@ -196,24 +374,47 @@ do_request() {
   # --dry-run: show exactly what would be sent (headers masked), send nothing (#5).
   if [ "${UKU_DRY:-0}" = "1" ]; then
     printf '%s\n' "$(_bold '[dry-run] would send:')" >&2
-    printf '  %s %s\n  %s\n  %s\n' "$method" "$url" \
-      "$(_dim "X-Uku-Company: $UKU_COMPANY  ·  X-API-Key: $(_mask_key "$UKU_KEY")")" \
-      "$([ -n "$data" ] && printf 'body: %s' "$data" || printf 'no body')" >&2
+    printf '  %s %s\n  %s\n' "$method" "$url" \
+      "$(_dim "X-Uku-Company: $UKU_COMPANY  ·  X-API-Key: $(_mask_key "$UKU_KEY")")" >&2
+    for h in ${UKU_HEADERS[@]+"${UKU_HEADERS[@]}"}; do printf '  %s\n' "$(_dim "$h")" >&2; done
+    if [ -n "$im" ]; then printf '  %s\n' "$(_dim "If-Match: $im")" >&2; fi
+    printf '  %s\n' "$([ -n "$data" ] && printf 'body: %s' "$data" || printf 'no body')" >&2
     exit "$EX_OK"
   fi
   if ! REPLY_STATUS="$(curl "${args[@]}")"; then
     # UKU_SOFT lets callers (doctor) probe without the CLI dying on a flake.
-    [ "${UKU_SOFT:-0}" = "1" ] && { REPLY_STATUS=0; REPLY_BODY=""; return 1; }
+    [ "${UKU_SOFT:-0}" = "1" ] && { REPLY_STATUS=0; REPLY_BODY=""; REPLY_HEADERS=""; return 1; }
     die "could not reach $UKU_BASE (network error)" "$EX_NET"
   fi
   REPLY_BODY="$(cat "$tmp")"
-  # Local ledger of every change (no bodies, no keys) — a receipt for accountants (#6).
+  REPLY_HEADERS="$(cat "$hdrf" 2>/dev/null || true)"
+  _rl_capture "$method"
+  # 429 on a READ is recoverable: the window turns over at Reset, so wait it out
+  # once. A 429'd WRITE is never retried — the request may or may not have been
+  # applied before the limiter saw it, and the CLI cannot tell.
+  if [ "$REPLY_STATUS" = "429" ] && [ "${_UKU_RETRIED:-0}" != "1" ]; then
+    case "$method" in
+      GET|HEAD)
+        local w; w="$(_rl_wait_secs)"
+        if [ -n "$w" ] && [ "$w" -gt 0 ] && [ "$w" -le "$UKU_RL_MAX_WAIT" ]; then
+          warn "rate limited — waiting ${w}s for the window to reset, then retrying this read once."
+          sleep "$w"
+          _UKU_RETRIED=1 do_request "$method" "$path" "$data"
+          return 0
+        fi ;;
+    esac
+  fi
+  # Ledger first, heal second, so the log reads chronologically:
+  #   POST … 428 · HEAL428 … · POST … 201
   case "$method" in
     GET|HEAD) : ;;
-    *) mkdir -p "$UKU_CONFIG_HOME" 2>/dev/null && { local log="$UKU_CONFIG_HOME/audit.log"
-         printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)" "${UKU_PROFILE:-?}" "$method" "$path" "$REPLY_STATUS" >> "$log" 2>/dev/null
-         chmod 600 "$log" 2>/dev/null || true; } || true ;;
+    *) _audit "$method" "$path" "$REPLY_STATUS" ;;
   esac
+  # 428 auto-heal: fetch the ETag and resend ONCE. Nothing was written, so this
+  # cannot double-apply; see _heal_428.
+  if [ "$REPLY_STATUS" = "428" ] && [ "${_UKU_NO_HEAL:-0}" != "1" ]; then
+    _heal_428 "$method" "$path" "$data" || true
+  fi
   return 0
 }
 
@@ -293,8 +494,37 @@ check_status() {
           warn "$(_bold "HTTP $s") — ${msg:-authentication or permission denied.}  Try: uku auth status" ;;
       esac
       printf '%s\n' "$body" >&2; exit "$EX_AUTH" ;;
+    409)
+      # Domain conflict — the record is fine, the ACTION is not allowed right now
+      # (*_EXISTS, *_LOCKED, TIMER_ALREADY_RUNNING, STATUS_TRANSITION_NOT_SUPPORTED).
+      # Retrying the identical request will fail identically; change the request.
+      warn "$(_bold "HTTP 409") — the API refused this on a domain rule (e.g. already exists, locked, or a timer is already running). Nothing changed. Re-sending the same request will fail the same way — read the code below and change the request."
+      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
+    412)
+      # STALE_WRITE. This is the whole reason If-Match exists: someone else
+      # changed the record after it was read. Re-GETting and resending would
+      # silently overwrite their edit — the exact lost update we are preventing.
+      # So: hard stop, its own exit code, never automatic.
+      warn "$(_bold "HTTP 412") — someone else changed this record after you read it. Nothing was written."
+      warn "Re-read the record, re-apply your change on top of the CURRENT values, then write again. This is never retried automatically: a blind retry would overwrite their edit."
+      printf '%s\n' "$body" >&2; exit "$EX_CONFLICT" ;;
+    428)
+      if [ "${_UKU_428_SUPPLIED:-0}" = "1" ]; then
+        warn "$(_bold "HTTP 428") — the --if-match value you supplied was rejected as missing or invalid. Not retrying."
+        warn "GET the resource and use the ETag from its response header, or drop --if-match and let the CLI fetch it."
+      else
+        warn "$(_bold "HTTP 428") — this write needs an If-Match (version) header, and no ETag could be found for it."
+        warn "GET the guarded resource, read its ETag response header, and pass it: uku --if-match '<etag>' …"
+      fi
+      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
     429)
-      warn "$(_bold "HTTP 429") — rate limited. Wait a moment and retry (reads auto-retry; writes never do)."
+      local rlw; rlw="$(_rl_wait_secs)"
+      if [ -n "$rlw" ] && [ "$rlw" -gt 0 ] 2>/dev/null; then
+        warn "$(_bold "HTTP 429") — rate limited ($(_reply_header X-RateLimit-Tier) budget, limit $(_reply_header X-RateLimit-Limit)). Wait ${rlw}s: the window resets at $(_rl_when "$(_reply_header X-RateLimit-Reset)")."
+      else
+        warn "$(_bold "HTTP 429") — rate limited. Wait for the window to reset before retrying."
+      fi
+      warn "Reads may be retried (the CLI already waits once). A WRITE must not be retried — its outcome is unknown; GET to check whether it landed before resending."
       printf '%s\n' "$body" >&2; exit "$EX_NET" ;;
     *)
       warn "$(_bold "HTTP $s") — request failed."
@@ -348,6 +578,8 @@ read_data() {
 # must never round-trip to itself, per audit N6).
 _mask_key() { local k="$1"; if [ "${#k}" -lt 20 ]; then printf '••••'; else printf '%s…%s' "${k:0:9}" "${k: -4}"; fi; }
 _trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+# escape for single-quoted shell output ('…' → '\'' )
+_sq() { local s="$1"; s="${s//\'/\'\\\'\'}"; printf '%s' "$s"; }
 
 cmd_auth() {
   local sub="${1:-status}"; shift || true
@@ -415,6 +647,28 @@ cmd_auth() {
         warn "Account '$UKU_PROFILE' stored but the API rejected it (HTTP $REPLY_STATUS)"
         exit "$EX_AUTH"
       fi
+      ;;
+    print-header|print-headers)
+      # An honest escape hatch. When `uku api` can't express something (a raw
+      # multipart upload, a header the CLI doesn't model), people need the two
+      # auth headers — and the alternative is telling them to cat the profile
+      # file, which is strictly worse. --dry-run keeps the mask, as everywhere.
+      load_creds; need_auth
+      local fmt="curl"
+      while [ $# -gt 0 ]; do case "$1" in
+        --format) _need_val "$@"; fmt="$2"; shift 2 ;;
+        --shell) fmt="shell"; shift ;;
+        *) die "usage: uku auth print-header [--format curl|shell|plain]" "$EX_USAGE" ;;
+      esac; done
+      local key="$UKU_KEY"
+      if [ "${UKU_DRY:-0}" = "1" ]; then key="$(_mask_key "$UKU_KEY")"; fi
+      warn "this prints a LIVE credential on stdout — don't paste it into a chat, a log, or a shared terminal. Prefer: uku api …"
+      case "$fmt" in
+        curl)  printf 'header = "X-Uku-Company: %s"\nheader = "X-API-Key: %s"\n' "$(_cfg_esc "$UKU_COMPANY")" "$(_cfg_esc "$key")" ;;
+        plain) printf 'X-Uku-Company: %s\nX-API-Key: %s\n' "$UKU_COMPANY" "$key" ;;
+        shell) printf "export UKU_COMPANY='%s'\nexport UKU_API_KEY='%s'\n" "$(_sq "$UKU_COMPANY")" "$(_sq "$key")" ;;
+        *) die "unknown --format '$fmt' (curl|shell|plain)" "$EX_USAGE" ;;
+      esac
       ;;
     logout)
       load_creds
@@ -697,6 +951,26 @@ cmd_doctor() {
       _doc warn "version $UKU_VERSION — $remote_v is available; run 'uku update'"
     fi
   fi
+  # The shipped version lives in TWO places: the VERSION file (what auto_update
+  # compares against) and UKU_VERSION in this file. If they ever diverge, every
+  # client sees "an update is available" forever and re-updates every single
+  # day. So fail loudly here the moment they disagree. Only checkouts have a
+  # VERSION file next to the binary; an installed single-file uku has none.
+  local selfp sd vfile="" fv
+  selfp="${BASH_SOURCE[0]:-$0}"
+  sd="$(cd "$(dirname "$selfp")" 2>/dev/null && pwd || true)"
+  if [ -n "$sd" ]; then
+    if [ -f "$sd/VERSION" ]; then vfile="$sd/VERSION"
+    elif [ -f "$sd/../VERSION" ]; then vfile="$sd/../VERSION"; fi
+  fi
+  if [ -n "$vfile" ]; then
+    fv="$(tr -d '[:space:]' < "$vfile" 2>/dev/null || true)"
+    if [ "$fv" = "$UKU_VERSION" ]; then
+      _doc ok "VERSION file agrees with UKU_VERSION ($UKU_VERSION)"
+    else
+      _doc fail "version lock broken: $vfile says '$fv', bin/uku says '$UKU_VERSION' — bump BOTH, or every client re-updates daily"
+    fi
+  fi
   if [ "${UKU_NO_AUTO_UPDATE:-0}" = "1" ]; then
     _doc ok "auto-update off (UKU_NO_AUTO_UPDATE=1)"
   else
@@ -785,6 +1059,12 @@ $(_bold "uku auth") — sign in and inspect the active account
   uku auth login [--account NAME] [--company UUID] [--base URL] [--key-stdin]
   uku auth status [--json]        who you're acting as (validates the key)
   uku auth logout [--account NAME]
+  uku auth print-header [--format curl|shell|plain]
+                                  the two auth headers, for when you must drop
+                                  to curl. Prints a LIVE key — treat it as one.
+                                    curl -K <(uku auth print-header) https://…
+                                    eval "\$(uku auth print-header --shell)"
+                                  --dry-run keeps the key masked.
 Non-interactive:  printf '%s' "\$KEY" | uku auth login --account ci --company <uuid> --key-stdin
 EOF
     ;;
@@ -869,7 +1149,7 @@ description: Operate a firm's Uku (accounting practice management) from the term
 
 ## Output & exit codes (this is your API)
 - `--json` is the default when output is not a TTY — you already receive JSON. Lists wrap as `{ "data": [ … ], "meta": { "total", "limit", "offset", "has_more", "next_cursor" } }`; a single get wraps as `{ "data": { … } }`. Parse `.data`.
-- Exit codes: **0** ok · **1** usage · **2** auth (tell the user to run `uku auth login`) · **3** API error · **4** a write was refused because `--yes` was missing.
+- Exit codes: **0** ok · **1** usage · **2** auth (tell the user to run `uku auth login`) · **3** API error · **4** a write was refused because `--yes` was missing · **5** network / rate limited · **6** conflict: someone else changed the record (HTTP 412).
 
 ## Commands
 - `uku auth status [--json]` — who/which account you're acting as.
@@ -878,6 +1158,8 @@ description: Operate a firm's Uku (accounting practice management) from the term
 - `uku tasks list` · `uku time list` · `uku invoices list [--status draft]` · `uku invoices get <id>`
 - `uku invoices create --data @file.json --yes` — a deliberate write.
 - `uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]` — every one of the 80+ v3 endpoints. Use this for anything without a first-class command.
+- Global: `--header 'K: V'` (repeatable) · `--if-match '<etag>'` · `--dry-run` (prints the request, sends nothing).
+- `uku auth print-header` — the raw auth headers, for the rare case `uku api` can't express something. It prints a **live credential**: never echo it back to the user, never put it in a file you commit, and prefer `uku api`.
 
 ## Building a write payload
 You must supply the body; the CLI does not invent fields. Discover the shape from
@@ -889,11 +1171,36 @@ spec at `https://app.getuku.com/api/v3/openapi.json`. Common required fields:
 - **client**: `name`.
 If unsure of a field, read the spec first — a wrong field fails server-side.
 
-## Retry discipline (important)
-- The CLI **never retries writes** — a POST/PATCH/DELETE runs once. **You** must
-  not blindly retry either: on **exit 3 after a write**, the write may have
-  landed. Do a **GET to check before resending** — never risk a double-create.
-- Exit **2** = re-auth (`uku auth login`). Exit **4** = you forgot `--yes`.
+## Retry doctrine (the important part)
+
+Read the status, not the vibe. Each of these means something different:
+
+| Status | What happened | What you do |
+|---|---|---|
+| **428** PRECONDITION_REQUIRED | The server refused the write for want of an `If-Match`. **Nothing happened.** | Safe to re-send once with the ETag — **the CLI already does this for you**, automatically and only once. If it still fails, GET the resource and pass `--if-match '<etag>'`. |
+| **412** STALE_WRITE (exit **6**) | Someone else changed the record after you read it. **Nothing was written.** | **STOP.** Re-read the record, re-apply your change on top of the *current* values, then write again. **Never** retry automatically — a blind retry silently overwrites their edit. Tell the user what changed. |
+| **429** rate limited (exit **5**) | Outcome **unknown** for a write. | **Never auto-retry a write.** GET to check whether it landed. The message tells you how many seconds until the window resets — wait, don't poll. Reads are safe and the CLI already waits once for you. |
+| **5xx / timeout** (exit 3/5) | Outcome **unknown**. | Same as 429: GET first, never blind-resend a write. |
+| **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `*_EXISTS`, `TIMER_ALREADY_RUNNING`). | Re-sending the identical request fails identically. Change the request or tell the user. |
+
+**Reads are idempotent and may be retried. Writes are not — a POST/PATCH/DELETE runs once.**
+
+### Version checks (If-Match / ETag)
+Financial writes (invoices, contracts and their rows, agreements, members,
+monitors) are guarded so two people can't overwrite each other. You do not have
+to manage this: omit `--if-match` and the CLI fetches the ETag on a 428 and
+re-sends once. Pass `--if-match '<etag>'` yourself only when you already hold a
+version you deliberately want to assert — then a 428 is **not** healed, because
+the value you chose was the thing rejected.
+
+### Time entries — the one payload shape to avoid
+A time entry with a `start` and **no `end`** is a *running timer*, not logged
+work. Sending `duration` without `end` is the single most common failure
+(`409 TIMER_ALREADY_RUNNING`); the CLI now refuses it before sending. To log
+finished work send `start` **and** `end`. Send `start` alone only when you
+really mean to start a timer.
+
+- Exit **2** = re-auth (`uku auth login`). Exit **4** = you forgot `--yes`. Exit **6** = 412, see above.
 - Keep requests lean: use `--limit` small and `get <id>` over listing when you
   know the id. `--all` can be large — avoid it unless the user needs everything.
 - **Never print or log the API key.** `uku auth status` masks it for you.
@@ -1038,9 +1345,19 @@ $(_bold "GLOBAL FLAGS")
   --fields a,b      Table columns to show   ·   --quiet, -q   ·   --no-color
   --account <name>  Run against a specific account (default: the active one)
   --base <url>      Override the API base URL
+  --header 'K: V'   Add a request header (repeatable; sent off argv, like the key)
+  --if-match <etag> Version check for a write. Omit it: on 428 the CLI fetches
+                    the ETag and re-sends once. On 412 it stops — see exit 6.
   -h, --help        This help   ·   --version
 
-$(_bold "EXIT CODES")  0 ok · 1 usage · 2 auth · 3 API error · 4 write refused · 5 network
+$(_bold "EXIT CODES")  0 ok · 1 usage · 2 auth · 3 API error · 4 write refused · 5 network · 6 conflict (412)
+
+$(_bold "RETRY DOCTRINE")
+  428  server rejected the write, nothing happened → safe to re-send once with
+       If-Match (the CLI does this for you).
+  412  someone else changed it → STOP, re-read, re-apply. Never automatic.
+  429 / 5xx / timeout  outcome unknown → never auto-retry a write. GET first.
+  Reads are idempotent and may retry.
 
 $(_bold "ENVIRONMENT")  (override stored creds; ideal for CI / agents)
   UKU_API_KEY, UKU_COMPANY, UKU_BASE_URL
@@ -1051,10 +1368,19 @@ EOF
 
 # ── Global pre-parse (pull out global flags anywhere) ────────────────
 UKU_JSON=0; UKU_YES=0; UKU_ALL=0; UKU_HELP=0; UKU_DRY=0; UKU_QUIET=0; UKU_FIELDS=""; UKU_QUERY=(); UKU_DATA=""
+UKU_HEADERS=(); UKU_IF_MATCH=""
+# A header value goes verbatim into the curl -K config file, whose grammar is
+# line-based — so a newline in one would inject a second directive. Reject it.
+_check_header_arg() {
+  case "$1" in *$'\n'*|*$'\r'*) die "a --header value must be a single line." "$EX_USAGE" ;; esac
+  case "$1" in *:*) : ;; *) die "--header wants 'Name: value' (got: $1)" "$EX_USAGE" ;; esac
+}
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) UKU_JSON=1; shift ;;
+    --header|-H) _need_val "$@"; _check_header_arg "$2"; UKU_HEADERS+=("$2"); shift 2 ;;
+    --if-match) _need_val "$@"; _check_header_arg "If-Match: $2"; UKU_IF_MATCH="$2"; shift 2 ;;
     -y|--yes) UKU_YES=1; shift ;;
     --dry-run) UKU_DRY=1; shift ;;
     --quiet|-q) UKU_QUIET=1; shift ;;
@@ -1082,6 +1408,20 @@ set -- ${ARGS[@]+"${ARGS[@]}"}
 # The replace is safe mid-run because the installer renames into place; the
 # running bash keeps reading the old inode. Never overwrite the file in place.
 UKU_UPDATE_URL="${UKU_UPDATE_URL:-https://raw.githubusercontent.com/uku-owl/uku-cli/main/VERSION}"
+# _ver_gt A B — true when dotted-numeric version A is newer than B (bash 3.2).
+_ver_gt() {
+  local a="$1" b="$2" x y
+  while [ -n "$a$b" ]; do
+    x="${a%%.*}"; y="${b%%.*}"
+    case "$x" in ''|*[!0-9]*) x=0 ;; esac
+    case "$y" in ''|*[!0-9]*) y=0 ;; esac
+    if [ "$x" -gt "$y" ]; then return 0; fi
+    if [ "$x" -lt "$y" ]; then return 1; fi
+    case "$a" in *.*) a="${a#*.}" ;; *) a="" ;; esac
+    case "$b" in *.*) b="${b#*.}" ;; *) b="" ;; esac
+  done
+  return 1
+}
 auto_update() {
   [ "${UKU_NO_AUTO_UPDATE:-0}" = "1" ] && return 0
   have curl || return 0
@@ -1101,7 +1441,10 @@ auto_update() {
   remote="$(curl -fsS --max-time 3 "$UKU_UPDATE_URL" 2>/dev/null | tr -d '[:space:]')" || return 0
   [ -n "$remote" ] || return 0
   case "$remote" in (*[!0-9.]*) return 0 ;; esac   # ignore anything that is not a version
-  [ "$remote" = "$UKU_VERSION" ] && return 0
+  # Only ever move FORWARD. A string comparison would "update" a machine whose
+  # binary is ahead of main (anyone running a release branch) straight back down
+  # — and then do it again tomorrow, forever.
+  _ver_gt "$remote" "$UKU_VERSION" || return 0
   warn "uku $remote is available (you have $UKU_VERSION) — updating…"
   cmd_update >&2 2>/dev/null && warn "updated to $remote; it applies to your next command." || true
   return 0
