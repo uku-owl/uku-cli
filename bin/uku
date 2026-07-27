@@ -1217,7 +1217,7 @@ Read the status, not the vibe. Each of these means something different:
 | **5xx / timeout** (exit 3/5) | Outcome **unknown**. | Same as 429: GET first, never blind-resend a write. |
 | **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `*_EXISTS`, `TIMER_ALREADY_RUNNING`). | Re-sending the identical request fails identically. Change the request or tell the user. |
 
-**Reads are idempotent and may be retried. Writes are not — a POST/PATCH/DELETE runs once.**
+**Reads are idempotent and may be retried. A write is re-sent automatically in exactly one case — a 428, where the server refused it and nothing happened. You must never resend any other failed write yourself: outside a 428 the outcome is unknown, so GET first.**
 
 ### Version checks (If-Match / ETag)
 Financial writes (invoices, contracts and their rows, agreements, members,
