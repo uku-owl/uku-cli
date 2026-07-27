@@ -21,6 +21,35 @@ never required (`--json` always gives you raw JSON).
 
 To install somewhere specific: `UKU_BIN_DIR=~/bin curl -fsSL https://getuku.com/install-cli | sh`
 
+### Releases and channels
+
+`main` is the development branch. A **git tag** is a release, and a tag cannot
+change after it is published — which is what makes the checksum beside it worth
+checking.
+
+```sh
+# default — the newest release, from its tag, checksum required
+curl -fsSL https://getuku.com/install-cli | sh
+
+# a specific release — same rules, your tag
+UKU_VERSION=0.2.0 curl -fsSL https://getuku.com/install-cli | sh
+
+# the rolling edge — whatever is on main right now, NOT verified
+UKU_CHANNEL=main curl -fsSL https://getuku.com/install-cli | sh
+```
+
+The default and pinned paths **refuse to install** if the checksum published at
+that tag is missing or does not match. The rolling channel checks nothing and
+says so on every run — it exists for trying unreleased work, not for daily use.
+
+A checksum anchored to a tag catches a swapped or truncated download and stops
+`main` moving under you. It is **not** authenticity: the file and its checksum
+come from the same repo. Signing is the next step and is not implemented —
+[`SECURITY.md`](SECURITY.md) spells out exactly where the line is.
+
+`uku update` and the once-a-day auto-update follow the release channel: they
+notice a bump in `VERSION` and install the tag behind it, verified.
+
 On a terminal the installer offers to sign you in and connect your coding agents
 right away. Or run it yourself:
 
@@ -150,7 +179,10 @@ The status code tells you whether the write happened. Treat them differently:
 | **5xx / timeout** | Outcome **unknown**. | Same as 429: `GET` first. |
 | **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `TIMER_ALREADY_RUNNING`). | Re-sending the same request fails the same way. Change the request. |
 
-**Reads are idempotent and may be retried. Writes are not.**
+**Reads are idempotent and may be retried.** A write is re-sent automatically in
+exactly one case — a **428**, where the server refused it and nothing happened.
+No other failed write is ever retried for you, because in no other case can the
+CLI know whether it landed.
 
 ## Rate limits
 
@@ -191,6 +223,9 @@ This prints a **live credential** on stdout — it warns you on stderr. Add
 | `UKU_API_KEY`, `UKU_COMPANY` | credentials (override the stored file — ideal for CI/agents) |
 | `UKU_BASE_URL` | override the API base (default `https://app.getuku.com`) |
 | `UKU_BIN_DIR` | install location (installer) |
+| `UKU_VERSION` | installer: pin a release tag (`0.2.0`), or `main` for the unverified rolling edge |
+| `UKU_CHANNEL` | installer: `release` (default) or `main` (rolling, unverified) |
+| `UKU_REQUIRE_CHECKSUM` | installer: `1` insists on a verified install; it is already the default, and it is refused outright on `UKU_CHANNEL=main` rather than silently ignored |
 | `UKU_SKIP_PATH` | set to `1` so the installer leaves your shell rc files alone (sandboxed / CI installs) |
 | `UKU_CONFIG_HOME` | credentials directory (default `~/.config/uku`) |
 | `UKU_RL_MAX_WAIT` | longest the CLI will wait for a rate-limit window to reset (default `60`s; beyond it, it refuses instead of blocking) |
