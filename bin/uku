@@ -944,24 +944,36 @@ cmd_doctor() {
   [ -n "$resolved" ] && _doc ok "uku on PATH → $resolved" || _doc warn "uku is not on your PATH (installed but PATH not set?)"
   # Version + where updates come from. doctor is the one place that always
   # asks the network, so drift between the shipped constant and the published
-  # VERSION shows up here rather than silently.
+  # release pointer shows up here rather than silently. UKU_UPDATE_URL serves
+  # main/VERSION, which names the newest *released* tag — not what is on main.
   if have curl; then
     # || true is load-bearing: set -euo pipefail is on, and doctor is
     # documented offline-safe (T3) — a failed probe must never abort the report.
     local remote_v; remote_v="$(curl -fsS --max-time 3 "$UKU_UPDATE_URL" 2>/dev/null | tr -d '[:space:]' || true)"
     if [ -z "$remote_v" ]; then
-      _doc warn "version $UKU_VERSION — could not reach the update source"
+      _doc warn "version $UKU_VERSION — could not reach the release pointer"
     elif [ "$remote_v" = "$UKU_VERSION" ]; then
-      _doc ok "version $UKU_VERSION (latest)"
-    else
+      _doc ok "version $UKU_VERSION (latest release)"
+    elif _ver_gt "$remote_v" "$UKU_VERSION"; then
       _doc warn "version $UKU_VERSION — $remote_v is available; run 'uku update'"
+    else
+      # Ahead of the newest release: a development build, or the rolling
+      # channel. Not a fault — auto_update only ever moves forward.
+      _doc ok "version $UKU_VERSION (ahead of release $remote_v — development build)"
     fi
   fi
-  # The shipped version lives in TWO places: the VERSION file (what auto_update
-  # compares against) and UKU_VERSION in this file. If they ever diverge, every
-  # client sees "an update is available" forever and re-updates every single
-  # day. So fail loudly here the moment they disagree. Only checkouts have a
-  # VERSION file next to the binary; an installed single-file uku has none.
+  # The shipped version lives in TWO places: the VERSION file (the release
+  # pointer auto_update compares against) and UKU_VERSION in this file.
+  #
+  # They are NOT required to be equal. VERSION means "the newest release we
+  # have published"; UKU_VERSION means "what this file is". On main between
+  # releases UKU_VERSION legitimately runs ahead. At a tag they must agree —
+  # that is what release.sh guarantees.
+  #
+  # The fault worth failing on is UKU_VERSION *behind* VERSION: auto_update
+  # would then see an update forever and re-install every single day, because
+  # the file it installs never reaches the number it is chasing. Only checkouts
+  # have a VERSION file next to the binary; an installed single-file uku has none.
   local selfp sd vfile="" fv
   selfp="${BASH_SOURCE[0]:-$0}"
   sd="$(cd "$(dirname "$selfp")" 2>/dev/null && pwd || true)"
@@ -972,15 +984,17 @@ cmd_doctor() {
   if [ -n "$vfile" ]; then
     fv="$(tr -d '[:space:]' < "$vfile" 2>/dev/null || true)"
     if [ "$fv" = "$UKU_VERSION" ]; then
-      _doc ok "VERSION file agrees with UKU_VERSION ($UKU_VERSION)"
+      _doc ok "version lock: VERSION and UKU_VERSION agree ($UKU_VERSION) — release-ready"
+    elif _ver_gt "$UKU_VERSION" "$fv"; then
+      _doc ok "version lock: bin/uku $UKU_VERSION is ahead of release $fv — normal on main; release.sh will align them"
     else
-      _doc fail "version lock broken: $vfile says '$fv', bin/uku says '$UKU_VERSION' — bump BOTH, or every client re-updates daily"
+      _doc fail "version lock broken: $vfile says '$fv', bin/uku says '$UKU_VERSION' — the shipped file is BEHIND the release pointer, so every client sees an update that never arrives and re-installs daily. Run scripts/release.sh, or fix UKU_VERSION."
     fi
   fi
   if [ "${UKU_NO_AUTO_UPDATE:-0}" = "1" ]; then
     _doc ok "auto-update off (UKU_NO_AUTO_UPDATE=1)"
   else
-    _doc ok "auto-update on — checks once a day, updates when VERSION is bumped"
+    _doc ok "auto-update on — checks once a day, installs the newest released tag (checksum-verified)"
   fi
   local sh; sh="$(_detect_shadow)"
   [ -n "$sh" ] && _doc warn "a shell function/alias 'uku' in $sh shadows this binary — rename it, or call 'command uku'"
@@ -1033,14 +1047,28 @@ EOF
 }
 
 # uku update — re-run the installer, into THIS binary's directory, no re-prompt.
+#
+# The installer is always fetched from main (getuku.com/install-cli redirects
+# there) — it is the delivery mechanism, not the artefact. What it INSTALLS is
+# the release channel's default: the newest published tag, checksum-verified.
+# We pass no UKU_VERSION, so the installer resolves the release pointer itself.
+#
+# UKU_CHANNEL is forwarded when the caller set it, so someone who deliberately
+# runs the rolling edge stays there instead of being silently pinned back — but
+# they are told, every time, that this update is not verified.
 cmd_update() {
   local url="${UKU_INSTALL_URL:-https://getuku.com/install-cli}"
   local self; self="$(command -v uku 2>/dev/null || printf '%s' "$0")"
   local dir; dir="$(cd "$(dirname "$self")" 2>/dev/null && pwd || printf '%s' "$HOME/.local/bin")"
   have curl || die "curl is required to update." "$EX_USAGE"
-  info "Updating uku (current $UKU_VERSION) → newest, into $dir"
+  local chan="${UKU_CHANNEL:-release}"
+  if [ "$chan" = "release" ]; then
+    info "Updating uku (current $UKU_VERSION) → newest release, into $dir"
+  else
+    warn "Updating uku (current $UKU_VERSION) → channel '$chan' (UNVERIFIED — no checksum), into $dir"
+  fi
   # pin the install dir to where uku already lives (no second binary, T11) + skip the sign-in re-prompt (N14)
-  UKU_BIN_DIR="$dir" UKU_SKIP_SETUP=1 UKU_NO_AUTO_UPDATE=1 curl -fsSL "$url" | sh
+  UKU_BIN_DIR="$dir" UKU_SKIP_SETUP=1 UKU_NO_AUTO_UPDATE=1 UKU_CHANNEL="$chan" curl -fsSL "$url" | sh
 }
 
 # uku completions <bash|zsh> — source-able completion for the top-level commands.
@@ -1340,7 +1368,9 @@ $(_bold "ACCOUNTS")  (one login, many companies — keep a sandbox beside your m
 $(_bold "MORE")
   uku doctor [--json]                 Check PATH, shadowing, tools, creds, skill
   uku setup agents                    Teach your coding agents the uku contract
-  uku update                          Upgrade in place · uku completions <bash|zsh>
+  uku update                          Upgrade in place to the newest release
+                                      (installed from its tag, checksum-verified)
+  uku completions <bash|zsh>          Shell completion
   uku me · uku members|products|contracts|projects list
 
 $(_bold "GLOBAL FLAGS")
@@ -1406,6 +1436,13 @@ set -- ${ARGS[@]+"${ARGS[@]}"}
 # following main HEAD: that would put every push, including work in progress,
 # on every machine within a day. So the gate is the VERSION file in the repo —
 # we push freely and clients only move when we deliberately bump the number.
+#
+# VERSION on main is the RELEASE POINTER: the number of the newest tag we have
+# published. Polling it is still right, but what a bump triggers is no longer a
+# download of main — cmd_update runs the installer, which resolves that same
+# pointer to the immutable tag v<version> and refuses to install it without a
+# matching checksum. The number we poll and the artefact we install are the
+# same release, and the release cannot change after the fact.
 #
 # Checked at most once a day (a timestamp under UKU_CONFIG_HOME), with a hard
 # 3s timeout, and every failure is silent: a CLI must not break because a
