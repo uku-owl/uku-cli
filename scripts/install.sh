@@ -5,16 +5,25 @@
 #
 # Downloads a single self-contained script to a directory on your PATH, adds
 # that directory to PATH, and — when run in a terminal — offers to sign you in.
-# It does NOT verify a checksum: none is published for the rolling install, and
-# one served from the same repo and commit as the file would prove transport,
-# not authenticity. The anchor is HTTPS to a public, readable repo.
 # No compilation, no dependencies beyond `curl` (and `bash`, which `uku` uses).
+#
+# CHANNELS. `main` is where development happens; a git tag is a release.
+#   release (default)  Reads main/VERSION as the pointer to the latest release,
+#                      then installs the immutable tag v<version> and REQUIRES a
+#                      matching bin/uku.sha256 published at that same tag.
+#   pinned             UKU_VERSION=x.y.z — same rules, your chosen tag.
+#   rolling (opt-in)   UKU_CHANNEL=main (or UKU_VERSION=main) — whatever is on
+#                      main right now, with NO checksum verification at all.
+#
+# What the checksum does and does not prove: anchored to a tag it detects a
+# swapped, truncated or corrupted download and stops main from moving under you.
+# It is NOT authenticity — the artefact and its checksum come from the same repo,
+# so anyone who could publish one could publish the other. See SECURITY.md.
 #
 # Options (via environment):
 #   UKU_BIN_DIR       Where to install (default: ~/.local/bin, or ~/bin if on PATH)
-#   UKU_VERSION       Pin a git tag (e.g. 0.1.0). No tags are published yet,
-#                     so this currently fails by design rather than silently
-#                     installing something unpinned.
+#   UKU_VERSION       Pin a release tag (e.g. 0.2.0), or `main` for the rolling edge
+#   UKU_CHANNEL       release (default) | main  — `main` is the unverified rolling edge
 #   UKU_BASE_URL_DL   Raw repo base to fetch bin/uku from
 #                     (default: https://raw.githubusercontent.com/uku-owl/uku-cli)
 #   UKU_SKIP_SETUP    Set to 1 to skip the post-install sign-in + agent setup
@@ -29,8 +38,14 @@ set -eu
 # even if this target does.
 DL_BASE="${UKU_BASE_URL_DL:-https://raw.githubusercontent.com/uku-owl/uku-cli}"
 VERSION="${UKU_VERSION:-}"
-# A pinned version resolves to that git tag; unpinned follows main.
-if [ -n "$VERSION" ]; then SRC="$DL_BASE/v$VERSION/bin/uku"; else SRC="$DL_BASE/main/bin/uku"; fi
+CHANNEL="${UKU_CHANNEL:-release}"
+# `UKU_VERSION=main` is the obvious thing to type for "give me main"; accept it
+# as an alias for the rolling channel rather than looking for a tag named vmain.
+case "$VERSION" in main|edge) CHANNEL="main"; VERSION="" ;; esac
+case "$CHANNEL" in
+  release|main) : ;;
+  *) printf '  UKU_CHANNEL must be `release` or `main` (got: %s)\n' "$CHANNEL" >&2; exit 1 ;;
+esac
 
 # ── output helpers (respect NO_COLOR + non-tty) ───────────────────────
 if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then
@@ -48,6 +63,35 @@ DL() { curl -fsSL --retry 3 --connect-timeout 10 "$1"; }
 
 printf '\n  %s\n  %s\n\n' "$(bold 'uku')" "$(dim 'operate your firm'\''s Uku from the terminal')"
 
+# ── resolve the channel → the exact ref we will install ───────────────
+# REQUIRE_SUM=1 means: no matching checksum, no install. It is on for every
+# path that resolves to a tag, because a tag is immutable — the checksum
+# committed alongside it describes that exact file forever. It is off for the
+# rolling channel, where a checksum would describe whichever commit main sat on
+# when it was last written and would fail loudly for no security gain.
+REQUIRE_SUM=1
+if [ "$CHANNEL" = "main" ]; then
+  REF="main"; REQUIRE_SUM=0
+elif [ -n "$VERSION" ]; then
+  case "$VERSION" in
+    v*) err "UKU_VERSION takes the bare number (e.g. 0.2.0), not the tag name — the leading 'v' is added for you." ;;
+    *[!0-9.]*) err "UKU_VERSION='$VERSION' is not a version number (expected x.y.z)." ;;
+  esac
+  REF="v$VERSION"
+else
+  # main/VERSION is the release pointer: "the newest tag we have published".
+  # It is deliberately NOT "what is on main" — bin/uku on main may be ahead.
+  step "Resolving the latest release…"
+  VERSION="$(DL "$DL_BASE/main/VERSION" | tr -d '[:space:]')" \
+    || err "could not read the release pointer at $DL_BASE/main/VERSION"
+  [ -n "$VERSION" ] || err "the release pointer at $DL_BASE/main/VERSION is empty."
+  case "$VERSION" in
+    ''|*[!0-9.]*) err "the release pointer returned '$VERSION', which is not a version. Refusing to guess." ;;
+  esac
+  REF="v$VERSION"
+fi
+SRC="$DL_BASE/$REF/bin/uku"
+
 # ── choose an install dir on PATH ─────────────────────────────────────
 on_path() { case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac; }
 if [ -n "${UKU_BIN_DIR:-}" ]; then BIN_DIR="$UKU_BIN_DIR"
@@ -61,8 +105,11 @@ TMP="$(mktemp)"; SUM="$(mktemp)"
 trap 'rm -f "$TMP" "$SUM"' EXIT
 
 # ── download ──────────────────────────────────────────────────────────
-step "Downloading uku${VERSION:+ v$VERSION}…"
+step "Downloading uku ${VERSION:+v$VERSION }$(dim "($REF)")…"
 DL "$SRC" > "$TMP" || err "download failed from $SRC"
+# These two catch an error page or a truncated body — they are sanity checks on
+# the shape of the download, not integrity checks. The checksum below is the
+# only thing here that can tell you the bytes are the ones we published.
 head -n 1 "$TMP" | grep -q '^#!' || err "downloaded file is not a script (an error page?). Aborting."
 grep -q 'the Uku command-line client' "$TMP" || err "downloaded file doesn't look like uku. Aborting."
 
@@ -70,7 +117,15 @@ grep -q 'the Uku command-line client' "$TMP" || err "downloaded file doesn't loo
 SHA_CMD=""
 if command -v sha256sum >/dev/null 2>&1; then SHA_CMD="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then SHA_CMD="shasum -a 256"; fi
-if DL "$SRC.sha256" > "$SUM" 2>/dev/null && [ -s "$SUM" ] && [ -n "$SHA_CMD" ]; then
+
+if [ "$REQUIRE_SUM" = "0" ] && [ "${UKU_REQUIRE_CHECKSUM:-0}" = "1" ]; then
+  err "UKU_REQUIRE_CHECKSUM=1 cannot be satisfied on the rolling channel — main publishes no per-commit checksum. Drop UKU_CHANNEL=main to install the latest verified release."
+fi
+
+if [ "$REQUIRE_SUM" = "1" ]; then
+  [ -n "$SHA_CMD" ] || err "neither sha256sum nor shasum is available, so the download cannot be verified — refusing to install uku v$VERSION unverified. Install coreutils (or Perl's shasum), or opt into the unverified rolling channel with UKU_CHANNEL=main."
+  DL "$SRC.sha256" > "$SUM" 2>/dev/null && [ -s "$SUM" ] \
+    || err "no checksum published at $SRC.sha256 — refusing to install uku v$VERSION unverified. (An attacker who could swap the binary could also simply omit the checksum, so a missing one is treated as a failure, never as 'skip the check'.)"
   want="$(cut -d' ' -f1 < "$SUM" | tr -d '[:space:]')"
   got="$($SHA_CMD < "$TMP" | cut -d' ' -f1)"
   if [ "$want" != "$got" ]; then
@@ -79,23 +134,19 @@ if DL "$SRC.sha256" > "$SUM" 2>/dev/null && [ -s "$SUM" ] && [ -n "$SHA_CMD" ]; 
     got      $got
   This is a failure worth reporting: security@getuku.com"
   fi
-  info "Checksum verified  $(dim "sha256 $(printf '%s' "$got" | cut -c1-12)…")"
+  info "Checksum verified  $(dim "sha256 $(printf '%s' "$got" | cut -c1-12)… · tag $REF")"
 else
-  # A missing checksum is a hard failure for a pinned version (an attacker can
-  # simply omit it) and when the caller demands one; otherwise a loud warning.
-  if [ -n "$VERSION" ]; then
-    err "no checksum published for uku v$VERSION — refusing to install a pinned version unverified."
-  elif [ "${UKU_REQUIRE_CHECKSUM:-0}" = "1" ]; then
-    err "no checksum published and UKU_REQUIRE_CHECKSUM=1 — refusing to install unverified."
-  fi
-  # No checksum on the rolling install, and that is deliberate rather than an
-  # oversight: a checksum served from the same repo and commit as the file it
-  # describes verifies transport, not authenticity — anyone who could swap the
-  # binary could swap the checksum with it. The real anchor here is TLS to
-  # GitHub plus a public, auditable repo. A published checksum starts meaning
-  # something at a tagged release, which is why a pinned version still refuses
-  # to install without one.
+  # The rolling channel is unverified on purpose, and we say so rather than
+  # implying otherwise. We do not even fetch a checksum here: any bin/uku.sha256
+  # sitting on main belongs to the last release commit, so on a moved main it
+  # would mismatch the current file and raise a security alarm that means
+  # nothing. Verification lives at tags, where the pair is immutable.
+  printf '\n'
+  step "$(red '! UNVERIFIED INSTALL')  $(bold 'UKU_CHANNEL=main') $(dim '— installing whatever is on main right now.')"
+  step "  $(dim 'No checksum is checked. main is the development branch: it can carry unreleased or half-finished work.')"
+  step "  $(dim 'For the latest verified release, re-run without UKU_CHANNEL/UKU_VERSION.')"
   step "$(dim 'Source:') $(bold 'github.com/uku-owl/uku-cli') $(dim '(public, over HTTPS) — read it before you run it.')"
+  printf '\n'
 fi
 
 # ── install ───────────────────────────────────────────────────────────
