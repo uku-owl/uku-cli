@@ -105,7 +105,8 @@ TMP="$(mktemp)"; SUM="$(mktemp)"
 trap 'rm -f "$TMP" "$SUM"' EXIT
 
 # ── download ──────────────────────────────────────────────────────────
-step "Downloading uku ${VERSION:+v$VERSION }$(dim "($REF)")…"
+if [ "$REF" = "main" ]; then step "Downloading uku from $(bold 'main')…"
+else step "Downloading uku $(bold "v$VERSION") $(dim "(tag $REF)")…"; fi
 DL "$SRC" > "$TMP" || err "download failed from $SRC"
 # These two catch an error page or a truncated body — they are sanity checks on
 # the shape of the download, not integrity checks. The checksum below is the
