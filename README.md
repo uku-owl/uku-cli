@@ -1,9 +1,21 @@
 # uku — the Uku command-line client
 
-A thin, dependency-light wrapper over the [Uku public API v3](https://app.getuku.com/api/v3/docs).
+One bash script over the [Uku public API v3](https://app.getuku.com/api/v3/docs).
 It gives terminals, scripts, CI, and coding agents (Claude Code, Cursor, Codex) a
 native way to operate a firm's Uku data — within the exact permissions of the API
 key you hand it.
+
+It is a single file with nothing to install beside it, and it is **not small** —
+several thousand lines, a large part of them spent on refusing. This tool edits
+a real firm's clients, hours and invoices, so it declines an ambiguous name
+instead of picking one, refuses to resume a write whose outcome it never saw,
+and stops when an endpoint ignores a filter rather than handing back a list that
+merely looks like an answer. Every one of those refusals is a bug someone
+already hit. A thinner wrapper is easy to write; it just makes the wrong call
+quietly.
+
+What stayed light is what you have to install: `curl` and `bash`, both already on
+your machine. No runtime, no package tree, no build step.
 
 > **Status:** MVP. Read + the essential writes, plus an `api` escape
 > hatch to every endpoint. Built on the real API v3 (no invented endpoints).

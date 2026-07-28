@@ -4,9 +4,15 @@ Thanks for helping improve the Uku CLI.
 
 ## What it is
 
-A single, dependency-light POSIX-friendly **bash** script (`bin/uku`) over the
-Uku public API v3, plus a POSIX **sh** installer (`scripts/install.sh`). No build
-step, no compilation — the script *is* the tool.
+A single POSIX-friendly **bash** script (`bin/uku`) over the Uku public API v3,
+plus a POSIX **sh** installer (`scripts/install.sh`). No build step, no
+compilation — the script *is* the tool, and its only runtime requirements are
+`curl` and `bash` (`jq` is optional and its absence is tested).
+
+It is one big file on purpose: one thing to download, one thing to read, one
+thing to checksum. That does mean the file keeps growing, so the bar for adding
+to it is high — see the surface and drift gates below, which exist because a
+file this size cannot be held in one person's head.
 
 ## Ground rules
 
