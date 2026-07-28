@@ -30,16 +30,35 @@ assert_err_contains 'X-API-Key: uku_live_…TAIL' 'the key is shown masked'
 assert_err_not_contains "$TEST_API_KEY" 'the raw key is NOT on stderr'
 assert_out_not_contains "$TEST_API_KEY" 'the raw key is NOT on stdout'
 
-# ── CURRENT BEHAVIOUR, and it is inconsistent (see the KNOWN ISSUES list in tests/run.sh #2) ──
-# A single-record --dry-run without --yes is refused by confirm_write (exit 4)
-# before do_request's dry-run printer is ever reached — even though nothing
-# would be sent. run_batch, by contrast, deliberately skips the confirm under
-# --dry-run, so `… create --batch @f --dry-run` works with no --yes at all.
-# Locking in what it does today so a refactor has to decide on purpose.
+# ── --dry-run needs no --yes: previewing a write is not making one ───
+# A dry run sends nothing, so requiring the confirmation to see what WOULD be
+# sent defeated the point — and a batch dry-run never required it, so the two
+# paths disagreed. Now they don't.
 reset_requests
 uku tasks create --data '{"title":"x"}' --dry-run
-assert_status 4 'a single --dry-run write without --yes is refused (exit 4) — KNOWN ISSUE #2'
+assert_status 0 'a single --dry-run write needs no --yes'
 assert_no_requests '--dry-run alone sends nothing'
+assert_err_contains '[dry-run] would send:' 'and the preview is what you get'
+assert_err_contains 'body: {"title":"x"}' 'including the body that would have gone'
+assert_err_not_contains 'Refusing a non-interactive write' 'no confirmation is demanded'
+
+# a write WITHOUT --dry-run and without --yes is still refused — the gate stands
+reset_requests
+uku tasks create --data '{"title":"x"}'
+assert_status 4 'a real write still needs --yes'
+assert_no_requests 'and is not sent'
+
+# the same for the other single-write paths
+reset_requests
+uku api DELETE /api/v3/tasks/1 --dry-run
+assert_status 0 'a DELETE dry-run needs no --yes either'
+assert_no_requests 'and deletes nothing'
+assert_err_contains 'DELETE ' 'the deletion that would happen is printed'
+
+reset_requests
+uku invoices create --data '{"client_id":1}' --dry-run
+assert_status 0 'an invoice dry-run needs no --yes'
+assert_no_requests 'and creates no invoice'
 
 # ── a read ───────────────────────────────────────────────────────────
 reset_requests

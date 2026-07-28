@@ -7,73 +7,63 @@
 # Exits non-zero if anything failed. bash 3.2 compatible.
 
 # ─────────────────────────────────────────────────────────────────────
-# KNOWN ISSUES in bin/uku that this suite PINS rather than fixes.
-# Each one has a test whose name ends "— KNOWN ISSUE #n". The tests assert what
-# the CLI does TODAY, so a refactor has to change each behaviour on purpose.
-# bin/uku itself is not modified by anything in tests/.
+# The nine issues this suite once PINNED are now FIXED in bin/uku, and each
+# test asserts the corrected behaviour instead. Kept as a map of what changed
+# and where the guard against a regression lives.
 #
-#  #1  --batch --resume cannot resume a line that failed with an API error.
-#      _ledger_state (bin/uku:965-975) inspects only `ok` and `send` rows, never
-#      `fail`, so a definitively-rejected line (422/500/412) reads back as
-#      UNKNOWN_OUTCOME and is REFUSED. The run's own summary tells the user to
-#      --resume; doing so re-sends nothing and exits 3. `uku help batch` says
-#      "--resume is safe and is the correct response to any interrupted batch".
-#      → tests/cases/batch.sh §2b                                       [HIGH]
+#  #1  --batch --resume can resume a line the server REFUSED. _ledger_state
+#      reads `fail` rows carrying an HTTP status as FAILED — a reply arrived and
+#      it was not a success, so nothing was created and plain --resume re-sends
+#      it, which is what the run's own summary tells the user to do. Only a
+#      `send` with no observed outcome is UNKNOWN and stays behind
+#      --retry-unknown; a `fail` row carrying a WORD (UNKNOWN_OUTCOME,
+#      GUARD_REFUSED) is a local refusal and decides nothing. A v0.3.0 ledger
+#      with no fail row still reads send-without-ok as UNKNOWN.
+#      → tests/cases/batch.sh §2b (re-send) and §3 (still-unknown, back-compat)
 #
-#  #2  --dry-run on a SINGLE write is refused without --yes (exit 4), because
-#      confirm_write (bin/uku:589) runs before do_request's dry-run printer
-#      (bin/uku:420). run_batch (bin/uku:1082) deliberately skips the confirm
-#      under --dry-run, so a batch dry-run needs no --yes. Inconsistent.
-#      → tests/cases/dry-run.sh, tests/cases/batch.sh §6                 [MED]
+#  #2  --dry-run needs no --yes on a single write: confirm_write returns early
+#      under UKU_DRY, matching run_batch. A dry run sends nothing, so there is
+#      nothing to confirm; a real write without --yes is still exit 4.
+#      → tests/cases/dry-run.sh, tests/cases/write-safety.sh
 #
-#  #3  A rate-limited or failing READ is sent THREE times by curl before the
-#      CLI's own logic sees it: bin/uku:413 adds `--retry 2` to GET/HEAD, and
-#      curl retries 408/429/5xx itself. Measured: GET→500 = 3 requests;
-#      GET→429×3 then 200 = 4 requests; GET→429 then 200 = 2 requests (curl's
-#      retry got the 200, the CLI never saw a 429). The documented "the CLI
-#      already waits once for you" is preceded by two immediate retries.
-#      → tests/cases/retry-429.sh §1, §4                                 [MED]
+#  #3  curl's `--retry` is gone. An HTTP status is never re-sent automatically,
+#      so a rate-limited read reaches the CLI's own "wait for X-RateLimit-Reset,
+#      retry once" path on the FIRST 429. Reads keep a transport-only retry:
+#      once, on curl exit 6/7/28/35/52/56 (never connected / never completed),
+#      and never for a write.
+#      → tests/cases/retry-429.sh §1, §1b, §4, §5
 #
-#  #4  --fields is parsed and then discarded whenever stdout is not a TTY
-#      (bin/uku:480-484 falls back to render()). Since --json is the non-TTY
-#      default, --fields is effectively TTY-only, and is accepted silently.
-#      → tests/cases/output-modes.sh                                     [LOW]
+#  #4  --fields works in JSON too — each row in .data is reduced to the named
+#      keys, in the order named, envelope untouched. Missing keys come back
+#      null so every row keeps one shape. Without jq it warns rather than
+#      silently ignoring the flag.
+#      → tests/cases/output-modes.sh
 #
-#  #5  `uku auth login` ignores --base AND UKU_BASE_URL and always validates
-#      against, and stores, https://app.getuku.com. The global pre-parse
-#      (bin/uku:2025) eats --base before cmd_auth sees it — its own --base case
-#      (bin/uku:646) is dead code — and login never calls load_creds
-#      (bin/uku:672). Signing in against staging/self-hosted is impossible, and
-#      `--base http://localhost:…` silently sends the key to production. This is
-#      why the harness writes profile files directly instead of using login.
-#      → tests/cases/accounts.sh (only login's pre-request refusal is tested)
-#                                                                        [HIGH]
+#  #5  `uku auth login` honours the base it is told to use: explicit --base
+#      (before or after the subcommand) > UKU_BASE_URL > the default. It used to
+#      validate against, and store, production regardless — a credential
+#      disclosure for anyone pointing the CLI at staging.
+#      → tests/cases/accounts.sh (a full hermetic login against the fixture)
 #
-#  #6  `--account X` ignores UKU_BASE_URL. load_creds' --account branch
-#      (bin/uku:123-130) reads UKU_BASE from the profile only; the env branch and
-#      the active-profile branch both honour it. --base still wins over all three.
-#      → tests/cases/accounts.sh                                         [LOW]
+#  #6  `--account X` resolves its base like every other path: profile base >
+#      UKU_BASE_URL > default, with --base winning over all three.
+#      → tests/cases/accounts.sh
 #
-#  #7  Removing the LAST account succeeds but exits 1. _reassign_active
-#      (bin/uku:178) runs `next="$(list_profiles | head -n1)"`; with an empty
-#      profiles dir list_profiles (bin/uku:183) returns 1, and `set -euo
-#      pipefail` aborts the script — after "✓ Removed account 'x'." was printed.
-#      Same for `uku auth logout` on the last profile. Exit 1 means "usage error"
-#      in this CLI's own contract.
-#      → tests/cases/accounts.sh                                         [MED]
+#  #7  Removing (or logging out of) the LAST account exits 0. list_profiles
+#      always succeeds — "no accounts" is an answer, not a failure — so
+#      _reassign_active no longer trips `set -euo pipefail` after reporting
+#      success.
+#      → tests/cases/accounts.sh
 #
-#  #8  `uku doctor` (text mode) prints its heading to stdout and every check
-#      line to stderr (bin/uku:1523-1533), so `uku doctor > report.txt` captures
-#      the heading alone. --json puts the whole report on stdout.
-#      → tests/cases/doctor.sh §5                                        [LOW]
+#  #8  `uku doctor` (text mode) writes the WHOLE report to stdout, so
+#      `uku doctor > report.txt` captures it. --json was already whole.
+#      → tests/cases/doctor.sh §5
 #
-#  #9  A 428 on a COLLECTION POST is never healed: _etag_candidates
-#      (bin/uku:347) only proposes path segments that look like an id, so
-#      `POST /api/v3/tasks` yields no candidates and exits 3. Healing does work
-#      for PATCH /contracts/{id} and for POST /contracts/{id}/rows (walking up to
-#      the parent) — both verified. The README, `uku help` and the embedded agent
-#      skill all promise the heal without this caveat.
-#      → tests/cases/retry-428.sh §4, §5                            [LOW/docs]
+#  #9  A 428 on a COLLECTION POST still cannot be healed — correctly: every
+#      candidate comes from an id in the path, and `POST /api/v3/tasks` has
+#      none. The code is unchanged; the README, `uku help` and the embedded
+#      agent skill now state the caveat instead of promising the heal.
+#      → tests/cases/retry-428.sh §4, §5
 # ─────────────────────────────────────────────────────────────────────
 
 TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"

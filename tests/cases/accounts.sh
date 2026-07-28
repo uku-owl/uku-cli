@@ -16,6 +16,8 @@ setup_case
 server_script <<'JSON'
 {
   "routes": [
+    { "method": "GET", "path": "/reject/api/v3/members",
+      "response": {"status": 401, "body": {"error": {"code": "UNAUTHENTICATED"}}} },
     { "method": "GET", "path_prefix": "/api/v3/",
       "response": {"status": 200, "body": {"data": [], "meta": {"total": 0}}} }
   ]
@@ -106,14 +108,32 @@ assert_err_contains 'mixing env credentials with stored account' 'but warns loud
 assert_request 1 X-Uku-Company "$MAIN_CO" "the profile's company is used"
 assert_request 1 X-API-Key 'uku_live_ENVKEY01234567890abcdefENVTAIL' 'with the env key welded on'
 
-# ── --account IGNORES UKU_BASE_URL (KNOWN ISSUE #6) ─────────────────────
-# load_creds' --account branch reads UKU_BASE from the profile and never looks
-# at the env. The harness writes the fixture URL into the profile, so this is
-# observable only as "the profile's base is what is used".
+# ── --account resolves its base like every other path ────────────────
+# profile base > UKU_BASE_URL > default, with --base winning over all three.
+# The --account branch used to read the profile only.
 reset_requests
-UKU_BASE_URL="$UKU_BASE_URL" uku --account sandbox clients list
+uku --account sandbox clients list
 assert_status 0 'the profile base is used under --account'
 assert_request_count 1 'and it reached the fixture, i.e. the profile URL'
+
+# a profile with no stored base falls back to UKU_BASE_URL (it used to fall
+# straight through to https://app.getuku.com — the production API)
+mkdir -p "$UKU_CONFIG_HOME/profiles"
+{ printf 'UKU_COMPANY=%s\n' "$SAND_CO"; printf 'UKU_KEY=%s\n' "$SAND_KEY"; } \
+  > "$UKU_CONFIG_HOME/profiles/nobase"
+chmod 600 "$UKU_CONFIG_HOME/profiles/nobase"
+reset_requests
+uku --account nobase clients list
+assert_status 0 'a base-less profile under --account exits 0'
+assert_request_count 1 'and UKU_BASE_URL is where it went'
+assert_request 1 X-API-Key "$SAND_KEY" 'carrying that profile s key'
+
+# --base still beats both
+reset_requests
+uku --base 'http://127.0.0.1:1' --account sandbox clients list
+assert_status 5 '--base wins over the profile base — a dead port is unreachable'
+assert_no_requests 'so nothing reached the fixture'
+rm -f "$UKU_CONFIG_HOME/profiles/nobase"
 
 # ── logout removes the profile and hands the active flag on ──────────
 reset_requests
@@ -124,16 +144,31 @@ assert_true 'the profile file is gone' test ! -f "$UKU_CONFIG_HOME/profiles/sand
 assert_true 'the other profile is untouched' test -f "$UKU_CONFIG_HOME/profiles/main"
 assert_no_requests 'logout is local'
 
-# KNOWN ISSUE #7: removing the LAST remaining profile succeeds ("Removed account
-# 'main'.") but exits 1 — the usage-error code. _reassign_active runs
-# `next="$(list_profiles | head -n1)"`; with an empty profiles directory
-# list_profiles returns 1, and `set -euo pipefail` turns that assignment into a
-# script abort. Pinned as-is so a refactor has to fix it on purpose.
+# Removing the LAST remaining profile is a success, and exits like one. It used
+# to print "Removed account 'main'." and then exit 1 — the usage-error code —
+# because _reassign_active's `list_profiles | head -n1` failed on an empty
+# directory and `set -euo pipefail` aborted the script after the fact.
 reset_requests
 uku account remove main
-assert_status 1 'removing the LAST account exits 1 despite succeeding — KNOWN ISSUE #7'
-assert_err_contains "Removed account 'main'." 'the removal itself reported success'
+assert_status 0 'removing the LAST account exits 0'
+assert_err_contains "Removed account 'main'." 'and reports the removal'
 assert_true 'the last profile is gone' test ! -f "$UKU_CONFIG_HOME/profiles/main"
+assert_true 'the dangling active pointer is cleared' test ! -f "$UKU_CONFIG_HOME/active"
+
+# the same for the other way out: logout on the last account
+write_profile solo
+set_active_profile solo
+reset_requests
+uku auth logout
+assert_status 0 'logout on the last account exits 0'
+assert_err_contains 'Signed out of account' 'and reports it'
+assert_true 'and the profile is gone' test ! -f "$UKU_CONFIG_HOME/profiles/solo"
+
+# and listing accounts when there are none is a normal, empty answer
+reset_requests
+uku account list
+assert_status 0 'listing no accounts exits 0'
+assert_no_requests 'and stays local'
 
 # removing a NON-last account is exit 0 — the contrast that proves the cause
 write_profile keeper
@@ -152,12 +187,56 @@ assert_status 2 'with nothing left, a read is an auth error'
 assert_no_requests 'nothing sent'
 
 # ── auth login refuses non-interactively without --company ───────────
-# Deliberately the ONLY login path exercised: with a --company it would
-# validate against the production base (KNOWN ISSUE #5), which a test must never do.
 reset_requests
 UKU_API_KEY="$MAIN_KEY" uku auth login --account ci
 assert_status 1 'a non-interactive login without --company is a usage error'
 assert_err_contains 'needs --company' 'and says what is missing'
 assert_no_requests 'nothing was sent'
+
+# ── login validates against, and stores, the base it was told to use ──
+# Was KNOWN ISSUE #5: the global pre-parse ate --base before cmd_auth saw it and
+# login always talked to https://app.getuku.com — so pointing the CLI at staging
+# sent the key to production. A hermetic login must reach the fixture and
+# nothing else.
+KEYFILE="$CASE_DIR/key.txt"
+printf '%s' "$SAND_KEY" > "$KEYFILE"
+SERVER_BASE="$UKU_BASE_URL"
+
+reset_requests
+uku_stdin "$KEYFILE" auth login --account envbase --company "$SAND_CO" --key-stdin
+assert_status 0 'a login against UKU_BASE_URL exits 0'
+assert_request_count 1 'exactly one request — the credential probe'
+assert_request 1 path /api/v3/members 'it validated the key'
+assert_request 1 X-API-Key "$SAND_KEY" 'with the key it was handed on stdin'
+assert_request 1 X-Uku-Company "$SAND_CO" 'and the company it was given'
+assert_equals "$(grep '^UKU_BASE=' "$UKU_CONFIG_HOME/profiles/envbase")" "UKU_BASE=$UKU_BASE_URL" \
+  'and the profile stores the base it actually validated against'
+assert_err_not_contains 'app.getuku.com' 'production is never named'
+
+# --base wins over UKU_BASE_URL, whether it comes before or after the subcommand
+reset_requests
+UKU_BASE_URL='http://127.0.0.1:1' uku_stdin "$KEYFILE" --base "$SERVER_BASE" \
+  auth login --account flagbase --company "$SAND_CO" --key-stdin
+assert_status 0 'a global --base login exits 0'
+assert_request_count 1 'the flag base is where the probe went'
+assert_equals "$(grep '^UKU_BASE=' "$UKU_CONFIG_HOME/profiles/flagbase")" "UKU_BASE=$SERVER_BASE" \
+  'and --base beats UKU_BASE_URL in what is stored'
+
+reset_requests
+UKU_BASE_URL='http://127.0.0.1:1' uku_stdin "$KEYFILE" \
+  auth login --account subbase --company "$SAND_CO" --key-stdin --base "$SERVER_BASE"
+assert_status 0 'a --base after the subcommand still works'
+assert_request_count 1 'and it is the base that was contacted'
+
+# and a login against a base that rejects the key saves nothing
+reset_requests
+uku_stdin "$KEYFILE" --base "$SERVER_BASE/reject" \
+  auth login --account rejected --company "$SAND_CO" --key-stdin
+assert_status 2 'rejected credentials are exit 2'
+assert_true 'and nothing was written to disk' test ! -f "$UKU_CONFIG_HOME/profiles/rejected"
+
+uku account remove envbase   >/dev/null 2>&1
+uku account remove flagbase  >/dev/null 2>&1
+uku account remove subbase   >/dev/null 2>&1
 
 finish

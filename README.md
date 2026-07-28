@@ -225,8 +225,8 @@ monitors — are guarded so two people can't silently overwrite each other. A
 guarded write must carry an `If-Match` header holding the `ETag` from the
 resource's `GET`.
 
-You do not have to manage this. If a write comes back **428**, the CLI fetches
-the current ETag and re-sends the request **once**:
+In most cases you do not have to manage this. If a write comes back **428**, the
+CLI fetches the current ETag and re-sends the request **once**:
 
 ```sh
 uku api POST /api/v3/contracts/41219/rows --data @row.json --yes
@@ -243,6 +243,13 @@ table. Measured against the live API:
 | `DELETE /contracts/{id}/rows/{row_id}` | the **row's own**, `GET /contracts/{id}/rows/{row_id}` |
 | `POST /invoices/{id}/send`, `/mark-paid` | `GET /invoices/{id}` (the trailing verb is stripped) |
 
+**Where the heal does not apply: a 428 on a collection `POST`.** Every candidate
+is derived from an id in the path, so `POST /api/v3/tasks` — no id anywhere —
+has no resource to read an ETag from. Such a 428 is reported straight through
+(exit `3`) and you supply the version yourself with `--if-match '<etag>'`. The
+heal covers the guarded writes that name a record: `PATCH /contracts/{id}`,
+`POST /contracts/{id}/rows`, `DELETE …/{id}`, `POST /invoices/{id}/send`.
+
 The ETag is the record's own `updated_at`, so adding or removing a contract row
 does not change the parent contract's ETag, and neither does a no-op `PATCH`.
 
@@ -255,14 +262,16 @@ The status code tells you whether the write happened. Treat them differently:
 
 | Status | What happened | What to do |
 |---|---|---|
-| **428** `PRECONDITION_REQUIRED` | The write was refused for want of `If-Match`. **Nothing happened.** | Safe to re-send **once** with the ETag. The CLI does this for you. |
+| **428** `PRECONDITION_REQUIRED` | The write was refused for want of `If-Match`. **Nothing happened.** | Safe to re-send **once** with the ETag. The CLI does this for you when the path names a record; on a collection `POST` there is no ETag to fetch, so pass `--if-match` yourself. |
 | **412** `STALE_WRITE` (exit `6`) | Someone else changed the record after you read it. **Nothing was written.** | **Stop.** Re-read, re-apply your change on top of the current values, write again. Never automatic — a blind retry overwrites their edit. |
 | **429** rate limited (exit `5`) | For a write, the outcome is **unknown**. | **Never auto-retry a write.** `GET` to check whether it landed. The error says how many seconds until the window resets — wait, don't poll. |
 | **5xx / timeout** | Outcome **unknown**. | Same as 429: `GET` first. |
 | **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `TIMER_ALREADY_RUNNING`). | Re-sending the same request fails the same way. Change the request. |
 
-**Reads are idempotent and may be retried.** A write is re-sent automatically in
-exactly one case — a **428**, where the server refused it and nothing happened.
+**Reads are idempotent and may be retried** — once, and only when the connection
+itself failed; an HTTP status is never a reason to re-send. A write is re-sent
+automatically in exactly one case — a **428** on a path that names a record,
+where the server refused it and nothing happened.
 No other failed write is ever retried for you, because in no other case can the
 CLI know whether it landed.
 

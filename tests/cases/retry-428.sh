@@ -86,8 +86,10 @@ teardown_case
 
 # ── 4. no GETable id in the path → nothing to heal with ──────────────
 # POST /api/v3/tasks has no id segment, so _etag_candidates finds nothing and
-# the 428 is reported straight through. Worth pinning: it is easy to assume a
-# collection POST heals like a resource PATCH. It does not.
+# the 428 is reported straight through. The behaviour is correct — there is no
+# resource to read a version from — and §9 of this project's known issues was
+# that the docs promised the heal without the caveat. They now state it, which
+# the last two assertions here check.
 setup_case
 server_script <<'JSON'
 {
@@ -100,9 +102,19 @@ JSON
 start_server
 
 uku api POST /api/v3/tasks --data '{"title":"x"}' --yes
-assert_status 3 'a 428 on a collection POST is not healed — KNOWN ISSUE #9'
+assert_status 3 'a 428 on a collection POST is not healed'
 assert_request_count 1 'no ETag fetch was even attempted'
 assert_err_contains 'no ETag could be found' 'the message explains why'
+
+# and the docs say so, rather than promising a heal that cannot happen
+reset_requests
+uku --help
+assert_out_contains 'collection POST' 'uku help states the collection-POST caveat'
+
+reset_requests
+uku api POST /api/v3/tasks --data '{"title":"x"}' --yes --if-match 'W/"mine"'
+assert_status 3 'and --if-match is the documented way through'
+assert_request 1 If-Match 'W/"mine"' 'the version the caller asserted is what was sent'
 teardown_case
 
 # ── 5. the ETag lookup walks UP to the parent resource ───────────────

@@ -4,25 +4,20 @@
 # Doctrine: a 429'd READ may be waited out and retried; a 429'd or 5xx'd WRITE
 # is NEVER retried, because the CLI cannot know whether it landed.
 #
-# NOTE (measured, see KNOWN ISSUE #3 in tests/run.sh): reads also carry curl's own
-# `--retry 2`, and curl retries 429/5xx responses itself. So a rate-limited read
-# is sent up to THREE times by curl before the CLI's own "wait for the reset
-# window, then retry once" logic ever sees the 429. The counts below are the
-# measured truth, not the doctrine's headline.
+# An HTTP status is NEVER a reason to re-send automatically. curl's own
+# `--retry` disagreed — it counts 408/429/5xx as retryable — so a rate-limited
+# read used to hit the limiter three times before the CLI's own "wait for the
+# reset window, then retry once" logic ever saw the 429. That is gone; the only
+# automatic re-send left on a read is the CLI's own, once, after the wait.
 . "$(dirname "$0")/../lib/harness.sh"
 
-# ── 1. a rate-limited read: curl's 3 attempts, then the CLI waits + retries ──
+# ── 1. a rate-limited read: the CLI waits for the reset, then retries ONCE ──
 setup_case
 server_script <<'JSON'
 {
   "routes": [
     { "method": "GET", "path": "/api/v3/clients",
       "responses": [
-        {"status": 429, "body": {"error": {"code": "RATE_LIMITED"}},
-         "headers": {"X-RateLimit-Limit": "30", "X-RateLimit-Remaining": "0",
-                     "X-RateLimit-Tier": "read", "X-RateLimit-Reset": "{{now+2}}"}},
-        {"status": 429, "body": {"error": {"code": "RATE_LIMITED"}},
-         "headers": {"X-RateLimit-Reset": "{{now+2}}"}},
         {"status": 429, "body": {"error": {"code": "RATE_LIMITED"}},
          "headers": {"X-RateLimit-Limit": "30", "X-RateLimit-Remaining": "0",
                      "X-RateLimit-Tier": "read", "X-RateLimit-Reset": "{{now+2}}"}},
@@ -38,7 +33,27 @@ assert_status 0 'a rate-limited read eventually succeeds'
 assert_out_contains '"id": 1' 'the caller gets the successful page'
 assert_err_contains 'waiting 2s for the window to reset, then retrying this read once' \
   'the CLI announces the wait and the single retry'
-assert_request_count 4 'curl retries the 429 twice, then the CLI waits and retries once'
+assert_request_count 2 'the 429 reached the CLI itself: one attempt, one retry after the wait'
+teardown_case
+
+# ── 1b. a read that stays rate limited is retried exactly once, then reported ──
+setup_case
+server_script <<'JSON'
+{
+  "routes": [
+    { "method": "GET", "path": "/api/v3/clients",
+      "response": {"status": 429, "body": {"error": {"code": "RATE_LIMITED"}},
+                   "headers": {"X-RateLimit-Limit": "30", "X-RateLimit-Remaining": "0",
+                               "X-RateLimit-Tier": "read", "X-RateLimit-Reset": "{{now+2}}"}} }
+  ]
+}
+JSON
+start_server
+
+uku clients list
+assert_status 5 'a read that stays rate limited is exit 5'
+assert_request_count 2 'the wait-and-retry happens once, and only once — no loop'
+assert_err_contains 'HTTP 429' 'and the rate limit is reported to the caller'
 teardown_case
 
 # ── 2. a rate-limited WRITE is never retried ─────────────────────────
@@ -98,10 +113,9 @@ assert_status 3 'a 503 on a write is an API error'
 assert_request_count 1 'a 503 write is sent exactly once'
 teardown_case
 
-# ── 4. a 5xx on a READ is retried — by curl, not by the CLI ──────────
-# `case "$method" in GET|HEAD) args+=(--retry 2 …)` in do_request. Pinned here
-# because it is invisible from the CLI's own code path and triples the load a
-# failing read puts on the API.
+# ── 4. a 5xx on a READ is sent ONCE ──────────────────────────────────
+# A 500 is an answer from the server, not a transport failure, so nothing
+# re-sends it. (It used to be sent three times: curl's own --retry.)
 setup_case
 server_script <<'JSON'
 {
@@ -115,6 +129,30 @@ start_server
 
 uku clients list
 assert_status 3 'a 500 on a read is an API error'
-assert_request_count 3 'curl --retry 2 sends a failing read three times'
+assert_request_count 1 'a failing read is sent exactly once — an HTTP status is never re-sent'
+teardown_case
+
+# ── 5. a TRANSPORT failure is what a read retries on — once, and reads only ──
+# Nothing reaches the fixture here (the base is a dead loopback port), so the
+# count comes from the curl spy: one line per curl invocation.
+setup_case
+server_script <<'JSON'
+{ "routes": [] }
+JSON
+start_server
+enable_curl_spy
+DEAD='http://127.0.0.1:1'
+
+uku --base "$DEAD" clients list
+assert_status 5 'an unreachable host is a network error (exit 5)'
+assert_equals "$(grep -c 'api/v3/clients' "$CURL_ARGV_LOG" | tr -d '[:space:]')" '2' \
+  'a GET that never connected is re-issued exactly once'
+assert_err_contains 'could not reach' 'and then reported, not retried forever'
+
+: > "$CURL_ARGV_LOG"
+uku --base "$DEAD" api POST /api/v3/tasks --data '{"title":"x"}' --yes
+assert_status 5 'an unreachable write is also exit 5'
+assert_equals "$(grep -c 'api/v3/tasks' "$CURL_ARGV_LOG" | tr -d '[:space:]')" '1' \
+  'but a WRITE is never re-issued — an interrupted POST may still have landed'
 
 finish

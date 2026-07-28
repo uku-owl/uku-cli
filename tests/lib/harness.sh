@@ -23,6 +23,13 @@ REQLOG_PY="$HARNESS_DIR/reqlog.py"
 # would try to mktemp inside the first case's removed directory.
 HARNESS_TMPDIR="${TMPDIR:-/tmp}"
 
+# The real PATH, captured before any case (hide_cmd, most drastically) narrows
+# it down to a per-case symlink farm inside CASE_DIR — a farm that stops
+# existing the moment that case's teardown_case removes CASE_DIR. Without
+# this, a SECOND setup_case in the same file would inherit a PATH pointing at
+# nothing, and even mkdir/mktemp would go missing.
+HARNESS_ORIG_PATH="$PATH"
+
 PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 have_cmd "$PYTHON_BIN" || PYTHON_BIN="python3"
@@ -65,6 +72,9 @@ REAL_CURL=""
 
 # setup_case — fresh temp dirs + hermetic env. Call once at the top of a case.
 setup_case() {
+  # Undo any PATH narrowing (hide_cmd) or prepending (enable_curl_spy) a
+  # PRIOR case in this same file left behind — each case starts hermetic.
+  export PATH="$HARNESS_ORIG_PATH"
   CASE_DIR="$(mktemp -d "${HARNESS_TMPDIR%/}/uku-test-XXXXXX")"
   mkdir -p "$CASE_DIR/home" "$CASE_DIR/config" "$CASE_DIR/work"
 
@@ -148,9 +158,9 @@ finish() {
 }
 
 # ── credentials on disk (the profile path) ───────────────────────────
-# Written directly rather than via `uku auth login`: login ignores --base and
-# UKU_BASE_URL and always validates against https://app.getuku.com, so calling
-# it in a test would hit the real API. See KNOWN ISSUE #5 in tests/run.sh.
+# A shortcut, not a workaround: `uku auth login` now honours --base and
+# UKU_BASE_URL (accounts.sh exercises the real login path against the fixture),
+# but most cases only need a profile to exist, not a round trip to create it.
 write_profile() { # NAME [COMPANY] [KEY]
   local name="$1" company="${2:-$TEST_COMPANY}" key="${3:-$TEST_API_KEY}"
   mkdir -p "$UKU_CONFIG_HOME/profiles"
@@ -177,6 +187,41 @@ enable_curl_spy() {
   } > "$CASE_DIR/bin/curl"
   chmod +x "$CASE_DIR/bin/curl"
   export PATH="$CASE_DIR/bin:$PATH"
+}
+
+# hide_cmd NAME — make `command -v NAME` fail for the rest of this case, while
+# every OTHER external tool the CLI reaches for (curl, python3, shasum,
+# column, …) stays available. This is what "no jq on this box" actually looks
+# like — not an unset PATH, just one missing binary.
+#
+# The robust way is a symlink farm, not a PATH trick: build a fresh directory,
+# walk every directory currently on PATH in order, and symlink each
+# executable found into the farm EXCEPT NAME — first occurrence wins, exactly
+# how PATH resolution itself works, so nothing downstream sees a different
+# `curl` or `python3` than it would have. Then PATH becomes that one
+# directory. A bare `PATH="${PATH/jq-dir/}"` was considered and rejected: on
+# this box jq, curl and python3 all live in the same few directories
+# (/usr/bin, /opt/homebrew/bin), so removing a directory to hide jq would
+# have hidden curl and python3 with it.
+hide_cmd() { # NAME
+  local hide="$1"
+  local farm="$CASE_DIR/hidebin-$hide"
+  mkdir -p "$farm"
+  local old_ifs="$IFS" dir f base
+  IFS=':'
+  for dir in $PATH; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    for f in "$dir"/*; do
+      [ -e "$f" ] || continue
+      base="$(basename "$f")"
+      [ "$base" = "$hide" ] && continue          # the one tool being hidden
+      [ -x "$f" ] || continue
+      [ -e "$farm/$base" ] && continue           # first occurrence on PATH wins
+      ln -s "$f" "$farm/$base" 2>/dev/null || true
+    done
+  done
+  IFS="$old_ifs"
+  export PATH="$farm"
 }
 
 # ── the guard ────────────────────────────────────────────────────────

@@ -125,14 +125,11 @@ uku tasks create --batch @"$LINES" --yes --run-id r1
 assert_request_count 3 'without --resume the same file is created again — by design'
 teardown_case
 
-# ── 2b. a line that FAILED with an API error cannot be resumed ───────
-# KNOWN ISSUE #1. The ledger records `send` before the request and `fail` after a
-# non-2xx reply, but _ledger_state only ever looks at `ok` and `send` — so on
-# --resume a definitively-rejected line (422, 500, …) is reported as
-# UNKNOWN_OUTCOME and REFUSED, and the run exits 3 with nothing re-sent.
-# `uku help batch` says "--resume is safe and is the correct response to any
-# interrupted batch"; for a run that had failures it is a dead end without
-# --retry-unknown. Pinned as the behaviour that exists today.
+# ── 2b. a line the server REFUSED is re-sent by plain --resume ───────
+# The distinction the ledger has to survive a crash for: a line for which a
+# reply arrived and it was not a success created NOTHING, so it is FAILED and
+# --resume re-sends it — which is exactly what the run's own summary tells the
+# user to do. Only a line sent with no observed outcome is UNKNOWN (§3).
 setup_case
 server_script <<'JSON'
 {
@@ -164,10 +161,13 @@ assert_equals "$(awk -F'\t' '$1=="fail"{n++} END{print n+0}' "$UKU_CONFIG_HOME/b
 
 reset_requests
 uku tasks create --batch @"$LINES" --yes --run-id r2 --resume
-assert_status 3 'the resume the summary suggested exits 3 — KNOWN ISSUE #1'
-assert_no_requests 'the failed line is NOT re-sent by --resume — KNOWN ISSUE #1'
-assert_equals "$(outcomes)" 'skipped,failed,' 'it is reported as failed, not retried'
-assert_out_contains 'UNKNOWN_OUTCOME' 'a definitively-rejected line is called unknown — KNOWN ISSUE #1'
+assert_status 0 'the resume the summary suggested succeeds'
+assert_request_count 1 'ONLY the refused line is re-sent'
+assert_request 1 body '{"title":"b"}' 'and it is the line that failed'
+assert_equals "$(outcomes)" 'skipped,created,' 'the created line is skipped, the refused one is created'
+assert_out_not_contains 'UNKNOWN_OUTCOME' 'a definitively-rejected line is never called unknown'
+assert_equals "$(awk -F'\t' '$1=="ok"{n++} END{print n+0}' "$UKU_CONFIG_HOME/batches/r2")" '2' \
+  'the ledger now holds both creates'
 teardown_case
 
 # ── 3. a line caught in flight (send, never confirmed) is NOT re-sent ──
@@ -193,7 +193,8 @@ assert_status 0 'the seed run succeeds'
 
 # Simulate the interruption the ledger exists for: the POST left, the reply
 # never arrived, so the `ok` row was never written and the ledger holds `send`
-# alone. Dropping the ok rows reproduces exactly that state on disk.
+# alone. Dropping the ok rows reproduces exactly that state on disk — and is
+# also the shape of a v0.3.0 ledger, which had no outcome rows to read.
 LEDG="$UKU_CONFIG_HOME/batches/inflight"
 grep -v '^ok	' "$LEDG" > "$LEDG.tmp" && mv "$LEDG.tmp" "$LEDG"
 assert_equals "$(awk -F'\t' '$1=="send"{n++} END{print n+0}' "$LEDG")" '2' \
@@ -205,6 +206,15 @@ assert_status 3 'an unresolved in-flight line fails the run (exit 3)'
 assert_out_contains 'UNKNOWN_OUTCOME' 'the unresolved line is reported as unknown'
 assert_out_contains 'may or may not exist' 'and explained'
 assert_no_requests 'NOTHING is re-sent — a duplicate is worse than a gap'
+
+# That refusal itself appended a `fail … UNKNOWN_OUTCOME` row. A local refusal
+# is not an observed outcome, so it must NOT downgrade the line to "the server
+# refused it" and make the next plain --resume send it.
+reset_requests
+uku tasks create --batch @"$LINES" --yes --run-id inflight --resume
+assert_status 3 'a second plain --resume still refuses'
+assert_out_contains 'UNKNOWN_OUTCOME' 'the line is still unknown, not failed'
+assert_no_requests 'and still nothing is re-sent'
 
 # --retry-unknown is the explicit opt-in to send it anyway
 reset_requests

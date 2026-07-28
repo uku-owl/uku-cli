@@ -42,6 +42,27 @@ info()  { [ "${UKU_QUIET:-0}" = "1" ] && return 0; printf '%s %s\n' "$(_green '�
 warn()  { printf '%s %s\n' "$(_color 33 '!')" "$1" >&2; }
 die()   { printf '%s %s\n' "$(_red '✗')" "$1" >&2; exit "${2:-$EX_USAGE}"; }
 have()  { command -v "$1" >/dev/null 2>&1; }
+# ── the jq-degradation rule ──────────────────────────────────────────
+# jq is optional (README: "used for pretty tables when present, but is never
+# required"). Every `have jq` branch in this file picks one of two responses,
+# and the choice is not a coin flip — it follows from what jq's absence costs:
+#
+#   • a DEGRADED SHAPE warns and continues. Fewer rows (--all can't combine
+#     pages), more keys (--fields can't select down), a plain dump instead of
+#     a table — the data is still correct, just shaped differently. Nothing
+#     is damaged, so refusing would only make the CLI less useful for exactly
+#     the box that needs it most.
+#   • an UNKEEPABLE SAFETY PROMISE refuses outright. --skip-existing exists to
+#     stop a batch from creating a duplicate; without jq it cannot compare the
+#     match field exactly, and proceeding would mean guessing at the one
+#     thing the flag promises never to guess at. A wrong guess creates data
+#     that then has to be found and cleaned up by hand — worse than refusing.
+#
+# So: can the command still tell the truth, just less prettily? Warn and
+# continue. Would continuing require guessing at something the caller was
+# explicitly promised would never be guessed? Die instead. Tested end to end,
+# including the promise NOT holding in one place (uku doctor --json): see
+# tests/cases/no-jq.sh.
 # _need_val FLAG [VALUE …] — die clearly instead of a silent `shift 2` death.
 _need_val() { [ "$#" -ge 2 ] || die "flag $1 needs a value" "$EX_USAGE"; }
 
@@ -124,7 +145,11 @@ load_creds() {
     UKU_PROFILE="$UKU_ACCOUNT_CLI"
     local f; f="$(_profile_path "$UKU_PROFILE")"
     [ -f "$f" ] || die "No such account: $UKU_PROFILE  (uku account list)" "$EX_AUTH"
-    UKU_BASE="$(_profile_get "$f" UKU_BASE)"; UKU_BASE="${UKU_BASE:-$UKU_BASE_DEFAULT}"
+    # Same base precedence as the other two branches: what the profile stored,
+    # then UKU_BASE_URL, then the default (and --base still wins over all three,
+    # below). This branch used to read the profile only, so --account silently
+    # ignored the env var that every other path honours.
+    UKU_BASE="$(_profile_get "$f" UKU_BASE)"; UKU_BASE="${UKU_BASE:-${env_base:-$UKU_BASE_DEFAULT}}"
     UKU_COMPANY="$(_profile_get "$f" UKU_COMPANY)"
     UKU_KEY="$(_profile_get "$f" UKU_KEY)"
   elif [ -n "$env_key" ] && [ -n "$env_company" ]; then
@@ -180,9 +205,15 @@ _reassign_active() {
   else rm -f "$UKU_ACTIVE_FILE" 2>/dev/null || true; fi
 }
 
+# "no accounts" is an ANSWER, not a failure. The loop's status used to be the
+# last `[ -f … ]`, so an empty (or glob-unmatched) profile dir returned 1 — and
+# under `set -euo pipefail` `next="$(list_profiles | head -n1)"` in
+# _reassign_active then aborted the script, AFTER "Removed account 'x'." had
+# already been printed. Removing your last account succeeded and exited 1.
 list_profiles() {
   [ -d "$UKU_PROFILE_DIR" ] || return 0
   local f; for f in "$UKU_PROFILE_DIR"/*; do [ -f "$f" ] && basename "$f"; done 2>/dev/null
+  return 0
 }
 
 need_auth() {
@@ -410,7 +441,12 @@ do_request() {
     -D "$hdrf"
     -w '%{http_code}' -o "$tmp")
   case "$url" in https://*) args+=(--proto '=https' --tlsv1.2) ;; esac  # pin TLS for https bases; allow http dev base
-  case "$method" in GET|HEAD) args+=(--retry 2 --retry-connrefused) ;; esac  # retry idempotent reads only
+  # NO `--retry`: curl's own retry counts 408/429/5xx as retryable and re-sends
+  # them itself, so a rate-limited read hit the limiter three times before the
+  # CLI's polite "read X-RateLimit-Reset, wait, retry once" path was even
+  # reachable — the client hammering the very budget it is trying to respect.
+  # Resilience to a flaky link is kept, but as a TRANSPORT-only retry below:
+  # once, and never on an HTTP status.
   # Request body also goes to a 0600 file, off argv — invoice/client PII isn't in `ps` either (#2).
   if [ -n "$data" ]; then
     local body; body="$(_mktemp)"; chmod 600 "$body" 2>/dev/null || true
@@ -427,7 +463,28 @@ do_request() {
     printf '  %s\n' "$([ -n "$data" ] && printf 'body: %s' "$data" || printf 'no body')" >&2
     exit "$EX_OK"
   fi
-  if ! REPLY_STATUS="$(curl "${args[@]}")"; then
+  # Transport-only retry. These curl exit codes all mean "the request did not
+  # complete on the wire", never "the server answered": 6 could not resolve the
+  # host · 7 could not connect · 28 timed out · 35 TLS handshake failed ·
+  # 52 empty reply · 56 error receiving data. An idempotent read may be
+  # re-issued once on any of them. A WRITE never is — an interrupted POST may
+  # still have been applied, which is the whole doctrine of this CLI.
+  local rc=0 attempt=1
+  while :; do
+    rc=0
+    REPLY_STATUS="$(curl "${args[@]}")" || rc=$?
+    if [ "$rc" -eq 0 ]; then break; fi
+    if [ "$attempt" -eq 1 ]; then
+      case "$method" in
+        GET|HEAD)
+          case "$rc" in
+            6|7|28|35|52|56) attempt=2; continue ;;
+          esac ;;
+      esac
+    fi
+    break
+  done
+  if [ "$rc" -ne 0 ]; then
     # UKU_SOFT lets callers (doctor) probe without the CLI dying on a flake.
     [ "${UKU_SOFT:-0}" = "1" ] && { REPLY_STATUS=0; REPLY_BODY=""; REPLY_HEADERS=""; return 1; }
     die "could not reach $UKU_BASE (network error)" "$EX_NET"
@@ -474,12 +531,40 @@ render() {
   if have jq; then printf '%s\n' "$body" | jq .; else printf '%s\n' "$body"; fi
 }
 
+# _project_fields BODY — BODY with every row in .data reduced to the keys named
+# by --fields, in the order the user named them, envelope (.meta) untouched. A
+# key a row does not have comes back null rather than vanishing, so every row
+# has the same shape and a consumer can index it without checking.
+_project_fields() {
+  printf '%s' "$1" | jq --arg fields "$UKU_FIELDS" '
+    ($fields | split(",") | map(select(length > 0))) as $f
+    | def pick: . as $row | reduce $f[] as $k ({}; .[$k] = $row[$k]);
+      if (.data | type) == "array"  then .data |= map(pick)
+      elif (.data | type) == "object" then .data |= pick
+      else . end' 2>/dev/null
+}
+
 # table BODY COL1 COL2 ...  — compact table of .data[] fields when jq present.
 table() {
   local body="$1"; shift
   # --fields id,name overrides the default columns (#8)
   if [ -n "${UKU_FIELDS:-}" ]; then local IFS=','; set -- $UKU_FIELDS; unset IFS; fi
   if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty || ! have jq; then
+    # --fields is explicit intent, and JSON is what a script or an agent gets by
+    # default — so honour it there too, by projecting each row down to the keys
+    # named. It used to be silently dropped on every non-TTY run, which made the
+    # flag do nothing at all for exactly the callers most likely to pass it.
+    if [ -n "${UKU_FIELDS:-}" ]; then
+      if have jq; then
+        local projected; projected="$(_project_fields "$body")"
+        if [ -n "$projected" ]; then printf '%s\n' "$projected"; return; fi
+        warn "--fields could not be applied to this response — showing it whole."
+      else
+        # Degraded shape, not an unkept promise — see the jq-degradation rule
+        # near have() — so warn and continue rather than refuse.
+        warn "--fields needs jq to select keys from JSON output — showing every field."
+      fi
+    fi
     render "$body"; return
   fi
   local hdr="" jqfields=""
@@ -587,6 +672,12 @@ check_status() {
 
 # confirm_write ACTION — deliberate-write gate.
 confirm_write() {
+  # --dry-run sends nothing, so there is nothing to confirm. Demanding --yes to
+  # PREVIEW a write defeats the point of previewing it before approving it —
+  # and run_batch has always skipped the confirm under --dry-run, so a single
+  # write was refused where the same write in a batch file was not. One gate,
+  # one rule (the "sent nothing" guarantee is do_request's, and is unchanged).
+  [ "${UKU_DRY:-0}" = "1" ] && return 0
   [ "${UKU_YES:-0}" = "1" ] && return 0
   if ! _is_tty; then
     die "Refusing a non-interactive write ($1). Re-run with --yes to confirm." "$EX_CONFIRM"
@@ -648,6 +739,14 @@ cmd_auth() {
         *) die "unknown flag for auth login: $1" "$EX_USAGE" ;;
       esac; done
       [ -n "$acct" ] || acct="${UKU_ACCOUNT_CLI:-$(active_profile)}"
+      # Base precedence, and it is a CREDENTIAL-DISCLOSURE decision, not cosmetics:
+      # the global pre-parse eats `--base` into UKU_BASE_CLI before this function
+      # ever sees its argv, so the local --base case above is only reached when
+      # the flag came AFTER the subcommand. Honour both, then the env, then the
+      # default — otherwise `uku auth login --base http://staging…` validated
+      # against, and stored, production, sending the key to the wrong host.
+      [ -n "$base" ] || base="${UKU_BASE_CLI:-}"
+      [ -n "$base" ] || base="${UKU_BASE_URL:-}"
       [ -n "$base" ] || base="$UKU_BASE_DEFAULT"
       local key=""
       if [ "$key_stdin" = "1" ] || [ -n "${UKU_API_KEY:-}" ] || { [ -n "$company" ] && ! _is_tty; }; then
@@ -810,6 +909,8 @@ list_resource() {
   [ -z "${UKU_BATCH:-}" ] || die "--batch creates records — it does nothing on a list. Try: uku <resource> create --batch @lines.jsonl" "$EX_USAGE"
   load_creds; need_auth
   if [ "${UKU_ALL:-0}" = "1" ]; then
+    # Degraded shape (fewer rows), not an unkept promise — see the
+    # jq-degradation rule near have() — so warn and continue rather than refuse.
     have jq && { _list_all "$path" "${cols[@]}"; return; } || warn "--all needs jq to combine pages — showing the first page only."
   fi
   local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
@@ -940,9 +1041,18 @@ _json_str() {
 #
 # Recording only successes would make --resume re-create that line: an exact
 # duplicate, in the one command whose entire promise is that it never does
-# that. So a hash with `send` and no `ok` is UNKNOWN, and --resume refuses to
+# that. So a hash with `send` and no outcome is UNKNOWN, and --resume refuses to
 # re-send it and says why. That is the same doctrine the CLI already applies to
 # a 429 or a 5xx on a write: the outcome is unknown, so GET before resending.
+#
+# A `fail` row carrying an HTTP STATUS is the opposite case and must not be
+# confused with it: a response came back, and it was not a success, so the
+# server created nothing. Such a line is FAILED, not unknown, and plain
+# --resume re-sends it — which is what the run's own summary tells the user to
+# do. A `fail` row carrying a WORD (UNKNOWN_OUTCOME, GUARD_REFUSED, …) is a
+# local refusal, never an observed outcome, so it decides nothing here.
+# Backward compatible with ledgers written by v0.3.0: they hold the same rows,
+# and one with no `fail` row at all still reads `send`-without-`ok` as UNKNOWN.
 _ledger_file() { printf '%s/%s' "$(_batch_dir)" "$1"; }
 _ledger_init() {  # RUNID METHOD PATH SOURCE
   local f; f="$(_ledger_file "$1")"
@@ -960,8 +1070,10 @@ _ledger_init() {  # RUNID METHOD PATH SOURCE
   chmod 600 "$f" 2>/dev/null || true
 }
 _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '-'; }
-# _ledger_state RUNID HASH → "ok <id>" · "send" · "" (never recorded).
-# `ok` wins over `send` whatever the order: a confirmed create is a fact.
+# _ledger_state RUNID HASH → "ok <id>" · "fail" · "send" · "" (never recorded).
+# `ok` wins over everything whatever the order: a confirmed create is a fact.
+# `fail` (an observed non-2xx) wins over `send`: the reply arrived, so the line
+# is definitively not created, rather than unresolved.
 _ledger_state() {
   local f; f="$(_ledger_file "$1")"
   [ -f "$f" ] || return 0
@@ -969,7 +1081,8 @@ _ledger_state() {
   awk -F'\t' -v h="$2" '
     $2==h && $1=="ok"   { id=$4; ok=1 }
     $2==h && $1=="send" { sent=1 }
-    END { if (ok) printf "ok %s", id; else if (sent) printf "send" }' "$f" 2>/dev/null || true
+    $2==h && $1=="fail" && $4 ~ /^[0-9]+$/ { rejected=1 }
+    END { if (ok) printf "ok %s", id; else if (rejected) printf "fail"; else if (sent) printf "send" }' "$f" 2>/dev/null || true
 }
 # _ledger_add RUNID STATE HASH PATH ID_OR_STATUS LINENO — append AND flush.
 # A separate open/write/close per line is the point: nothing is buffered, so an
@@ -1035,6 +1148,8 @@ run_batch() {
   [ "$UKU_SKIP_EXISTING" = "1" ] && [ -z "$UKU_MATCH_ON" ] && die "--skip-existing needs --match-on <field> — otherwise there is nothing to match on. Nothing was sent." "$EX_USAGE"
   [ -n "$UKU_MATCH_ON" ] && [ "$UKU_SKIP_EXISTING" != "1" ] && die "--match-on only means something with --skip-existing. Nothing was sent." "$EX_USAGE"
   if [ "$UKU_SKIP_EXISTING" = "1" ] && ! have jq; then
+    # Unkeepable safety promise, not a mere shape change — see the
+    # jq-degradation rule near have() — so refuse rather than guess.
     die "--skip-existing needs jq to compare a field exactly; without it the CLI would have to guess. Use the ledger instead (--resume). Nothing was sent." "$EX_USAGE"
   fi
   load_creds; need_auth
@@ -1128,6 +1243,11 @@ run_batch() {
           skipped=$((skipped + 1))
           _batch_emit "$lineno" "$([ "${UKU_DRY:-0}" = "1" ] && printf 'would_skip' || printf 'skipped')" "${state#ok }" "" LEDGER_HIT "already created by run $rid" "$path"
           continue ;;
+        fail)
+          # The server answered and refused (422 / 500 / 412 …), so it created
+          # nothing. Re-sending is the whole point of --resume here; falling
+          # through does exactly that. Only an unobserved outcome is UNKNOWN.
+          : ;;
         send)
           # Sent, never confirmed — the line the interruption caught in flight.
           if [ "$UKU_RETRY_UNKNOWN" != "1" ]; then
@@ -1518,23 +1638,46 @@ cmd_doctor() {
     if have jq; then
       printf '%s' "$_DOC_ROWS" | jq -R -s 'split("\n")|map(select(length>0))|map(split("|")|{level:.[0],message:.[1]})
         | {checks:., fails:(map(select(.level=="fail"))|length), warnings:(map(select(.level=="warn"))|length), ok:(all(.level!="fail"))}'
-    else printf '%s' "$_DOC_ROWS"; fi
+    else
+      # No jq — but --json is a promise ("--json always gives you raw JSON"),
+      # and doctor is the command you reach for when the box is BARE. Printing
+      # the raw level|message accumulator here emitted something that was not
+      # JSON at all, while still exiting 0, so a script parsing it got garbage
+      # and no signal that anything was wrong. _json_str already escapes without
+      # jq for the batch ledger; the same shape is buildable in pure bash.
+      local _dj_first=1 _dj_lvl _dj_msg
+      printf '{"checks":['
+      while IFS='|' read -r _dj_lvl _dj_msg; do
+        [ -z "$_dj_lvl" ] && continue
+        [ "$_dj_first" = "1" ] || printf ','
+        _dj_first=0
+        printf '{"level":%s,"message":%s}' "$(_json_str "$_dj_lvl")" "$(_json_str "$_dj_msg")"
+      done <<EOF
+$(printf '%s' "$_DOC_ROWS")
+EOF
+      local _dj_ok=true; [ "$_DOC_FAILS" -gt 0 ] && _dj_ok=false
+      printf '],"fails":%d,"warnings":%d,"ok":%s}\n' "$_DOC_FAILS" "$_DOC_WARNS" "$_dj_ok"
+    fi
   else
+    # The whole report on STDOUT — heading, every check, the tally. It is this
+    # command's output, not commentary on some other output, and it used to be
+    # split across both streams, so `uku doctor > report.txt` captured the
+    # heading and nothing else. --json was always whole; now text matches it.
     printf '  %s\n\n' "$(_bold 'uku doctor')"
     local line lvl msg
     while IFS='|' read -r lvl msg; do [ -z "$lvl" ] && continue
       case "$lvl" in
-        ok)   info "$msg" ;;
-        warn) printf '  %s %s\n' "$(_color 33 '!')" "$msg" >&2 ;;
-        fail) printf '  %s %s\n' "$(_red '✗')" "$msg" >&2 ;;
+        ok)   printf '  %s %s\n' "$(_green '✓')" "$msg" ;;
+        warn) printf '  %s %s\n' "$(_color 33 '!')" "$msg" ;;
+        fail) printf '  %s %s\n' "$(_red '✗')" "$msg" ;;
       esac
     done <<EOF
 $(printf '%s' "$_DOC_ROWS")
 EOF
     printf '\n'
-    if [ "$_DOC_FAILS" -gt 0 ]; then printf '  %s\n' "$(_red "$_DOC_FAILS failing, $_DOC_WARNS warning(s).")" >&2
-    elif [ "$_DOC_WARNS" -gt 0 ]; then printf '  %s\n' "$(_color 33 "$_DOC_WARNS thing(s) to look at.")" >&2
-    else info "All good."; fi
+    if [ "$_DOC_FAILS" -gt 0 ]; then printf '  %s\n' "$(_red "$_DOC_FAILS failing, $_DOC_WARNS warning(s).")"
+    elif [ "$_DOC_WARNS" -gt 0 ]; then printf '  %s\n' "$(_color 33 "$_DOC_WARNS thing(s) to look at.")"
+    else printf '  %s %s\n' "$(_green '✓')" "All good."; fi
   fi
   [ "$_DOC_FAILS" -gt 0 ] && exit 1 || return 0
 }
@@ -1640,10 +1783,16 @@ $(_bold "THE LEDGER — why --resume can be trusted")
   The run-id is derived from the target plus a hash of the file, so --resume
   works without having remembered anything. --run-id NAME overrides it.
 
-  One line can be caught in flight — the request left, the reply never came.
-  That line is recorded as SENT, not created, and --resume $(_bold "refuses to re-send
-  it") and tells you so: the CLI cannot know whether it landed, and guessing
-  would duplicate a record. Check that one, then --retry-unknown to send it.
+  The rule is about what the server was OBSERVED to do, not about which lines
+  went out:
+    • created (the server confirmed it)  → --resume SKIPS it.
+    • the server answered and refused it (422, 500, 412, …) → nothing was
+      created, so --resume $(_bold "re-sends it"). That is what the summary's
+      "resume:" line is for.
+    • sent, and the reply never came — the one line an interruption can catch
+      in flight → $(_bold "UNKNOWN"). --resume $(_bold "refuses to re-send it") and tells you
+      so: the CLI cannot know whether it landed, and guessing would duplicate a
+      record. Check that one, then --retry-unknown to send it.
   The ledger stores a hash, never the line: no client data is written to disk.
     uku batch list · uku batch show <run-id>
 
@@ -1763,13 +1912,13 @@ Read the status, not the vibe. Each of these means something different:
 
 | Status | What happened | What you do |
 |---|---|---|
-| **428** PRECONDITION_REQUIRED | The server refused the write for want of an `If-Match`. **Nothing happened.** | Safe to re-send once with the ETag — **the CLI already does this for you**, automatically and only once. If it still fails, GET the resource and pass `--if-match '<etag>'`. |
+| **428** PRECONDITION_REQUIRED | The server refused the write for want of an `If-Match`. **Nothing happened.** | Safe to re-send once with the ETag. **The CLI does this for you when the path names a record** (`PATCH /contracts/{id}`, `POST /contracts/{id}/rows`, `DELETE …/{id}`), automatically and only once. On a **collection POST** (`POST /api/v3/tasks`) there is no record to read an ETag from, so it is not healed: GET the relevant resource and pass `--if-match '<etag>'` yourself. If a heal still fails, do the same. |
 | **412** STALE_WRITE (exit **6**) | Someone else changed the record after you read it. **Nothing was written.** | **STOP.** Re-read the record, re-apply your change on top of the *current* values, then write again. **Never** retry automatically — a blind retry silently overwrites their edit. Tell the user what changed. |
 | **429** rate limited (exit **5**) | Outcome **unknown** for a write. | **Never auto-retry a write.** GET to check whether it landed. The message tells you how many seconds until the window resets — wait, don't poll. Reads are safe and the CLI already waits once for you. |
 | **5xx / timeout** (exit 3/5) | Outcome **unknown**. | Same as 429: GET first, never blind-resend a write. |
 | **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `*_EXISTS`, `TIMER_ALREADY_RUNNING`). | Re-sending the identical request fails identically. Change the request or tell the user. |
 
-**Reads are idempotent and may be retried. A write is re-sent automatically in exactly one case — a 428, where the server refused it and nothing happened. You must never resend any other failed write yourself: outside a 428 the outcome is unknown, so GET first.**
+**Reads are idempotent; the CLI re-issues one at most once, and only when the connection itself failed — an HTTP status is never re-sent for you. A write is re-sent automatically in exactly one case — a 428 on a path that names a record, where the server refused it and nothing happened. You must never resend any other failed write yourself: outside a 428 the outcome is unknown, so GET first.**
 
 ### Creating many records — use `--batch`, never a shell loop
 When the user wants N records created, write one JSON object per line to a
@@ -1783,18 +1932,30 @@ uku tasks create --batch @tasks.jsonl --resume --yes # after any interruption
 ```
 - stdout is **JSONL, one result per input line**: `{line, outcome, id, status, code, message}`. `outcome` is `created` / `skipped` / `failed` (`would_create` / `would_skip` under `--dry-run`).
 - A bad line fails by itself; the run continues. `--stop-on-error` halts instead.
-- **`--resume` is safe and is the correct response to any interrupted batch.** Lines already created are skipped by content hash — re-running cannot duplicate them. This is the one case where "just run it again" is right.
+- **`--resume` is safe and is the correct response to any interrupted or partly-failed batch.** What the ledger records is what the server was *observed* to do:
+  - **created** → skipped by content hash; re-running cannot duplicate it.
+  - **answered and refused** (422 / 500 / 412 …) → nothing was created, so `--resume` **re-sends** that line.
+  - **sent, no reply** (the one line an interruption can catch in flight) → **UNKNOWN**: `--resume` refuses it and says so. Check the server, then `--retry-unknown` if it really is missing.
 - `--dry-run` validates every line and sends nothing.
 - `--skip-existing --match-on <field>` queries before creating. It is fragile — many real records share a title — and it refuses a line when more than one record matches. Prefer the ledger; use `--match-on` only on a genuinely unique field.
 - `uku batch list` · `uku batch show <run-id>` — what a previous run did.
 
 ### Version checks (If-Match / ETag)
 Financial writes (invoices, contracts and their rows, agreements, members,
-monitors) are guarded so two people can't overwrite each other. You do not have
-to manage this: omit `--if-match` and the CLI fetches the ETag on a 428 and
-re-sends once. Pass `--if-match '<etag>'` yourself only when you already hold a
-version you deliberately want to assert — then a 428 is **not** healed, because
-the value you chose was the thing rejected.
+monitors) are guarded so two people can't overwrite each other. Usually you do
+not have to manage this: omit `--if-match` and, **when the path names a record**,
+the CLI fetches that record's ETag on a 428 and re-sends once — walking up to
+the parent when the path's own segment is not an id (`POST /contracts/{id}/rows`
+uses `GET /contracts/{id}`).
+
+**The exception is a collection POST**, e.g. `POST /api/v3/tasks`: there is no id
+in the path, so there is no resource to read an ETag from and the 428 is
+reported as an API error (exit 3). Then GET the resource the server is guarding
+and pass `--if-match '<etag>'` yourself.
+
+Pass `--if-match '<etag>'` deliberately whenever you already hold a version you
+want to assert — a 428 is then **not** healed, because the value you chose was
+the thing rejected.
 
 ### Time entries — the one payload shape to avoid
 A time entry with a `start` and **no `end`** is a *running timer*, not logged
@@ -1964,7 +2125,9 @@ $(_bold "GLOBAL FLAGS")
   --yes, -y         Confirm a non-interactive write
   --dry-run         Print the request (headers masked) and send nothing
   --all             Page through every row (keeps your filters)
-  --fields a,b      Table columns to show   ·   --quiet, -q   ·   --no-color
+  --fields a,b      Keep only these fields: table columns on a TTY, and the keys
+                    each row is reduced to in JSON (needs jq)
+  --quiet, -q       Suppress the ✓ lines   ·   --no-color
   --batch @f.jsonl  Create one record per JSON line (@- for stdin). Results are
                     JSONL on stdout; progress on stderr. See: uku help batch
   --resume          With --batch: skip lines the run's ledger already created
@@ -1977,18 +2140,23 @@ $(_bold "GLOBAL FLAGS")
   --account <name>  Run against a specific account (default: the active one)
   --base <url>      Override the API base URL
   --header 'K: V'   Add a request header (repeatable; sent off argv, like the key)
-  --if-match <etag> Version check for a write. Omit it: on 428 the CLI fetches
-                    the ETag and re-sends once. On 412 it stops — see exit 6.
+  --if-match <etag> Version check for a write. Omit it and, when the path names
+                    a record, a 428 makes the CLI fetch the ETag and re-send
+                    once. A collection POST (e.g. POST /api/v3/tasks) has no
+                    record to read one from, so pass --if-match yourself there.
+                    On 412 it stops — see exit 6.
   -h, --help        This help   ·   --version
 
 $(_bold "EXIT CODES")  0 ok · 1 usage · 2 auth · 3 API error · 4 write refused · 5 network · 6 conflict (412)
 
 $(_bold "RETRY DOCTRINE")
   428  server rejected the write, nothing happened → safe to re-send once with
-       If-Match (the CLI does this for you).
+       If-Match. The CLI does this for you when the path names a record; on a
+       collection POST there is no ETag to fetch, so pass --if-match yourself.
   412  someone else changed it → STOP, re-read, re-apply. Never automatic.
   429 / 5xx / timeout  outcome unknown → never auto-retry a write. GET first.
-  Reads are idempotent and may retry.
+  Reads may be re-issued once, and only when the connection failed — never
+  because of an HTTP status.
 
 $(_bold "ENVIRONMENT")  (override stored creds; ideal for CI / agents)
   UKU_API_KEY, UKU_COMPANY, UKU_BASE_URL

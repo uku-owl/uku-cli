@@ -93,15 +93,45 @@ assert_true 'and warns that nothing is signed in' \
 assert_true 'it does not claim a valid key' \
   sh -c "printf '%s' '$OUT' | jq -e '[.checks[] | select(.message | test(\"key valid\"))] | length == 0' >/dev/null"
 
-# ── 5. the human (non --json) report is readable and still exits 0 ───
+# ── 5. the human (non --json) report is one whole thing, on stdout ───
+# It used to put the heading on stdout and every check line on stderr, so
+# `uku doctor > report.txt` captured the heading alone.
 reset_requests
 uku doctor
 assert_status 0 'the text report exits 0'
-# KNOWN ISSUE #8: in text mode the heading and the trailing blank lines go to
-# stdout while every check line goes to stderr, so `uku doctor > report.txt`
-# captures only the heading. --json puts everything on stdout.
-assert_out_contains 'uku doctor' 'the heading is on STDOUT — KNOWN ISSUE #8'
-assert_err_contains 'curl present' 'while the checks themselves are on stderr — KNOWN ISSUE #8'
-assert_err_contains 'bash 3.2' 'including the bash version this ran under'
+assert_out_contains 'uku doctor' 'the heading is on stdout'
+assert_out_contains 'curl present' 'and so are the checks'
+assert_out_contains 'bash 3.2' 'including the bash version this ran under'
+assert_out_contains 'no credentials' 'and the warnings'
+assert_out_contains 'thing(s) to look at' 'and the closing tally'
+assert_err_not_contains 'curl present' 'nothing of the report is left on stderr'
+assert_err_not_contains 'no credentials' 'not even the warning lines'
+
+# which is to say: redirecting stdout captures the report
+reset_requests
+"$UKU_BIN" doctor > "$CASE_DIR/report.txt" 2>/dev/null || true
+assert_true 'uku doctor > report.txt captures the checks, not just the heading' \
+  grep -q 'curl present' "$CASE_DIR/report.txt"
+
+# ── 6. --quiet does NOT suppress the per-check lines — pinned, not fixed ──
+# UKU_QUIET only gates info() (the "✓ Invoice created." style write-confirmation
+# lines — see output-modes.sh). #8 (above, §5) moved doctor's ENTIRE text
+# report onto stdout as this command's actual output — the report IS what
+# `uku doctor` produces, not incidental commentary alongside some other
+# result the way an info() line is for a write. cmd_doctor's per-check lines
+# are printed with a bare `printf` in the loop at the bottom of the function
+# (bin/uku, the `ok)/warn)/fail)` case inside `while IFS='|' read -r lvl msg`),
+# never through info() — so --quiet has no code path that reaches them and
+# `uku doctor --quiet` is BYTE IDENTICAL to `uku doctor`. That is a defensible
+# reading (the report is the output, not commentary on it — same doctrine as
+# §5), but nothing pinned it either way before this, so a future change here
+# would have been an accident rather than a decision. Pinned as-is.
+reset_requests
+uku doctor --quiet
+QUIET_STATUS="$STATUS"; QUIET_OUT="$OUT"
+reset_requests
+uku doctor
+assert_equals "$QUIET_STATUS" "$STATUS" '--quiet does not change the exit status'
+assert_equals "$QUIET_OUT" "$OUT" '--quiet does not change stdout at all — the per-check lines are the report, not info() commentary'
 
 finish

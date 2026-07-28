@@ -35,15 +35,34 @@ assert_status 0 '--json exits 0'
 assert_true 'stdout is valid JSON' sh -c "printf '%s' '$OUT' | jq -e . >/dev/null"
 assert_out_contains '"name": "Acme"' 'the payload is there'
 
-# ── --fields is accepted, and (not a TTY) does not change the output ──
-# table() falls back to render() whenever stdout is not a TTY, so column
-# selection is a TTY-only affordance. See KNOWN ISSUE #4 in tests/run.sh — this is the
-# documented behaviour, not a bug, but it is easy to expect otherwise.
+# ── --fields projects the rows, in JSON too ──────────────────────────
+# --json is the non-TTY default, so a flag that only worked on a TTY did
+# nothing at all for a script or an agent. It now selects keys in both modes.
 reset_requests
 uku clients list --fields id,name
 assert_status 0 '--fields is accepted'
-assert_true 'stdout is still full raw JSON' sh -c "printf '%s' '$OUT' | jq -e '.data[0].status == \"active\"' >/dev/null"
-assert_out_contains '"meta"' 'including the fields --fields did not name'
+assert_true 'stdout is still valid JSON' sh -c "printf '%s' '$OUT' | jq -e . >/dev/null"
+assert_true 'each row carries exactly the named keys, in that order' \
+  sh -c "printf '%s' '$OUT' | jq -e '.data[0] | keys_unsorted == [\"id\",\"name\"]' >/dev/null"
+assert_true 'the values are the real ones' \
+  sh -c "printf '%s' '$OUT' | jq -e '.data[0].id == 1 and .data[0].name == \"Acme\"' >/dev/null"
+assert_true 'an unnamed field is gone, not just blank' \
+  sh -c "printf '%s' '$OUT' | jq -e '.data[0] | has(\"status\") | not' >/dev/null"
+assert_out_contains '"meta"' 'the envelope is left alone'
+assert_err_empty 'and it is not warned about'
+
+# a key no row has comes back null, so every row keeps the same shape
+reset_requests
+uku clients list --fields id,nope
+assert_status 0 '--fields with an unknown key still exits 0'
+assert_true 'the missing key is present and null' \
+  sh -c "printf '%s' '$OUT' | jq -e '.data[0] | keys_unsorted == [\"id\",\"nope\"] and .nope == null' >/dev/null"
+
+# without --fields nothing is projected — the raw body is still byte-for-byte
+reset_requests
+uku clients list
+assert_equals "$OUT" '{"data": [{"id": 1, "name": "Acme", "status": "active"}], "meta": {"total": 1, "offset": 0, "limit": 50}}' \
+  'and a list without --fields is untouched'
 
 # --fields still needs a value
 reset_requests
