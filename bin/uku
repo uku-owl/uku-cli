@@ -51,6 +51,10 @@ _need_val() { [ "$#" -ge 2 ] || die "flag $1 needs a value" "$EX_USAGE"; }
 # mid-request, which previously left a file with the live API key in $TMPDIR.
 UKU_TMPFILES=""
 _mktemp()  { local f; f="$(mktemp)" || die "cannot create a temp file" "$EX_USAGE"; UKU_TMPFILES="$UKU_TMPFILES $f"; printf '%s' "$f"; }
+# _rmtmp FILE… — delete now AND forget, so a long-running loop (a --batch of
+# 500 lines = 2000 request buffers) doesn't hold every response of the run on
+# disk until the process exits. The EXIT trap stays the backstop for the rest.
+_rmtmp()   { local f; for f in "$@"; do [ -n "$f" ] || continue; rm -f "$f" 2>/dev/null || true; UKU_TMPFILES="${UKU_TMPFILES// $f/}"; done; return 0; }
 _cleanup() { [ -n "$UKU_TMPFILES" ] && rm -f $UKU_TMPFILES 2>/dev/null; return 0; }
 trap _cleanup EXIT INT TERM
 
@@ -223,19 +227,31 @@ _rl_wait_secs() {
   local w=$(( rst - now )); [ "$w" -lt 0 ] && w=0
   printf '%s' "$w"
 }
+# _rl_write_wait_secs — how many seconds a write must wait before it may be
+# sent: 0 = go now. Pure (no sleeping, no dying), because two callers need the
+# same answer for different reasons — _pace_write waits on it, and the batch
+# loop needs to DECIDE, before it sends, whether to stop the run cleanly and
+# leave a resumable ledger. One source of truth, two policies.
+_rl_write_wait_secs() {
+  local f rem rst now w
+  f="$(_rl_file write)"; [ -f "$f" ] || { printf '0'; return 0; }
+  rem="$(_profile_get "$f" remaining)"; rst="$(_profile_get "$f" reset)"
+  case "$rem" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  [ "$rem" -gt 0 ] && { printf '0'; return 0; }
+  case "$rst" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  now="$(date +%s 2>/dev/null)" || { printf '0'; return 0; }
+  w=$(( rst - now )); [ "$w" -lt 0 ] && w=0
+  printf '%s' "$w"
+}
+# _rl_write_reset — the epoch the write window turns over at (for messages).
+_rl_write_reset() { _profile_get "$(_rl_file write)" reset; }
 # Pace BEFORE a write: if the last write response said the budget is spent and
 # the window has not turned over yet, wait it out rather than spend a 429 —
 # because a 429'd write can never be safely retried.
 _pace_write() {
-  local f rem rst now w
-  f="$(_rl_file write)"; [ -f "$f" ] || return 0
-  rem="$(_profile_get "$f" remaining)"; rst="$(_profile_get "$f" reset)"
-  case "$rem" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$rem" -gt 0 ] && return 0
-  case "$rst" in ''|*[!0-9]*) return 0 ;; esac
-  now="$(date +%s 2>/dev/null)" || return 0
-  w=$(( rst - now ))
-  [ "$w" -le 0 ] && return 0
+  local w rst; w="$(_rl_write_wait_secs)"
+  [ "$w" -gt 0 ] || return 0
+  rst="$(_rl_write_reset)"
   if [ "$w" -gt "$UKU_RL_MAX_WAIT" ]; then
     die "write rate limit is spent and does not reset for ${w}s (at $(_rl_when "$rst")). Refusing to block that long — nothing was sent. Re-run after then, or raise UKU_RL_MAX_WAIT." "$EX_NET"
   fi
@@ -394,6 +410,7 @@ do_request() {
   fi
   REPLY_BODY="$(cat "$tmp")"
   REPLY_HEADERS="$(cat "$hdrf" 2>/dev/null || true)"
+  _rmtmp "$tmp" "$cfg" "$hdrf" "${body:-}"   # the reply is in memory now; don't hoard buffers (see _rmtmp)
   _rl_capture "$method"
   # 429 on a READ is recoverable: the window turns over at Reset, so wait it out
   # once. A 429'd WRITE is never retried — the request may or may not have been
@@ -758,6 +775,9 @@ EOF
 list_resource() {
   local path="$1"; shift
   local -a cols=("$@")
+  # --batch is a write flag; accepting it silently on a read would look like it
+  # worked. parse_list_flags is shared, so the refusal belongs here.
+  [ -z "${UKU_BATCH:-}" ] || die "--batch creates records — it does nothing on a list. Try: uku <resource> create --batch @lines.jsonl" "$EX_USAGE"
   load_creds; need_auth
   if [ "${UKU_ALL:-0}" = "1" ]; then
     have jq && { _list_all "$path" "${cols[@]}"; return; } || warn "--all needs jq to combine pages — showing the first page only."
@@ -804,6 +824,9 @@ get_resource() {
 # or a TTY confirm); the payload comes from --data (@file, @-, or literal JSON).
 write_resource() {
   local method="$1" path="$2" label="$3"
+  # ONE batch implementation, reached from the resource commands rather than
+  # copied into each of them (tasks/time/clients create all land here).
+  if [ -n "${UKU_BATCH:-}" ]; then run_batch "$method" "$path" "$label"; return; fi
   load_creds; need_auth
   [ -n "${UKU_DATA:-}" ] || die "$label needs a body: --data @file.json (or --data '{...}', or --data @-)" "$EX_USAGE"
   local payload; payload="$(read_data "$UKU_DATA")"
@@ -811,6 +834,384 @@ write_resource() {
   confirm_write "$label"
   do_request "$method" "$path" "$payload"
   check_status "$REPLY_BODY"; render "$REPLY_BODY"
+}
+
+# ── Bulk input (C3) ──────────────────────────────────────────────────
+# Rain wrote this loop by hand four times in one day — four throwaway scripts,
+# each re-implementing progress, resume-after-interruption and
+# don't-create-it-twice. That logic belongs in the CLI. The API request count
+# is unchanged; what changes is that nobody writes the loop again.
+#
+# The trustworthy part is the LEDGER, not the server. Before a line is sent its
+# canonical content is hashed; the moment the server confirms the create, the
+# hash + the new id are APPENDED to $UKU_CONFIG_HOME/batches/<run-id> — one
+# open-write-close per line, so a Ctrl-C, a crash or a closed lid leaves a
+# ledger that is complete up to the last record that actually landed. --resume
+# then skips any line whose hash is already recorded. No server-side matching,
+# no guessing about which record is "the same one".
+#
+# The ledger stores a HASH, never the line: this file lives in ~/.config/uku
+# and client PII must not.
+UKU_BATCH=""; UKU_RESUME=0; UKU_RUN_ID=""; UKU_STOP_ON_ERROR=0; UKU_SKIP_EXISTING=0; UKU_MATCH_ON=""
+
+_batch_dir() { printf '%s/batches' "$UKU_CONFIG_HOME"; }
+
+# Hashing: whatever the machine actually has. shasum ships with macOS and any
+# perl install, sha256sum with coreutils; cksum is POSIX and present everywhere
+# but is a 32-bit CRC — collisions are conceivable, so it is a last resort and
+# says so out loud. With NONE of the three there is no honest idempotency, so
+# the ledger is disabled: a batch still runs, --resume refuses rather than
+# silently skipping (or re-creating) the wrong lines.
+UKU_HASH_TOOL=""
+_hash_tool() {
+  if [ -z "$UKU_HASH_TOOL" ]; then
+    if have shasum; then UKU_HASH_TOOL=shasum
+    elif have sha256sum; then UKU_HASH_TOOL=sha256sum
+    elif have cksum; then UKU_HASH_TOOL=cksum
+    else UKU_HASH_TOOL=none; fi
+  fi
+  printf '%s' "$UKU_HASH_TOOL"
+}
+_hash() {  # stdin → a stable digest, or "" when nothing on this box can hash
+  case "$(_hash_tool)" in
+    shasum)    shasum -a 256 | awk '{print $1}' ;;
+    sha256sum) sha256sum | awk '{print $1}' ;;
+    cksum)     cksum | awk '{print $1 "-" $2}' ;;
+    *)         cat >/dev/null 2>&1; printf '' ;;
+  esac
+}
+# Canonical form so that whitespace and key ORDER don't make the same record
+# look new on a resume. Without jq we can only trim: document that a re-ordered
+# line then hashes differently and would be created again.
+_canon_line() {
+  local c
+  if have jq && c="$(printf '%s' "$1" | jq -S -c . 2>/dev/null)"; then printf '%s' "$c"; else _trim "$1"; fi
+}
+
+# _json_str STRING — a JSON string literal without jq (results must stay
+# machine-clean even on a box with no jq).
+_json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  printf '"%s"' "$s"
+}
+
+# ── the ledger ───────────────────────────────────────────────────────
+# TSV, one record per line:  ok|fail <TAB> hash <TAB> path <TAB> id|status <TAB> iso8601 <TAB> lineno
+_ledger_file() { printf '%s/%s' "$(_batch_dir)" "$1"; }
+_ledger_init() {  # RUNID METHOD PATH SOURCE
+  local f; f="$(_ledger_file "$1")"
+  mkdir -p "$(_batch_dir)" 2>/dev/null || return 0
+  chmod 700 "$UKU_CONFIG_HOME" "$(_batch_dir)" 2>/dev/null || true
+  if [ ! -f "$f" ]; then
+    ( umask 077; { printf '# uku batch run\t%s\n' "$1"
+                   printf '# target\t%s %s\n' "$2" "$3"
+                   printf '# source\t%s\n' "$4"
+                   printf '# account\t%s\n' "${UKU_PROFILE:-?}"
+                   printf '# started\t%s\n' "$(_now_iso)"; } > "$f" )
+  else
+    ( umask 077; printf '# resumed\t%s\n' "$(_now_iso)" >> "$f" )
+  fi
+  chmod 600 "$f" 2>/dev/null || true
+}
+_now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '-'; }
+# _ledger_id RUNID HASH — the id a previous run created for this content, or "".
+_ledger_id() {
+  local f; f="$(_ledger_file "$1")"
+  [ -f "$f" ] || return 0
+  [ -n "$2" ] || return 0
+  awk -F'\t' -v h="$2" '$1=="ok" && $2==h { print $4; exit }' "$f" 2>/dev/null || true
+}
+# _ledger_add RUNID STATE HASH PATH ID_OR_STATUS LINENO — append AND flush.
+# A separate open/write/close per line is the point: nothing is buffered, so an
+# interruption can never lose a record for something the server already created.
+_ledger_add() {
+  local f; f="$(_ledger_file "$1")"
+  [ -n "${3:-}" ] || return 0      # no hash (no hash tool) → nothing to resume on
+  ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$(_now_iso)" "$6" >> "$f" ) 2>/dev/null || true
+  return 0
+}
+
+# _batch_emit LINENO OUTCOME ID STATUS CODE MESSAGE PATH — one result object on
+# STDOUT. stdout is the machine's channel: results only, one JSON object per
+# input line. Every human word in a batch run goes to stderr.
+_batch_emit() {
+  if have jq; then
+    jq -cn --argjson line "$1" --arg outcome "$2" --arg id "$3" --arg status "$4" \
+           --arg code "$5" --arg message "$6" --arg path "$7" \
+      '{line:$line, outcome:$outcome, path:$path,
+        id:(if $id=="" then null else $id end),
+        status:(if $status=="" then null else ($status|tonumber) end),
+        code:(if $code=="" then null else $code end),
+        message:(if $message=="" then null else $message end)}'
+  else
+    printf '{"line":%s,"outcome":%s,"path":%s,"id":%s,"status":%s,"code":%s,"message":%s}\n' \
+      "$1" "$(_json_str "$2")" "$(_json_str "$7")" \
+      "$([ -n "$3" ] && _json_str "$3" || printf 'null')" \
+      "$([ -n "$4" ] && printf '%s' "$4" || printf 'null')" \
+      "$([ -n "$5" ] && _json_str "$5" || printf 'null')" \
+      "$([ -n "$6" ] && _json_str "$6" || printf 'null')"
+  fi
+}
+_body_id()   { if have jq; then printf '%s' "$1" | jq -r '(.data.id // .id // empty) | tostring' 2>/dev/null || true
+               else printf '%s' "$1" | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -n1 | grep -o '[0-9]*$' || true; fi; }
+_body_code() { if have jq; then printf '%s' "$1" | jq -r '.error.code // .code // empty' 2>/dev/null || true; fi; }
+_body_msg()  { if have jq; then printf '%s' "$1" | jq -r '.error.message // .message // empty' 2>/dev/null || true
+               else printf '%s' "$1" | tr '\n' ' ' | cut -c1-200; fi; }
+
+# _batch_match_ids PATH FIELD VALUE — ids of existing records whose FIELD equals
+# VALUE exactly. The server-side `q` is a fuzzy search, so it is used only to
+# NARROW; the equality test is done here, on the field the user named.
+_batch_match_ids() {
+  local p="$1" fld="$2" val="$3"
+  _UKU_NO_HEAL=1 UKU_SOFT=1 do_request GET "$p$(build_query q="$val" limit=100)" || return 1
+  case "$REPLY_STATUS" in 2*) : ;; *) return 1 ;; esac
+  printf '%s' "$REPLY_BODY" | jq -r --arg f "$fld" --arg v "$val" \
+    '.data[]? | select((.[$f] // empty | tostring) == $v) | .id' 2>/dev/null || true
+}
+
+# run_batch METHOD PATH LABEL — the one implementation every batching command
+# routes through (write_resource, invoices create, uku api).
+run_batch() {
+  local method="$1" path="$2" label="$3"
+  case "$method" in
+    POST) : ;;
+    *) die "--batch creates records, so it only supports POST (got $method). Nothing was sent." "$EX_USAGE" ;;
+  esac
+  [ -z "${UKU_DATA:-}" ] || die "--batch and --data are alternatives — the batch file IS the data. Nothing was sent." "$EX_USAGE"
+  [ "$UKU_SKIP_EXISTING" = "1" ] && [ -z "$UKU_MATCH_ON" ] && die "--skip-existing needs --match-on <field> — otherwise there is nothing to match on. Nothing was sent." "$EX_USAGE"
+  [ -n "$UKU_MATCH_ON" ] && [ "$UKU_SKIP_EXISTING" != "1" ] && die "--match-on only means something with --skip-existing. Nothing was sent." "$EX_USAGE"
+  if [ "$UKU_SKIP_EXISTING" = "1" ] && ! have jq; then
+    die "--skip-existing needs jq to compare a field exactly; without it the CLI would have to guess. Use the ledger instead (--resume). Nothing was sent." "$EX_USAGE"
+  fi
+  load_creds; need_auth
+
+  # Materialise the input FIRST, into a 0600 temp file. Two reasons, both
+  # load-bearing: (a) @- must be drained before the loop starts, and (b) `read`
+  # in a loop that also runs curl is the classic bash trap — curl inherits
+  # stdin and eats the rest of the file. The loop below reads from a dedicated
+  # fd 3 so curl's stdin and the input can never be the same descriptor.
+  local src="$UKU_BATCH" f
+  f="$(_mktemp)"; chmod 600 "$f" 2>/dev/null || true
+  case "$src" in
+    @-) cat > "$f" ;;
+    @*) [ -f "${src#@}" ] || die "batch file not found: ${src#@}" "$EX_USAGE"; cat "${src#@}" > "$f" ;;
+    *)  die "--batch wants a file: --batch @lines.jsonl  (or @- for stdin)" "$EX_USAGE" ;;
+  esac
+  # awk, not `wc -l`: a final line with no trailing newline still counts.
+  local total; total="$(awk '!/^[[:space:]]*$/ && !/^[[:space:]]*#/ {n++} END{print n+0}' "$f" 2>/dev/null || printf '0')"
+  [ "$total" -gt 0 ] || die "no JSON lines in $src (blank lines and # comments are skipped). Nothing was sent." "$EX_USAGE"
+
+  # Run id: deterministic by default — target + a hash of the file — so
+  # --resume works for someone who never wrote an id down.
+  local rid="$UKU_RUN_ID" fh=""
+  fh="$({ printf '%s %s\n' "$method" "$path"; cat "$f"; } | _hash)"
+  if [ -z "$rid" ]; then
+    [ -n "$fh" ] || die "no shasum/sha256sum/cksum on this system, so a run-id cannot be derived. Pass --run-id NAME (and note that --resume is unavailable without a hash tool)." "$EX_USAGE"
+    local seg="${path##*/}"; seg="${seg%%\?*}"
+    rid="$(printf '%s-%s' "$seg" "$(printf '%s' "$fh" | cut -c1-12)")"
+  fi
+  _valid_name "$rid" || die "invalid --run-id '$rid' (letters, digits, . _ -)" "$EX_USAGE"
+  if [ "$UKU_RESUME" = "1" ] && [ "$(_hash_tool)" = "none" ]; then
+    die "--resume needs a content hash and this system has no shasum/sha256sum/cksum. Refusing to guess which lines already landed. Nothing was sent." "$EX_USAGE"
+  fi
+  [ "$(_hash_tool)" = "cksum" ] && warn "hashing with cksum (a 32-bit CRC) — no shasum/sha256sum here. Resume is best-effort; two different lines could in principle collide."
+
+  # How much of this file a previous run already created — worth saying before
+  # the confirm, not after.
+  local known=0
+  if [ -f "$(_ledger_file "$rid")" ] && [ -n "$fh" ]; then
+    known="$(awk -F'\t' '$1=="ok"{n++} END{print n+0}' "$(_ledger_file "$rid")" 2>/dev/null || printf '0')"
+  fi
+
+  # ONE confirm for the whole batch, naming the count and the target — not one
+  # per line. --dry-run sends nothing, so it needs no confirmation.
+  if [ "${UKU_DRY:-0}" != "1" ]; then
+    confirm_write "$label — $total line(s) from $src → $method $path  ·  account '$UKU_PROFILE' ($UKU_COMPANY)$( [ "$UKU_RESUME" = "1" ] && printf ' · resuming %s' "$rid" || true)"
+    _ledger_init "$rid" "$method" "$path" "$src"
+  fi
+
+  local created=0 skipped=0 failed=0 lineno=0 stopped="" line=""
+  printf '  %s\n' "$(_dim "batch $rid · $total line(s) → $method $path${known:+ · ledger holds $known}")" >&2
+
+  exec 3< "$f"
+  while IFS= read -r line <&3 || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    local t; t="$(_trim "$line")"
+    case "$t" in ''|'#'*) continue ;; esac
+
+    # 1 — is it JSON at all? A bad line fails ITSELF and never aborts the run.
+    local ok_json=1
+    if have jq; then printf '%s' "$t" | jq -e 'type == "object"' >/dev/null 2>&1 || ok_json=0
+    else case "$t" in '{'*'}') : ;; *) ok_json=0 ;; esac; fi
+    if [ "$ok_json" = "0" ]; then
+      failed=$((failed + 1))
+      _batch_emit "$lineno" failed "" "" INVALID_JSON "line is not a JSON object — nothing sent" "$path"
+      [ "${UKU_DRY:-0}" = "1" ] || _ledger_add "$rid" fail "$(printf '%s' "$t" | _hash)" "$path" INVALID_JSON "$lineno"
+      if [ "$UKU_STOP_ON_ERROR" = "1" ]; then stopped="line $lineno failed (INVALID_JSON)"; break; fi
+      continue
+    fi
+
+    local canon h prev
+    canon="$(_canon_line "$t")"; h="$(printf '%s' "$canon" | _hash)"
+    prev=""; [ -n "$h" ] && prev="$(_ledger_id "$rid" "$h")"
+
+    # 2 — the ledger. This is the idempotency that can be trusted.
+    if [ "$UKU_RESUME" = "1" ] && [ -n "$prev" ]; then
+      skipped=$((skipped + 1))
+      _batch_emit "$lineno" "$([ "${UKU_DRY:-0}" = "1" ] && printf 'would_skip' || printf 'skipped')" "$prev" "" LEDGER_HIT "already created by run $rid" "$path"
+      continue
+    fi
+
+    # 3 — the same guard every single write gets (a time entry with a duration
+    # and no end opens a timer). It dies; in a batch that must fail one line,
+    # so run it where its exit and its message can be caught.
+    local gmsg=""
+    if ! gmsg="$( _guard_time_entry "$method" "$path" "$t" 2>&1 )"; then
+      failed=$((failed + 1))
+      _batch_emit "$lineno" failed "" "" GUARD_REFUSED "$(printf '%s' "$gmsg" | tr '\n' ' ' | tr -s ' ')" "$path"
+      [ "${UKU_DRY:-0}" = "1" ] || _ledger_add "$rid" fail "$h" "$path" GUARD_REFUSED "$lineno"
+      if [ "$UKU_STOP_ON_ERROR" = "1" ]; then stopped="line $lineno failed (GUARD_REFUSED)"; break; fi
+      continue
+    fi
+
+    # 4 — --skip-existing: an explicit opt-in that asks the server first. See
+    # `uku help batch` for why this is the fragile path and the ledger is not.
+    if [ "$UKU_SKIP_EXISTING" = "1" ]; then
+      local mval mids mcount
+      mval="$(printf '%s' "$t" | jq -r --arg f "$UKU_MATCH_ON" '.[$f] // empty | tostring' 2>/dev/null || true)"
+      if [ -z "$mval" ]; then
+        failed=$((failed + 1))
+        _batch_emit "$lineno" failed "" "" MATCH_FIELD_MISSING "line has no '$UKU_MATCH_ON' to match on — nothing sent" "$path"
+        [ "${UKU_DRY:-0}" = "1" ] || _ledger_add "$rid" fail "$h" "$path" MATCH_FIELD_MISSING "$lineno"
+        if [ "$UKU_STOP_ON_ERROR" = "1" ]; then stopped="line $lineno failed (MATCH_FIELD_MISSING)"; break; fi
+        continue
+      fi
+      mids="$(_batch_match_ids "$path" "$UKU_MATCH_ON" "$mval" || true)"
+      mcount="$(printf '%s' "$mids" | grep -c '[0-9]' || true)"; mcount="${mcount:-0}"
+      if [ "$mcount" -gt 1 ]; then
+        # REFUSE. In an accounting firm every client owns a task called
+        # "Käibedeklaratsioon"; picking one of them would be picking wrong.
+        failed=$((failed + 1))
+        _batch_emit "$lineno" failed "" "" AMBIGUOUS_MATCH \
+          "$mcount existing records have $UKU_MATCH_ON='$mval' (ids: $(printf '%s' "$mids" | tr '\n' ',' | sed 's/,$//')) — refusing to guess which one this is. Nothing sent." "$path"
+        [ "${UKU_DRY:-0}" = "1" ] || _ledger_add "$rid" fail "$h" "$path" AMBIGUOUS_MATCH "$lineno"
+        if [ "$UKU_STOP_ON_ERROR" = "1" ]; then stopped="line $lineno failed (AMBIGUOUS_MATCH)"; break; fi
+        continue
+      elif [ "$mcount" = "1" ]; then
+        skipped=$((skipped + 1))
+        _batch_emit "$lineno" "$([ "${UKU_DRY:-0}" = "1" ] && printf 'would_skip' || printf 'skipped')" "$(printf '%s' "$mids" | tr -d '[:space:]')" "" MATCH_EXISTS "$UKU_MATCH_ON='$mval' already exists" "$path"
+        continue
+      fi
+    fi
+
+    # 5 — --dry-run stops here. do_request's own --dry-run exits the process
+    # after ONE request, which would end the run at line 1; a batch dry-run has
+    # to report every line, so it never enters do_request at all.
+    if [ "${UKU_DRY:-0}" = "1" ]; then
+      _batch_emit "$lineno" would_create "" "" "" "validated — nothing sent" "$path"
+      created=$((created + 1))
+      continue
+    fi
+
+    # 6 — rate limit. The write bucket is small (30/min on this account) and a
+    # batch is exactly where that bites. do_request's _pace_write does the
+    # waiting; the run only has to DECIDE whether the wait is longer than the
+    # cap, and if so stop cleanly while the ledger is complete and resumable.
+    local w; w="$(_rl_write_wait_secs)"
+    if [ "$w" -gt "$UKU_RL_MAX_WAIT" ]; then
+      stopped="write rate limit spent; it resets in ${w}s (at $(_rl_when "$(_rl_write_reset)")). Stopped before line $lineno — nothing was sent for it."
+      break
+    fi
+
+    do_request "$method" "$path" "$t"
+    case "$REPLY_STATUS" in
+      2*)
+        local nid; nid="$(_body_id "$REPLY_BODY")"
+        created=$((created + 1))
+        _ledger_add "$rid" ok "$h" "$path" "${nid:-?}" "$lineno"
+        _batch_emit "$lineno" created "$nid" "$REPLY_STATUS" "" "" "$path"
+        ;;
+      *)
+        # 412 included, deliberately: a stale-write conflict is recorded as a
+        # failed line and the run moves on. It is NEVER auto-retried — the
+        # record changed under us and only a human can re-apply the change.
+        failed=$((failed + 1))
+        _ledger_add "$rid" fail "$h" "$path" "$REPLY_STATUS" "$lineno"
+        _batch_emit "$lineno" failed "" "$REPLY_STATUS" "$(_body_code "$REPLY_BODY")" "$(_body_msg "$REPLY_BODY")" "$path"
+        if [ "$UKU_STOP_ON_ERROR" = "1" ]; then stopped="line $lineno failed (HTTP $REPLY_STATUS)"; break; fi
+        ;;
+    esac
+  done
+  exec 3<&-
+
+  # ── summary (stderr — stdout stayed machine-clean) ──
+  local resume_cmd; resume_cmd="uku"
+  local a; for a in ${ARGS[@]+"${ARGS[@]}"}; do
+    case "$a" in --resume) continue ;; esac
+    case "$a" in *[![:alnum:]@/._=-]*) resume_cmd="$resume_cmd '$(_sq "$a")'" ;; *) resume_cmd="$resume_cmd $a" ;; esac
+  done
+  resume_cmd="$resume_cmd --resume --yes"   # the run-id is derived from the file, so it needs no flag
+  {
+    printf '\n'
+    printf '  %s\n' "$(_bold "batch $rid") — $(_green "$created created") · $skipped skipped · $([ "$failed" -gt 0 ] && _red "$failed failed" || printf '%s' "0 failed")  (of $total line(s))"
+    if [ "${UKU_DRY:-0}" = "1" ]; then
+      printf '  %s\n' "$(_dim "--dry-run: nothing was sent, no ledger was written.")"
+      [ "$known" -gt 0 ] && [ "$UKU_RESUME" != "1" ] && printf '  %s\n' "$(_dim "a ledger for $rid already holds $known created line(s) — add --resume to skip them")"
+    else
+      printf '  %s\n' "$(_dim "ledger: $(_ledger_file "$rid")")"
+    fi
+    if [ -n "$stopped" ]; then printf '  %s %s\n' "$(_color 33 '!')" "stopped: $stopped"; fi
+    if [ "$failed" -gt 0 ] || [ -n "$stopped" ]; then
+      case "$src" in
+        @-) printf '  %s\n' "$(_dim "resume: re-feed the same lines and add --resume  (stdin can't be replayed for you)")" ;;
+        *)  printf '  %s\n' "$(_dim "resume: $resume_cmd")" ;;
+      esac
+    fi
+    printf '\n'
+  } >&2
+
+  [ -n "$stopped" ] && exit "$EX_NET"
+  [ "$failed" -gt 0 ] && exit "$EX_API"
+  return 0
+}
+
+# uku batch list | show <run-id> — what a previous run actually did. Small on
+# purpose: the ledger is a receipt, not a database.
+cmd_batch() {
+  local sub="${1:-list}"; shift || true
+  local d; d="$(_batch_dir)"
+  case "$sub" in
+    list|ls)
+      [ -d "$d" ] || { warn "no batch runs yet ($d)"; return 0; }
+      local rows="" fpath name
+      for fpath in "$d"/*; do
+        [ -f "$fpath" ] || continue
+        name="$(basename "$fpath")"
+        rows="$rows$(awk -F'\t' -v n="$name" '
+          $1=="# target"{t=$2} $1=="# started"{s=$2}
+          $1=="ok"{c++} $1=="fail"{x++}
+          END{printf "%s\t%d\t%d\t%s\t%s", n, c+0, x+0, (s?s:"-"), (t?t:"-")}' "$fpath")"$'\n'
+      done
+      [ -n "$rows" ] || { warn "no batch runs yet ($d)"; return 0; }
+      if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then
+        if have jq; then
+          printf '%s' "$rows" | jq -R -s 'split("\n")|map(select(length>0))|map(split("\t")|{run_id:.[0],created:(.[1]|tonumber),failed:(.[2]|tonumber),started:.[3],target:.[4]})'
+        else printf '%s' "$rows"; fi
+      else
+        { printf '%b\n' "$(_bold "RUN-ID\tCREATED\tFAILED\tSTARTED\tTARGET")"; printf '%s' "$rows"; } \
+          | { have column && column -t -s "$(printf '\t')" || tr '\t' ' '; }
+      fi
+      ;;
+    show)
+      local rid="${1:-}"; [ -n "$rid" ] || die "usage: uku batch show <run-id>   (uku batch list)" "$EX_USAGE"
+      local fpath; fpath="$(_ledger_file "$rid")"
+      [ -f "$fpath" ] || die "no such batch run: $rid  (uku batch list)" "$EX_USAGE"
+      cat "$fpath"
+      ;;
+    *) die "usage: uku batch <list|show <run-id>>" "$EX_USAGE" ;;
+  esac
 }
 
 cmd_clients() {
@@ -851,6 +1252,7 @@ cmd_invoices() {
     get)  [ -n "${2:-}" ] || die "usage: uku invoices get <invoice_id>" "$EX_USAGE"; get_resource "/api/v3/invoices/$2" ;;
     create)
       shift || true; parse_list_flags "$@"
+      if [ -n "${UKU_BATCH:-}" ]; then run_batch POST /api/v3/invoices "create invoices"; return; fi
       [ -n "${UKU_DATA:-}" ] || die "usage: uku invoices create --data @file.json  (or --data '{...}')" "$EX_USAGE"
       load_creds; need_auth
       local payload; payload="$(read_data "$UKU_DATA")"
@@ -872,6 +1274,7 @@ cmd_api() {
   parse_list_flags "$@"
   load_creds; need_auth
   case "$path" in /*) : ;; *) path="/$path" ;; esac
+  if [ -n "${UKU_BATCH:-}" ]; then run_batch "$method" "$path" "$method $path"; return; fi
   local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
   local payload=""; [ -n "${UKU_DATA:-}" ] && payload="$(read_data "$UKU_DATA")"
   case "$method" in
@@ -1074,7 +1477,7 @@ cmd_update() {
 # uku completions <bash|zsh> — source-able completion for the top-level commands.
 cmd_completions() {
   local shell="${1:-}"
-  local cmds="auth account setup clients tasks time invoices members products contracts projects me api doctor update completions help version"
+  local cmds="auth account setup clients tasks time invoices members products contracts projects me api batch doctor update completions help version"
   case "$shell" in
     bash) printf 'complete -W "%s" uku\n' "$cmds" ;;
     # compdef form works under `eval "$(uku completions zsh)"` (needs compinit loaded)
@@ -1119,6 +1522,58 @@ $(_bold "uku $topic") — list/get$( [ "$topic" = time ] && printf '/create' || 
 Examples:
   uku $topic list --limit 5
   uku $topic list --json | jq '.data[] | {id}'
+EOF
+    ;;
+    batch) cat <<EOF
+$(_bold "uku batch") — create many records from one file, safely restartable
+
+  uku tasks create   --batch @tasks.jsonl --yes
+  uku clients create --batch @clients.jsonl --yes
+  uku time create    --batch @time.jsonl --yes
+  uku api POST /api/v3/tasks --batch @tasks.jsonl --yes
+  cat tasks.jsonl | uku tasks create --batch @- --yes
+
+$(_bold "INPUT")  one JSON object per line. Blank lines and lines starting with #
+  are skipped; a final line without a newline is fine. A malformed line fails
+  by itself — it never aborts the run.
+
+$(_bold "OUTPUT")  one JSON result per input line on stdout (line, outcome,
+  id, status, code, message) — pipe it, grep it. Everything human is on stderr.
+    uku tasks create --batch @t.jsonl --yes | jq -r 'select(.outcome=="failed")'
+
+$(_bold "THE LEDGER — why --resume can be trusted")
+  Each created line is recorded as a HASH of its content plus the id the server
+  returned, appended to $UKU_CONFIG_HOME/batches/<run-id> the moment
+  the create is confirmed. Kill the run at any point and the ledger is complete
+  up to the last record that actually landed. Re-run with --resume and those
+  exact lines are skipped — no duplicates, no server-side matching, no guessing.
+  The run-id is derived from the target plus a hash of the file, so --resume
+  works without having remembered anything. --run-id NAME overrides it.
+  The ledger stores a hash, never the line: no client data is written to disk.
+    uku batch list · uku batch show <run-id>
+
+$(_bold "--skip-existing --match-on FIELD — read this before using it")
+  It queries the API for a record whose FIELD equals this line's value, and
+  skips the line if it finds exactly one. $(_bold "It is fragile.") In an accounting
+  firm dozens of records legitimately share a title — every client has a
+  "Käibedeklaratsioon" — so a title match can easily be the wrong record.
+  When more than one record matches, the CLI $(_bold "refuses that line") (AMBIGUOUS_MATCH)
+  and records why, rather than silently picking one.
+  $(_bold "The ledger, not --match-on, is the trustworthy path to idempotency.")
+  Use --match-on only against a field that is genuinely unique in your firm,
+  and only for records this CLI did not create.
+
+$(_bold "WRITES, RATE LIMITS, FAILURES")
+  --yes confirms the whole batch ONCE (line count + target + account), not once
+  per line. Without a TTY and without --yes the batch is refused (exit 4).
+  A failed line is recorded and the run CONTINUES; --stop-on-error halts instead.
+  A 412 fails that line and is never auto-retried. The write budget is small
+  (30/min), so the run paces itself through the same limiter as every other
+  write; if the wait would exceed UKU_RL_MAX_WAIT (${UKU_RL_MAX_WAIT}s) it stops
+  cleanly, tells you when the window resets, and leaves a resumable ledger.
+  --dry-run validates every line, reports what WOULD happen (including which
+  lines the ledger would skip) and sends nothing.
+  Exit: 0 all good · 3 some line failed · 5 stopped on the rate limit · 4 refused.
 EOF
     ;;
     api) cat <<EOF
@@ -1218,6 +1673,23 @@ Read the status, not the vibe. Each of these means something different:
 | **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `*_EXISTS`, `TIMER_ALREADY_RUNNING`). | Re-sending the identical request fails identically. Change the request or tell the user. |
 
 **Reads are idempotent and may be retried. A write is re-sent automatically in exactly one case — a 428, where the server refused it and nothing happened. You must never resend any other failed write yourself: outside a 428 the outcome is unknown, so GET first.**
+
+### Creating many records — use `--batch`, never a shell loop
+When the user wants N records created, write one JSON object per line to a
+`.jsonl` file and run the batch. Do **not** write your own `for` loop: the CLI
+already handles pacing, the confirm, and — the important part — a ledger that
+makes the run restartable.
+
+```
+uku tasks create --batch @tasks.jsonl --yes          # one confirm for the file
+uku tasks create --batch @tasks.jsonl --resume --yes # after any interruption
+```
+- stdout is **JSONL, one result per input line**: `{line, outcome, id, status, code, message}`. `outcome` is `created` / `skipped` / `failed` (`would_create` / `would_skip` under `--dry-run`).
+- A bad line fails by itself; the run continues. `--stop-on-error` halts instead.
+- **`--resume` is safe and is the correct response to any interrupted batch.** Lines already created are skipped by content hash — re-running cannot duplicate them. This is the one case where "just run it again" is right.
+- `--dry-run` validates every line and sends nothing.
+- `--skip-existing --match-on <field>` queries before creating. It is fragile — many real records share a title — and it refuses a line when more than one record matches. Prefer the ledger; use `--match-on` only on a genuinely unique field.
+- `uku batch list` · `uku batch show <run-id>` — what a previous run did.
 
 ### Version checks (If-Match / ETag)
 Financial writes (invoices, contracts and their rows, agreements, members,
@@ -1327,6 +1799,13 @@ parse_list_flags() {
       --cursor) _need_val "$@"; UKU_QUERY+=("cursor=$2"); shift 2 ;;
       --all) UKU_ALL=1; shift ;;
       --data|-d) _need_val "$@"; UKU_DATA="$2"; shift 2 ;;
+      # ── bulk input (see run_batch) ──
+      --batch) _need_val "$@"; UKU_BATCH="$2"; shift 2 ;;
+      --resume) UKU_RESUME=1; shift ;;
+      --run-id) _need_val "$@"; UKU_RUN_ID="$2"; shift 2 ;;
+      --stop-on-error) UKU_STOP_ON_ERROR=1; shift ;;
+      --skip-existing) UKU_SKIP_EXISTING=1; shift ;;
+      --match-on) _need_val "$@"; UKU_MATCH_ON="$2"; shift 2 ;;
       *) die "unknown flag: $1  (try: uku <command> --help)" "$EX_USAGE" ;;
     esac
   done
@@ -1355,6 +1834,14 @@ $(_bold "RESOURCES")  (read with any key)
 $(_bold "WRITES")  (deliberate — need a TTY or --yes; money needs an All key)
   uku invoices create --data @invoice.json [--yes]
 
+$(_bold "BULK")  (one JSON object per line; one confirm for the whole file)
+  uku tasks create --batch @tasks.jsonl --yes
+  uku tasks create --batch @tasks.jsonl --resume --yes    Re-run after an
+                                      interruption: lines a previous run
+                                      already created are skipped, not redone.
+  uku batch list · uku batch show <run-id>       What a previous run did
+  See: uku help batch
+
 $(_bold "ESCAPE HATCH")  (any endpoint in the API v3)
   uku api GET  /api/v3/members --query limit=5
   uku api POST /api/v3/tasks --data @task.json --yes
@@ -1372,6 +1859,7 @@ $(_bold "MORE")
                                       (installed from its tag, checksum-verified)
   uku completions <bash|zsh>          Shell completion
   uku me · uku members|products|contracts|projects list
+  uku batch list|show <run-id>        Ledgers of previous --batch runs
 
 $(_bold "GLOBAL FLAGS")
   --json            Raw JSON (default when stdout is not a TTY)
@@ -1379,6 +1867,13 @@ $(_bold "GLOBAL FLAGS")
   --dry-run         Print the request (headers masked) and send nothing
   --all             Page through every row (keeps your filters)
   --fields a,b      Table columns to show   ·   --quiet, -q   ·   --no-color
+  --batch @f.jsonl  Create one record per JSON line (@- for stdin). Results are
+                    JSONL on stdout; progress on stderr. See: uku help batch
+  --resume          With --batch: skip lines the run's ledger already created
+  --run-id NAME     Name the ledger (default: derived from target + file hash)
+  --stop-on-error   With --batch: halt on the first failed line (default: go on)
+  --skip-existing --match-on FIELD    Query before creating. Read the hazard in
+                    uku help batch first — the ledger is the trustworthy path.
   --account <name>  Run against a specific account (default: the active one)
   --base <url>      Override the API base URL
   --header 'K: V'   Add a request header (repeatable; sent off argv, like the key)
@@ -1517,6 +2012,7 @@ case "$cmd" in
   projects) cmd_projects "$@" ;;
   me)       cmd_me "$@" ;;
   api)      cmd_api "$@" ;;
+  batch)    cmd_batch "$@" ;;
   doctor)   cmd_doctor "$@" ;;
   setup-agents) cmd_setup agents "$@" ;;
   update)   cmd_update "$@" ;;
