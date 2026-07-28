@@ -153,7 +153,8 @@ assert_status 3 'a run with a failed line exits 3'
 assert_request_count 2 'both lines were attempted (the default is to continue)'
 assert_equals "$(outcomes)" 'created,failed,' 'the second line failed by itself'
 assert_out_contains '"code":"INTERNAL"' 'the failure carries the API error code'
-assert_err_contains 'resume:' 'the summary prints a resume command'
+assert_err_contains '→ run: uku tasks create --batch' \
+  'the summary offers the resume command as a remedy, in the shape every other failure uses'
 assert_equals "$(awk -F'\t' '$1=="ok"{n++} END{print n+0}' "$UKU_CONFIG_HOME/batches/r2")" '1' \
   'the ledger holds exactly the one that landed'
 assert_equals "$(awk -F'\t' '$1=="fail"{n++} END{print n+0}' "$UKU_CONFIG_HOME/batches/r2")" '1' \

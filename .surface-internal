@@ -10,4 +10,5 @@
 #
 # Seeded 2026-07-28 with the honest state of the tree at that commit.
 
+gflag --dump-remedies  # the same, for the remedy table: prints slug<TAB>template so scripts/check-drift.sh can resolve every hint and breadcrumb against .surface. CI plumbing, and a user has no reason to read the table rather than run the commands it names.
 gflag --dump-surface   # the build gate's own hook: prints .surface, one fact per line. It is CI plumbing, not a user feature, and putting it in the help would invite agents to parse it as a product contract. scripts/check-surface.sh is the only caller.

@@ -57,6 +57,24 @@ Adding a command means: the `case` label, the `cmd_*` function, a row in the
 table, `--update`, and a line in `usage()` — the gate names whichever you
 forgot.
 
+### The remedy table (hints and breadcrumbs)
+
+Every next-step command the CLI suggests — the `→ run: …` line under an error,
+the `Next:` footer after a success, the `breadcrumbs` array under `--agent` — is
+declared in a second table in `bin/uku` (`_remedy_table`), keyed by an `@@slug`.
+It is a table for one reason: `scripts/check-drift.sh` resolves every template
+against `.surface`, so a suggestion can never name a command, subcommand or flag
+the CLI does not have. A breadcrumb that points at fiction is worse than none.
+
+- A template starting with `uku ` is a **command** and is checked. `{1}`/`{2}`
+  are filled in at the call site with real ids.
+- A template that does not is **prose**, and that is the honest shape when no
+  command would fix it ("re-read the record, re-apply your change").
+- The check runs both ways: an `@@slug` used in the code but never declared
+  fails too, because it would render as nothing at all.
+- Where no honest next step exists, pass none. An invented remedy is worse than
+  silence.
+
 Test any change against a **sandbox account** (`uku auth login --account sandbox`)
 before a real one — never rehearse a write on production books.
 

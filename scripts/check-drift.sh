@@ -123,7 +123,10 @@ done < "$TMP/fns"
 
 # 3b — every label the dispatcher answers to is in the table.
 printf '  case labels in the dispatcher\n'
-awk '/case "\$cmd" in/,/^esac/' "$UKU" \
+# Anchored at column 0: the dispatcher is top-level code, while a `case "$cmd"`
+# INSIDE a function is indented — and a helper that happens to keep the resource
+# name in a variable called `cmd` used to drag its whole case list in here.
+awk '/^case "\$cmd" in/,/^esac/' "$UKU" \
   | grep -oE '^[[:space:]]+[a-z_|-]+\)' | tr -d ' )' | tr '|' '\n' \
   | grep -v '^__firstrun__$' | grep -v '^$' | LC_ALL=C sort -u > "$TMP/labels"
 while IFS= read -r line; do
@@ -190,6 +193,66 @@ while IFS= read -r line; do
   _internal "doc $2 $3" && continue
   _report "help-doc $2 $3" "the table marks \`$2 $3\` as must-document, but \`uku --help\` does not show it. Fix: add it to usage() in bin/uku, drop the \`!\` from the table, or excuse it in .surface-internal."
 done < <(grep '^doc ' "$SURFACE")
+
+# ── 5: a breadcrumb may never name a command that does not exist ─────
+# A hint or a breadcrumb is a command we are telling someone — often an agent —
+# to run next. One that does not exist is worse than none at all: it costs a
+# round trip, an exit 1, and the trust that the next suggestion is real. The
+# remedies are DECLARED in one table in bin/uku (that is why the table exists),
+# so every command they can emit is checkable here, before it ships.
+printf '\ndrift: breadcrumbs → surface\n'
+printf '  every command a hint or breadcrumb can emit\n'
+"$UKU" --dump-remedies > "$TMP/remedies" 2>/dev/null || {
+  printf '    ✗ `uku --dump-remedies` failed — the remedy table cannot be checked\n' >&2
+  FAIL=$((FAIL + 1))
+  : > "$TMP/remedies"
+}
+while IFS='	' read -r slug tpl; do
+  [ -n "$slug" ] || continue
+  # {1}/{2} are ids filled in at the call site — values, not surface.
+  tpl="$(printf '%s' "$tpl" | sed 's/{[0-9]}//g; s/  */ /g; s/[[:space:]]*$//')"
+  # A template that is not a command is prose ("re-read the record …"), which
+  # is the honest shape when nothing the CLI offers would fix it.
+  case "$tpl" in "uku "*) : ;; *) continue ;; esac
+  set -- $tpl
+  bc_cmd="${2:-}"; bc_sub="${3:-}"
+  if ! _fact "cmd $bc_cmd" && ! grep -qE "^cmdalias [a-z-]+ $bc_cmd\$" "$SURFACE"; then
+    _report "bc-cmd $bc_cmd" "the remedy $slug is \`$tpl\` — there is no \`uku $bc_cmd\`. Fix: correct the template in _remedy_table, or add the command to the surface table."
+    continue
+  fi
+  case "$bc_sub" in
+    ""|-*) : ;;   # no subcommand, or a flag (uku api --describe)
+    # A POSIX class, not an a-z range: bracket ranges are collation-dependent,
+    # and under en_US.UTF-8 `[!a-z-]` matched plain lowercase words — which
+    # silently skipped this whole check.
+    *[![:lower:]-]*) : ;;  # an id or a placeholder leftover — a value, not surface
+    *)
+      if grep -qE "^sub $bc_cmd " "$SURFACE"; then
+        if ! _fact "sub $bc_cmd $bc_sub" && ! _fact "subalias $bc_cmd $bc_sub"; then
+          _report "bc-sub $bc_cmd $bc_sub" "the remedy $slug is \`$tpl\` — \`$bc_cmd\` has no \`$bc_sub\` subcommand. Fix: correct the template in _remedy_table, or declare the subcommand."
+        fi
+      fi ;;
+  esac
+  for bc_flag in $tpl; do
+    case "$bc_flag" in
+      --*) if ! _fact "gflag $bc_flag" && ! _fact "flag $bc_cmd $bc_flag"; then
+             _report "bc-flag $bc_flag" "the remedy $slug is \`$tpl\` — \`uku $bc_cmd\` does not accept \`$bc_flag\`. Fix: correct the template in _remedy_table, or declare the flag."
+           fi ;;
+    esac
+  done
+done < "$TMP/remedies"
+
+# The other direction: a call site naming a remedy nobody declared would render
+# as nothing at all — a silently missing hint. The `@@` prefix exists so this
+# grep can be exact and can never collide with a file path (`--data @file.json`).
+printf '  every @@slug used in bin/uku is declared in the table\n'
+cut -f1 "$TMP/remedies" | LC_ALL=C sort -u > "$TMP/remedy-slugs"
+grep -oE '@@[a-z]+\.[a-z-]+' "$UKU" | LC_ALL=C sort -u > "$TMP/remedy-used" || true
+while IFS= read -r slug; do
+  [ -n "$slug" ] || continue
+  grep -qxF "$slug" "$TMP/remedy-slugs" && continue
+  _report "bc-slug $slug" "bin/uku uses the remedy \`$slug\` but _remedy_table does not declare it — the hint would render as nothing. Fix: declare it, or correct the call site."
+done < "$TMP/remedy-used"
 
 # ── verdict ──────────────────────────────────────────────────────────
 n_base="$(wc -l < "$TMP/baseline" | tr -d ' ')"

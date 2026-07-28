@@ -206,4 +206,72 @@ assert_err_contains 'nobody can discover it' 'and says why that matters'
 assert_err_contains '.surface-internal' 'and offers the honest escape hatch'
 teardown_case
 
+# ── 8. drift: a breadcrumb may not name a command that does not exist ─
+# A hint or a breadcrumb is a command we tell someone — usually an agent — to
+# run next. One that does not exist costs a round trip, an exit 1, and the
+# trust that the next suggestion is real. That is why the remedies are a
+# declared table rather than strings in the code: so this check can exist.
+setup_case
+mk_sandbox
+note '8 — the remedy table cannot promise fiction either'
+
+gate check-drift.sh
+assert_status 0 'the remedy table as committed is clean'
+
+# a whole command that does not exist
+"$PYTHON_BIN" - "$SB/bin/uku" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("@@clients.get     | uku clients get {1}", "@@clients.get     | uku frobnicate get {1}", 1)
+open(p, "w").write(s)
+PY
+gate check-drift.sh
+assert_status 1 'a breadcrumb naming a command that does not exist fails the build'
+assert_err_contains 'there is no `uku frobnicate`' 'and says exactly what is missing'
+assert_err_contains '@@clients.get' 'naming the remedy that promised it'
+
+# a real command, a subcommand it does not have
+mk_sandbox
+"$PYTHON_BIN" - "$SB/bin/uku" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("@@clients.get     | uku clients get {1}", "@@clients.get     | uku clients archive {1}", 1)
+open(p, "w").write(s)
+PY
+gate check-drift.sh
+assert_status 1 'a breadcrumb naming a subcommand that does not exist fails'
+assert_err_contains 'has no `archive` subcommand' 'and names the subcommand'
+
+# a real command and subcommand, a flag nothing accepts
+mk_sandbox
+"$PYTHON_BIN" - "$SB/bin/uku" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("@@clients.list    | uku clients list", "@@clients.list    | uku clients list --force-it", 1)
+open(p, "w").write(s)
+PY
+gate check-drift.sh
+assert_status 1 'a breadcrumb naming a flag that does not exist fails'
+assert_err_contains '--force-it' 'and quotes the flag'
+
+# the other direction: a call site naming a remedy nobody declared. It would
+# render as nothing at all, which is the one failure mode a human never sees.
+mk_sandbox
+"$PYTHON_BIN" - "$SB/bin/uku" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace('die "unknown command: $cmd" "$EX_USAGE" @@help.root',
+              'die "unknown command: $cmd" "$EX_USAGE" @@help.nowhere', 1)
+open(p, "w").write(s)
+PY
+gate check-drift.sh
+assert_status 1 'a remedy used but never declared fails'
+assert_err_contains '@@help.nowhere' 'naming the slug'
+assert_err_contains 'render as nothing' 'and why a missing one is worse than a wrong one'
+teardown_case
+
 finish

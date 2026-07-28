@@ -203,8 +203,78 @@ without ever being able to move money.
 ## Output & scripting
 
 - `--json` prints the raw API JSON. It is the **default when stdout is not a TTY**,
-  so pipes and agents get JSON automatically.
+  so pipes and agents get JSON automatically. **This never changes shape:** it is
+  the API's body, and `.data` means what the API says it means.
+- `--agent` is the second channel — one envelope, for a program that wants the
+  CLI's own reading of what just happened. See below.
 - With a TTY and `jq` installed, list commands print a compact table.
+
+### `--agent` — one envelope, for a program
+
+`--json` is the raw body and stays that way. When you want the CLI's summary and
+its idea of what to do next, ask for `--agent` instead. The two are alternatives;
+passing both is a usage error.
+
+```sh
+uku clients list --limit 2 --agent
+```
+```json
+{"ok":true,
+ "data":[{"id":41,"name":"Acme"},{"id":42,"name":"Byrd"}],
+ "meta":{"total":2,"offset":0,"limit":2},
+ "summary":"2 clients",
+ "breadcrumbs":[{"cmd":"uku clients get 41","why":"that client in full"}]}
+```
+
+`data` and `meta` are **exactly the bytes the API returned** — spliced out, never
+re-serialised — so `.data` means the same thing it means under `--json`.
+
+A failure is the same envelope, inverted, and **the exit code is unchanged**:
+
+```sh
+uku invoices create --data @march.json --yes --agent; echo "exit $?"
+```
+```json
+{"ok":false,
+ "error":"HTTP 403 — this key can't perform that action: financial actions need an All-scope key.",
+ "code":"auth",
+ "hint":"this needs an All-scope key — create one in Uku (Settings, API), then sign in again with: uku auth login"}
+```
+```
+exit 2
+```
+
+`code` is the stable name of the exit status (`ok` `usage` `auth` `api` `confirm`
+`network` `conflict`), so you can branch on either.
+
+**Breadcrumbs** are the commands you most plausibly want next, with the real ids
+already filled in — the first row of a list, the id of the record you just
+created. On a terminal they are a dim `Next:` footer; under `--agent` they are the
+array above. `--no-hints`, `--quiet` and `--json` all suppress them. Every command
+a breadcrumb can name is checked against the CLI's declared surface at build time,
+so it can never point at something that does not exist.
+
+**Hints** do the same job for failures: a second line on stderr saying what to run
+next, and the `hint` field above. Where no honest next step exists there is none.
+
+### `uku --help --agent` — the CLI describing itself
+
+```sh
+uku --help --agent        # the whole tree
+uku time --help --agent   # one command
+```
+```json
+{"command":"time","aliases":[],"subcommands":["list","get","create"],
+ "flags":["--limit","--data","--batch", "…"],
+ "args":["get <id>"],
+ "notes":["there is no `patch` subcommand here — use `uku api PATCH /api/v3/time-entries/<id>`",
+          "`start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending"]}
+```
+
+The `notes` are the agent-facing gotchas — mostly the negative kind, which is the
+knowledge that stops an agent guessing. The root form adds `global_flags` and
+`exit_codes`. This is how an agent discovers the CLI without a human pasting the
+help text into its context.
 
 ### Exit codes
 

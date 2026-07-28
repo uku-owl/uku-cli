@@ -40,7 +40,20 @@ _red()     { _color "31" "$1"; }
 _dim()     { _color "2" "$1"; }
 info()  { [ "${UKU_QUIET:-0}" = "1" ] && return 0; printf '%s %s\n' "$(_green '✓')" "$1" >&2; }
 warn()  { printf '%s %s\n' "$(_color 33 '!')" "$1" >&2; }
-die()   { printf '%s %s\n' "$(_red '✗')" "$1" >&2; exit "${2:-$EX_USAGE}"; }
+# die MESSAGE [EXIT] [REMEDY [ARG…]] — the only way this CLI fails.
+# The remedy is a second line ("→ run: uku auth login") on stderr, and the
+# `hint` field of the --agent error envelope. Where no honest next step exists,
+# pass none: an invented remedy is worse than silence.
+die()   {
+  local msg="$1" code="${2:-$EX_USAGE}"
+  shift; [ "$#" -gt 0 ] && shift
+  local hint=""
+  [ "$#" -gt 0 ] && hint="$(_bc_render "$@")"
+  if [ "${UKU_AGENT:-0}" = "1" ]; then _agent_error "$msg" "$code" "$hint"; exit "$code"; fi
+  printf '%s %s\n' "$(_red '✗')" "$msg" >&2
+  _hint_line "$hint"
+  exit "$code"
+}
 have()  { command -v "$1" >/dev/null 2>&1; }
 # ── the jq-degradation rule ──────────────────────────────────────────
 # jq is optional (README: "used for pretty tables when present, but is never
@@ -93,8 +106,8 @@ _on_signal() {
   # the last record that landed (every create is appended before the next line
   # is read), so this is always safe advice.
   if [ "${UKU_BATCH_RUNNING:-0}" = "1" ]; then
-    printf '\n  %s\n  %s\n' "interrupted — ${UKU_BATCH_DONE:-0} record(s) created and recorded in the ledger." \
-      "resume: ${UKU_BATCH_RESUME_HINT:-uku batch list}" >&2
+    printf '\n  %s\n' "interrupted — ${UKU_BATCH_DONE:-0} record(s) created and recorded in the ledger." >&2
+    _hint_line "${UKU_BATCH_RESUME_HINT:-uku batch list}"
   fi
   trap - "$1" EXIT; kill -s "$1" $$
 }
@@ -144,7 +157,7 @@ load_creds() {
   if [ -n "$UKU_ACCOUNT_CLI" ]; then
     UKU_PROFILE="$UKU_ACCOUNT_CLI"
     local f; f="$(_profile_path "$UKU_PROFILE")"
-    [ -f "$f" ] || die "No such account: $UKU_PROFILE  (uku account list)" "$EX_AUTH"
+    [ -f "$f" ] || die "No such account: $UKU_PROFILE" "$EX_AUTH" @@account.list
     # Same base precedence as the other two branches: what the profile stored,
     # then UKU_BASE_URL, then the default (and --base still wins over all three,
     # below). This branch used to read the profile only, so --account silently
@@ -218,7 +231,7 @@ list_profiles() {
 
 need_auth() {
   [ -n "${UKU_COMPANY:-}" ] && [ -n "${UKU_KEY:-}" ] && return 0
-  die "Not signed in for account '$UKU_PROFILE'. Run: uku auth login  (or set UKU_COMPANY + UKU_API_KEY)." "$EX_AUTH"
+  die "Not signed in for account '$UKU_PROFILE' (or set UKU_COMPANY + UKU_API_KEY)." "$EX_AUTH" @@auth.login
 }
 
 # ── HTTP core ────────────────────────────────────────────────────────
@@ -228,6 +241,8 @@ need_auth() {
 REPLY_BODY=""
 REPLY_STATUS=0
 REPLY_HEADERS=""
+REPLY_PATH=""    # the path the last request went to — a 412 remedy needs to
+                 # name the record to re-read, not just say "re-read it"
 # curl -K config values live inside "…"; backslash-escape \ and " so a key or
 # company containing them can't silently corrupt the header (T12).
 _cfg_esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
@@ -420,6 +435,7 @@ _heal_428() {
 do_request() {
   local method="$1" path="$2" data="${3:-}"
   local url="$UKU_BASE$path"
+  REPLY_PATH="$path"
   _guard_time_entry "$method" "$path" "$data"
   case "$method" in GET|HEAD) : ;; *) _pace_write ;; esac
   local tmp cfg hdrf; tmp="$(_mktemp)"; cfg="$(_mktemp)"; hdrf="$(_mktemp)"
@@ -487,7 +503,7 @@ do_request() {
   if [ "$rc" -ne 0 ]; then
     # UKU_SOFT lets callers (doctor) probe without the CLI dying on a flake.
     [ "${UKU_SOFT:-0}" = "1" ] && { REPLY_STATUS=0; REPLY_BODY=""; REPLY_HEADERS=""; return 1; }
-    die "could not reach $UKU_BASE (network error)" "$EX_NET"
+    die "could not reach $UKU_BASE (network error)" "$EX_NET" @@doctor
   fi
   REPLY_BODY="$(cat "$tmp")"
   REPLY_HEADERS="$(cat "$hdrf" 2>/dev/null || true)"
@@ -525,10 +541,12 @@ do_request() {
 # render BODY  — pretty JSON when jq is present and TTY; raw otherwise.
 render() {
   local body="$1"
+  if [ "${UKU_AGENT:-0}" = "1" ]; then _agent_ok "$body" "$UKU_SUMMARY"; return; fi
   if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then
-    printf '%s\n' "$body"; return
+    printf '%s\n' "$body"; _bc_flush; return
   fi
   if have jq; then printf '%s\n' "$body" | jq .; else printf '%s\n' "$body"; fi
+  _bc_flush
 }
 
 # _project_fields BODY — BODY with every row in .data reduced to the keys named
@@ -549,7 +567,7 @@ table() {
   local body="$1"; shift
   # --fields id,name overrides the default columns (#8)
   if [ -n "${UKU_FIELDS:-}" ]; then local IFS=','; set -- $UKU_FIELDS; unset IFS; fi
-  if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty || ! have jq; then
+  if [ "${UKU_AGENT:-0}" = "1" ] || [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty || ! have jq; then
     # --fields is explicit intent, and JSON is what a script or an agent gets by
     # default — so honour it there too, by projecting each row down to the keys
     # named. It used to be silently dropped on every non-TTY run, which made the
@@ -557,7 +575,7 @@ table() {
     if [ -n "${UKU_FIELDS:-}" ]; then
       if have jq; then
         local projected; projected="$(_project_fields "$body")"
-        if [ -n "$projected" ]; then printf '%s\n' "$projected"; return; fi
+        if [ -n "$projected" ]; then render "$projected"; return; fi
         warn "--fields could not be applied to this response — showing it whole."
       else
         # Degraded shape, not an unkept promise — see the jq-degradation rule
@@ -577,6 +595,7 @@ table() {
     printf '%b\n' "$(_bold "${hdr%\\t}")"; printf '%s\n' "$rows" | tr '\t' ' '
   fi
   _pagination_footer "$body"
+  _bc_flush
 }
 
 # _pagination_footer BODY — "— N of TOTAL · more: --offset X" from meta.
@@ -612,6 +631,20 @@ _urlencode() {
   printf '%s' "$out"
 }
 
+# _api_fail EXIT MESSAGE BODY [REMEDY [ARG…]] — the exit path for a failed
+# response. On a terminal the human warnings above it have already been
+# printed, so this adds the remedy line and the server's own body; under
+# --agent it is ONE object on stdout instead, carrying the same facts.
+_api_fail() {
+  local code="$1" msg="$2" body="$3"; shift 3
+  local hint=""
+  [ "$#" -gt 0 ] && hint="$(_bc_render "$@")"
+  if [ "${UKU_AGENT:-0}" = "1" ]; then _agent_error "$msg" "$code" "$hint"; exit "$code"; fi
+  _hint_line "$hint"
+  [ -n "$body" ] && printf '%s\n' "$body" >&2
+  exit "$code"
+}
+
 # check_status BODY — die with a helpful message on 4xx/5xx (uses REPLY_STATUS).
 check_status() {
   local body="$1" s="$REPLY_STATUS"
@@ -627,17 +660,27 @@ check_status() {
       case "$code" in
         *[Ss][Cc][Oo][Pp][Ee]*|*[Ff][Ii][Nn][Aa][Nn][Cc][Ii][Aa][Ll]*)
           warn "$(_bold "HTTP $s") — this key can't perform that action."
-          warn "Financial actions need an All-scope key; read/operate keys can't touch money." ;;
+          warn "Financial actions need an All-scope key; read/operate keys can't touch money."
+          _api_fail "$EX_AUTH" "HTTP $s — this key can't perform that action: financial actions need an All-scope key." "$body" @@money.key ;;
         *)
-          warn "$(_bold "HTTP $s") — ${msg:-authentication or permission denied.}  Try: uku auth status" ;;
-      esac
-      printf '%s\n' "$body" >&2; exit "$EX_AUTH" ;;
+          warn "$(_bold "HTTP $s") — ${msg:-authentication or permission denied.}  Try: uku auth status"
+          # 401 is "who are you"; 403 is "not you, or not that account".
+          case "$s" in
+            401) _api_fail "$EX_AUTH" "HTTP $s — ${msg:-authentication failed}" "$body" @@auth.login ;;
+            *)   _api_fail "$EX_AUTH" "HTTP $s — ${msg:-permission denied}" "$body" @@auth.status ;;
+          esac ;;
+      esac ;;
     409)
       # Domain conflict — the record is fine, the ACTION is not allowed right now
       # (*_EXISTS, *_LOCKED, TIMER_ALREADY_RUNNING, STATUS_TRANSITION_NOT_SUPPORTED).
       # Retrying the identical request will fail identically; change the request.
       warn "$(_bold "HTTP 409") — the API refused this on a domain rule (e.g. already exists, locked, or a timer is already running). Nothing changed. Re-sending the same request will fail the same way — read the code below and change the request."
-      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
+      # A running timer is the 409 people actually hit, and it has a real next
+      # step; the other domain rules do not, so they get the message only.
+      case "$(printf '%s' "$body" | (have jq && jq -r '.error.code // .code // empty' 2>/dev/null || true))" in
+        *TIMER_ALREADY_RUNNING*) _api_fail "$EX_API" "HTTP 409 — a timer is already running for this person; nothing changed." "$body" @@time.list ;;
+        *) _api_fail "$EX_API" "HTTP 409 — the API refused this on a domain rule. Nothing changed; re-sending it unchanged will fail the same way." "$body" ;;
+      esac ;;
     412)
       # STALE_WRITE. This is the whole reason If-Match exists: someone else
       # changed the record after it was read. Re-GETting and resending would
@@ -645,7 +688,15 @@ check_status() {
       # So: hard stop, its own exit code, never automatic.
       warn "$(_bold "HTTP 412") — someone else changed this record after you read it. Nothing was written."
       warn "Re-read the record, re-apply your change on top of the CURRENT values, then write again. This is never retried automatically: a blind retry would overwrite their edit."
-      printf '%s\n' "$body" >&2; exit "$EX_CONFLICT" ;;
+      # "Re-read it" is only advice until we say WHICH read. When the path
+      # named a record we know the exact command; otherwise say the true thing
+      # in words rather than guess at a command.
+      local cf_cmd cf_id
+      cf_cmd="$(_res_cmd "${REPLY_PATH:-}")"; cf_id="$(_path_id "${REPLY_PATH:-}")"
+      if [ -n "$cf_cmd" ] && [ -n "$cf_id" ]; then
+        _api_fail "$EX_CONFLICT" "HTTP 412 — someone else changed this record after you read it. Nothing was written." "$body" "@@$cf_cmd.get" "$cf_id"
+      fi
+      _api_fail "$EX_CONFLICT" "HTTP 412 — someone else changed this record after you read it. Nothing was written." "$body" @@stale.reread ;;
     428)
       if [ "${_UKU_428_SUPPLIED:-0}" = "1" ]; then
         warn "$(_bold "HTTP 428") — the --if-match value you supplied was rejected as missing or invalid. Not retrying."
@@ -654,7 +705,7 @@ check_status() {
         warn "$(_bold "HTTP 428") — this write needs an If-Match (version) header, and no ETag could be found for it."
         warn "GET the guarded resource, read its ETag response header, and pass it: uku --if-match '<etag>' …"
       fi
-      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
+      _api_fail "$EX_API" "HTTP 428 — this write needs an If-Match (version) header. Nothing was written." "$body" @@ifmatch.supply ;;
     429)
       local rlw; rlw="$(_rl_wait_secs)"
       if [ -n "$rlw" ] && [ "$rlw" -gt 0 ] 2>/dev/null; then
@@ -663,10 +714,16 @@ check_status() {
         warn "$(_bold "HTTP 429") — rate limited. Wait for the window to reset before retrying."
       fi
       warn "Reads may be retried (the CLI already waits once). A WRITE must not be retried — its outcome is unknown; GET to check whether it landed before resending."
-      printf '%s\n' "$body" >&2; exit "$EX_NET" ;;
+      _api_fail "$EX_NET" "HTTP 429 — rate limited.${rlw:+ The window resets in ${rlw}s.}" "$body" @@ratelimit.wait ;;
+    5*)
+      warn "$(_bold "HTTP $s") — request failed."
+      _api_fail "$EX_API" "HTTP $s — the server failed. For a write the outcome is unknown." "$body" @@unknown.outcome ;;
+    400|404|422)
+      warn "$(_bold "HTTP $s") — request failed."
+      _api_fail "$EX_API" "HTTP $s — $(_body_msg "$body" | tr '\n' ' ' | cut -c1-200)" "$body" @@api.describe ;;
     *)
       warn "$(_bold "HTTP $s") — request failed."
-      printf '%s\n' "$body" >&2; exit "$EX_API" ;;
+      _api_fail "$EX_API" "HTTP $s — request failed." "$body" ;;
   esac
 }
 
@@ -680,7 +737,10 @@ confirm_write() {
   [ "${UKU_DRY:-0}" = "1" ] && return 0
   [ "${UKU_YES:-0}" = "1" ] && return 0
   if ! _is_tty; then
-    die "Refusing a non-interactive write ($1). Re-run with --yes to confirm." "$EX_CONFIRM"
+    # The remedy here is the caller's OWN line with --yes on the end. It is the
+    # one command that cannot be declared in advance, and the one nobody should
+    # have to retype.
+    die "Refusing a non-interactive write ($1). Re-run with --yes to confirm." "$EX_CONFIRM" "$(_argv_cmd --yes -y) --yes"
   fi
   printf '%s %s [y/N] ' "$(_bold 'Confirm write:')" "$1" >&2
   local reply=""; read -r reply < /dev/tty || true   # init so a failed tty read refuses, never set -u crashes (N8)
@@ -714,6 +774,382 @@ read_data() {
     @*) local f="${1#@}"; [ -f "$f" ] || die "data file not found: $f" "$EX_USAGE"; cat "$f" ;;
     *) printf '%s' "$1" ;;
   esac
+}
+
+# ── Being driven: remedies, breadcrumbs, and the --agent envelope ────
+#
+# A failure with no next step is a dead end, and a success that does not say
+# what is now possible makes the caller guess. Both are answered from ONE
+# declared table, for the same reason the command surface is declared: a
+# breadcrumb that names a command the CLI does not have is worse than no
+# breadcrumb, and only a table can be checked by the build gate.
+#
+#   @@slug | template | why
+#
+# * `{1}`, `{2}` are filled in at the call site with real ids from the response.
+# * A template starting with `uku ` is a COMMAND: scripts/check-drift.sh
+#   resolves it against `.surface`, so it cannot name fiction.
+# * A template that does not is PROSE — the honest shape when no command fixes
+#   it ("re-read the record, re-apply your change"). Inventing a command there
+#   would be worse than saying the true thing in words.
+# * The gate also checks the other direction: every `@@slug` written anywhere in
+#   this file must exist in the table (`grep -oE '@@[a-z]+\.[a-z-]+'`), which is
+#   why the prefix is `@@` and not something a file path could ever look like.
+_remedy_table() {
+  cat <<'TABLE'
+@@auth.login      | uku auth login                        | sign in
+@@auth.status     | uku auth status                       | check the key you are using
+@@account.list    | uku account list                      | the accounts on this machine
+@@account.current | uku account current                   | which account this would hit
+@@doctor          | uku doctor                            | check the install end to end
+@@setup.agents    | uku setup agents                      | install the agent skill
+@@update          | uku update                            | upgrade in place
+@@help.root       | uku help                              | every command
+@@help.topic      | uku help {1}                          | the card for this command
+@@help.batch      | uku help batch                        | how a batch and its ledger work
+@@api.describe    | uku api --describe                    | the resource map and required fields
+@@batch.list      | uku batch list                        | the runs this machine has done
+@@batch.show      | uku batch show {1}                    | what that run actually did
+@@clients.list    | uku clients list                      | the clients
+@@clients.get     | uku clients get {1}                   | that client in full
+@@clients.patch   | uku clients patch {1}                 | change it
+@@tasks.list      | uku tasks list                        | the tasks
+@@tasks.get       | uku tasks get {1}                     | that task in full
+@@tasks.patch     | uku tasks patch {1}                   | change it
+@@time.list       | uku time list                         | the time entries
+@@time.get        | uku time get {1}                      | that entry in full
+@@invoices.list   | uku invoices list                     | the invoices
+@@invoices.get    | uku invoices get {1}                  | that invoice in full
+@@members.get     | uku members get {1}                   | that member in full
+@@products.get    | uku products get {1}                  | that product in full
+@@contracts.get   | uku contracts get {1}                 | that contract in full
+@@projects.get    | uku projects get {1}                  | that project in full
+@@money.key       | this needs an All-scope key — create one in Uku (Settings, API), then sign in again with: uku auth login | -
+@@stale.reread    | re-read the record, re-apply your change on top of the CURRENT values, then write again | -
+@@ifmatch.supply  | GET the guarded resource, take its ETag response header, and pass it: uku --if-match '<etag>' ... | -
+@@ratelimit.wait  | wait for the window to reset; after a write, GET first to see whether it landed | -
+@@unknown.outcome | the outcome is unknown — GET the resource to see whether the write landed before re-sending | -
+TABLE
+}
+
+# _dump_remedies (hidden) — slug<TAB>template, one per line. The gate's hook.
+_dump_remedies() {
+  _remedy_table | awk -F'|' '
+    { s=$1; t=$2; gsub(/^[ \t]+|[ \t]+$/,"",s); gsub(/^[ \t]+|[ \t]+$/,"",t)
+      if (s ~ /^@@/) printf "%s\t%s\n", s, t }' | LC_ALL=C sort -u
+  return 0
+}
+# _remedy_get SLUG COLUMN — one field of one row (2 = template, 3 = why).
+# A heredoc, not a pipe: an awk that `exit`s early leaves the writer holding an
+# unread pipe, and with `set -o pipefail` that EPIPE becomes the status of the
+# whole statement. (This is not theoretical — it is exactly how the first
+# version of `uku <cmd> --help --agent` failed, on a 15KB write into a 16KB
+# macOS pipe buffer.)
+_remedy_get() {
+  awk -F'|' -v k="$1" -v c="$2" '
+    { s=$1; gsub(/^[ \t]+|[ \t]+$/,"",s)
+      if (s == k) { v=$c; gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } }' <<EOF
+$(_remedy_table)
+EOF
+  return 0
+}
+
+# _bc_render SLUG|TEXT [ARG…] — the remedy string with {N} filled in.
+# A first argument that is NOT an @@slug is literal text, used in the one place
+# where the command is built from the user's own argv (a batch resume, a refused
+# write): there is nothing to declare, because it is the caller's own line.
+_bc_render() {
+  local key="$1"; shift
+  local tpl=""
+  case "$key" in
+    @@*) tpl="$(_remedy_get "$key" 2)"
+         [ -n "$tpl" ] || { warn "internal: no remedy declared for $key"; return 0; } ;;
+    *)   tpl="$key" ;;
+  esac
+  local i=1 a
+  for a in ${@+"$@"}; do
+    tpl="${tpl//"{$i}"/$a}"
+    i=$((i + 1))
+  done
+  printf '%s' "$tpl"
+  return 0
+}
+
+# _hint_line TEXT — the second line of an error: what to do next.
+_hint_line() {
+  [ -n "$1" ] || return 0
+  case "$1" in
+    "uku "*) printf '  %s\n' "$(_dim "→ run: $1")" >&2 ;;
+    *)       printf '  %s\n' "$(_dim "→ $1")" >&2 ;;
+  esac
+  return 0
+}
+
+# ── breadcrumbs ──────────────────────────────────────────────────────
+# What a caller most plausibly wants next, with the ids already filled in.
+UKU_BC=""          # accumulated "command<TAB>why" lines
+UKU_SUMMARY=""     # the one-line human summary for the --agent envelope
+_bc_enabled() {
+  [ "${UKU_NO_HINTS:-0}" = "1" ] && return 1
+  [ "${UKU_QUIET:-0}" = "1" ] && return 1
+  return 0
+}
+# _wants_extras — is it worth computing a summary and breadcrumbs at all?
+# (--json never gets them; a non-TTY without --agent is --json by default.)
+_wants_extras() {
+  [ "${UKU_AGENT:-0}" = "1" ] && return 0
+  [ "${UKU_JSON:-0}" = "1" ] && return 1
+  _bc_enabled || return 1
+  _is_tty
+}
+_bc_add() { # SLUG|TEXT [ARG…]
+  local cmd why
+  cmd="$(_bc_render "$@")"
+  [ -n "$cmd" ] || return 0
+  why=""
+  case "$1" in @@*) why="$(_remedy_get "$1" 3)"; [ "$why" = "-" ] && why="" ;; esac
+  UKU_BC="$UKU_BC$cmd	$why"$'\n'
+  return 0
+}
+_bc_json() {
+  if ! _bc_enabled; then printf '[]'; return 0; fi
+  local first=1 cmd why
+  printf '['
+  while IFS='	' read -r cmd why; do
+    [ -n "$cmd" ] || continue
+    [ "$first" = "1" ] || printf ','
+    first=0
+    printf '{"cmd":%s,"why":%s}' "$(_json_str "$cmd")" \
+      "$([ -n "$why" ] && _json_str "$why" || printf 'null')"
+  done <<EOF
+$(printf '%s' "$UKU_BC")
+EOF
+  printf ']'
+  return 0
+}
+# _bc_flush — the dim TTY footer. Never on --json, --quiet, --no-hints, --agent
+# or a pipe: on those channels stdout is a contract and stderr is noise.
+_bc_flush() {
+  local bc="$UKU_BC"; UKU_BC=""
+  [ -n "$bc" ] || return 0
+  [ "${UKU_AGENT:-0}" = "1" ] && return 0
+  [ "${UKU_JSON:-0}" = "1" ] && return 0
+  _bc_enabled || return 0
+  _is_tty || return 0
+  local cmd why
+  printf '  %s\n' "$(_dim 'Next:')" >&2
+  while IFS='	' read -r cmd why; do
+    [ -n "$cmd" ] || continue
+    printf '  %s\n' "$(_dim "  $cmd${why:+   · $why}")" >&2
+  done <<EOF
+$bc
+EOF
+  return 0
+}
+
+# ── the --agent envelope ─────────────────────────────────────────────
+# --json is NOT touched: it is documented as the raw API body and the embedded
+# skill tells agents to parse `.data`. Adding CLI-invented keys to something
+# advertised as raw would be dishonest and would break every agent already
+# reading it. --agent is the second channel, and inside it `.data` still means
+# exactly what it meant — the same bytes, spliced out of the response.
+#
+# _json_scan MODE WANT — JSON on stdin.
+#   field KEY  → the RAW bytes of top-level KEY's value (nothing re-serialised,
+#                so `--agent | jq .data` and `--json | jq .data` are equal)
+#   len   -    → the number of elements of a top-level array (-1 if not one)
+# awk, not jq: jq is optional, and re-serialising through jq would make the
+# bytes ours rather than the server's. The cost is a character walk, paid only
+# in --agent mode.
+_json_scan() {
+  awk -v mode="$1" -v want="$2" '
+    function skipws(i) { while (i <= n && substr(buf,i,1) ~ /[ \t\r\n]/) i++; return i }
+    function readstr(i,   ch) {
+      STR = ""; i++
+      while (i <= n) {
+        ch = substr(buf,i,1)
+        if (ch == "\\") { STR = STR ch substr(buf,i+1,1); i += 2; continue }
+        if (ch == "\"") { i++; break }
+        STR = STR ch; i++
+      }
+      return i }
+    function skipval(i,   ch,d) {
+      ch = substr(buf,i,1)
+      if (ch == "\"") return readstr(i)
+      if (ch == "{" || ch == "[") {
+        d = 0
+        while (i <= n) {
+          ch = substr(buf,i,1)
+          if (ch == "\"") { i = readstr(i); continue }
+          if (ch == "{" || ch == "[") d++
+          else if (ch == "}" || ch == "]") { d--; i++; if (d == 0) return i; continue }
+          i++
+        }
+        return i }
+      while (i <= n && substr(buf,i,1) !~ /[,}\]\[{ \t\r\n]/) i++
+      return i }
+    function arrlen(   i,ch,d,cnt) {
+      i = skipws(1)
+      if (substr(buf,i,1) != "[") return -1
+      i++; i = skipws(i)
+      if (substr(buf,i,1) == "]") return 0
+      cnt = 1; d = 0
+      while (i <= n) {
+        ch = substr(buf,i,1)
+        if (ch == "\"") { i = readstr(i); continue }
+        if (ch == "[" || ch == "{") d++
+        else if (ch == "]" || ch == "}") { if (d == 0) break; d-- }
+        else if (ch == "," && d == 0) cnt++
+        i++
+      }
+      return cnt }
+    { buf = buf $0 "\n" }
+    END {
+      n = length(buf)
+      if (mode == "len") { print arrlen(); exit }
+      i = skipws(1)
+      if (substr(buf,i,1) != "{") exit
+      i++
+      while (i <= n) {
+        i = skipws(i); ch = substr(buf,i,1)
+        if (ch == "}" || ch == "") exit
+        if (ch == ",") { i++; continue }
+        if (ch != "\"") exit
+        i = readstr(i); key = STR
+        i = skipws(i)
+        if (substr(buf,i,1) != ":") exit
+        i++
+        i = skipws(i); start = i
+        i = skipval(i)
+        if (key == want) { printf "%s", substr(buf,start,i-start); exit }
+      }
+    }'
+  return 0
+}
+
+# _exit_name CODE — the stable symbolic name of an exit code. This is what
+# `code` holds in an --agent error: the exit status and the code are one fact
+# said twice, so an agent can branch on either.
+_exit_name() {
+  case "$1" in
+    0) printf 'ok' ;;      1) printf 'usage' ;;   2) printf 'auth' ;;
+    3) printf 'api' ;;     4) printf 'confirm' ;; 5) printf 'network' ;;
+    6) printf 'conflict' ;; *) printf 'error' ;;
+  esac
+}
+
+_agent_ok() { # BODY SUMMARY
+  local body="$1" summary="$2" data="" meta=""
+  if [ -n "$body" ]; then
+    data="$(printf '%s' "$body" | _json_scan field data)"
+    meta="$(printf '%s' "$body" | _json_scan field meta)"
+  fi
+  # A body with no top-level `data` IS the data (uku doctor, uku auth status).
+  [ -n "$data" ] || data="$body"
+  [ -n "$data" ] || data="null"
+  [ -n "$meta" ] || meta="null"
+  printf '{"ok":true,"data":%s,"meta":%s,"summary":%s,"breadcrumbs":%s}\n' \
+    "$data" "$meta" "$(_json_str "$summary")" "$(_bc_json)"
+  UKU_BC=""
+  return 0
+}
+_agent_error() { # MESSAGE EXITCODE HINT
+  printf '{"ok":false,"error":%s,"code":%s,"hint":%s}\n' \
+    "$(_json_str "$1")" "$(_json_str "$(_exit_name "$2")")" \
+    "$([ -n "$3" ] && _json_str "$3" || printf 'null')"
+  return 0
+}
+
+# _argv_cmd DROP… — the line the user just ran, rebuilt from the original argv
+# with the named flags removed. Used for the one remedy that cannot be declared
+# in advance, because it is the caller's own command with one flag added.
+_argv_cmd() {
+  local out="uku" a d skip
+  for a in ${UKU_ARGV[@]+"${UKU_ARGV[@]}"}; do
+    skip=0
+    for d in ${@+"$@"}; do [ "$a" = "$d" ] && skip=1; done
+    [ "$skip" = "1" ] && continue
+    case "$a" in
+      *[![:alnum:]@/._=-]*) out="$out '$(_sq "$a")'" ;;
+      *) out="$out $a" ;;
+    esac
+  done
+  printf '%s' "$out"
+  return 0
+}
+
+# ── which resource a path belongs to (explicit, not parsed) ──────────
+_res_cmd() { # API PATH → the uku command that owns it, or ""
+  case "${1%%\?*}" in
+    /api/v3/clients|/api/v3/clients/*)           printf 'clients' ;;
+    /api/v3/tasks|/api/v3/tasks/*)               printf 'tasks' ;;
+    /api/v3/time-entries|/api/v3/time-entries/*) printf 'time' ;;
+    /api/v3/invoices|/api/v3/invoices/*)         printf 'invoices' ;;
+    /api/v3/members|/api/v3/members/*)           printf 'members' ;;
+    /api/v3/products|/api/v3/products/*)         printf 'products' ;;
+    /api/v3/contracts|/api/v3/contracts/*)       printf 'contracts' ;;
+    /api/v3/projects|/api/v3/projects/*)         printf 'projects' ;;
+    *) printf '' ;;
+  esac
+}
+_res_one()  { case "$1" in clients) printf 'client' ;; tasks) printf 'task' ;; time) printf 'time entry' ;;
+                invoices) printf 'invoice' ;; members) printf 'member' ;; products) printf 'product' ;;
+                contracts) printf 'contract' ;; projects) printf 'project' ;; *) printf 'record' ;; esac; }
+_res_many() { case "$1" in time) printf 'time entries' ;; *) printf '%s' "$1" ;; esac; }
+# _path_id PATH — the id the path names, if its last segment is one.
+_path_id() { local p="${1%%\?*}"; p="${p%/}"; local s="${p##*/}"; _looks_like_id "$s" && printf '%s' "$s" || printf ''; return 0; }
+# _first_id JSON — the id of the first record in an array, or of an object.
+_first_id() {
+  [ -n "$1" ] || return 0
+  if have jq; then
+    printf '%s' "$1" | jq -r 'if type=="array" then (.[0].id // empty) elif type=="object" then (.id // empty) else empty end | tostring' 2>/dev/null | head -n1
+  else
+    printf '%s' "$1" | awk 'match($0, /"id"[ \t]*:[ \t]*("[^"]*"|[0-9]+)/) {
+      s = substr($0, RSTART, RLENGTH); sub(/^"id"[ \t]*:[ \t]*/, "", s); gsub(/"/, "", s); print s; exit }'
+  fi
+  return 0
+}
+
+# ── what a successful command offers next ────────────────────────────
+_after_list() { # PATH BODY
+  _wants_extras || return 0
+  local rescmd data cnt id
+  rescmd="$(_res_cmd "$1")"
+  data="$(printf '%s' "$2" | _json_scan field data)"
+  cnt="$(printf '%s' "$data" | _json_scan len -)"
+  case "$cnt" in ''|-1) cnt="" ;; esac
+  if [ -n "$rescmd" ]; then
+    if [ "$cnt" = "1" ]; then UKU_SUMMARY="1 $(_res_one "$rescmd")"
+    else UKU_SUMMARY="${cnt:-0} $(_res_many "$rescmd")"; fi
+  else
+    UKU_SUMMARY="${cnt:-0} record(s)"
+  fi
+  id="$(_first_id "$data")"
+  [ -n "$rescmd" ] && [ -n "$id" ] && _bc_add "@@$rescmd.get" "$id"
+  return 0
+}
+_after_get() { # PATH BODY
+  _wants_extras || return 0
+  local rescmd id
+  rescmd="$(_res_cmd "$1")"; [ -n "$rescmd" ] || return 0
+  id="$(_first_id "$(printf '%s' "$2" | _json_scan field data)")"
+  [ -n "$id" ] || id="$(_path_id "$1")"
+  UKU_SUMMARY="$(_res_one "$rescmd") ${id:-?}"
+  case "$rescmd" in
+    clients|tasks) [ -n "$id" ] && _bc_add "@@$rescmd.patch" "$id" ;;
+  esac
+  return 0
+}
+_after_write() { # METHOD PATH BODY
+  _wants_extras || return 0
+  local rescmd id verb
+  rescmd="$(_res_cmd "$2")"; [ -n "$rescmd" ] || return 0
+  id="$(_first_id "$(printf '%s' "$3" | _json_scan field data)")"
+  [ -n "$id" ] || id="$(_path_id "$2")"
+  case "$1" in POST) verb="created" ;; PATCH|PUT) verb="updated" ;; DELETE) verb="deleted" ;; *) verb="written" ;; esac
+  UKU_SUMMARY="$(_res_one "$rescmd") ${id:-?} $verb"
+  [ -n "$id" ] && [ "$verb" != "deleted" ] && _bc_add "@@$rescmd.get" "$id"
+  return 0
 }
 
 # ── Commands ─────────────────────────────────────────────────────────
@@ -782,14 +1218,27 @@ cmd_auth() {
     status)
       load_creds
       if [ -z "${UKU_KEY:-}" ]; then
-        if [ "${UKU_JSON:-0}" = "1" ]; then printf '{"account":"%s","signed_in":false}\n' "$UKU_PROFILE"; else warn "Account '$UKU_PROFILE' is not signed in. Run: uku auth login"; fi
+        if [ "${UKU_AGENT:-0}" = "1" ]; then
+          _agent_error "account '$UKU_PROFILE' is not signed in" "$EX_AUTH" "$(_bc_render @@auth.login)"
+        elif [ "${UKU_JSON:-0}" = "1" ]; then printf '{"account":"%s","signed_in":false}\n' "$UKU_PROFILE"
+        else warn "Account '$UKU_PROFILE' is not signed in. Run: uku auth login"; _hint_line "$(_bc_render @@auth.login)"; fi
         exit "$EX_AUTH"
       fi
       do_request GET /api/v3/members
       local valid=false; [ "${REPLY_STATUS:0:1}" = "2" ] && valid=true
+      local st_json; st_json="$(printf '{"account":"%s","base":"%s","company":"%s","key_masked":"%s","valid":%s}' \
+          "$UKU_PROFILE" "$UKU_BASE" "$UKU_COMPANY" "$(_mask_key "$UKU_KEY")" "$valid")"
+      if [ "${UKU_AGENT:-0}" = "1" ]; then
+        if [ "$valid" = true ]; then
+          _bc_add @@account.list
+          _agent_ok "$st_json" "signed in as account '$UKU_PROFILE'"
+          return
+        fi
+        _agent_error "account '$UKU_PROFILE' is stored but the API rejected the key (HTTP $REPLY_STATUS)" "$EX_AUTH" "$(_bc_render @@auth.login)"
+        exit "$EX_AUTH"
+      fi
       if [ "${UKU_JSON:-0}" = "1" ]; then
-        printf '{"account":"%s","base":"%s","company":"%s","key_masked":"%s","valid":%s}\n' \
-          "$UKU_PROFILE" "$UKU_BASE" "$UKU_COMPANY" "$(_mask_key "$UKU_KEY")" "$valid"
+        printf '%s\n' "$st_json"
         [ "$valid" = true ] || exit "$EX_AUTH"; return
       fi
       if [ "$valid" = true ]; then
@@ -797,6 +1246,7 @@ cmd_auth() {
         printf '  company: %s\n  key:     %s  %s\n' "$UKU_COMPANY" "$(_mask_key "$UKU_KEY")" "$(_green 'valid')" >&2
       else
         warn "Account '$UKU_PROFILE' stored but the API rejected it (HTTP $REPLY_STATUS)"
+        _hint_line "$(_bc_render @@auth.login)"
         exit "$EX_AUTH"
       fi
       ;;
@@ -829,7 +1279,7 @@ cmd_auth() {
       if [ -f "$f" ]; then rm -f "$f"; info "Signed out of account '$target' (removed profile)."; else warn "No stored credentials for account '$target'."; fi
       _reassign_active "$target"
       ;;
-    *) die "Unknown: uku auth $sub  (login|status|logout)" "$EX_USAGE" ;;
+    *) die "Unknown: uku auth $sub  (login|status|logout)" "$EX_USAGE" @@help.topic auth ;;
   esac
 }
 
@@ -841,6 +1291,23 @@ cmd_account() {
   case "$sub" in
     list|ls)
       local act; act="$(active_profile)"
+      # --agent asks for ONE envelope shape from every command, including the
+      # ones that never touch the API — an agent should not have to know which
+      # is which. Built in pure bash so it does not depend on jq either.
+      if [ "${UKU_AGENT:-0}" = "1" ]; then
+        local ag_first=1 ag_name ag_co ag_n=0 ag_out="["
+        while IFS= read -r ag_name; do
+          [ -z "$ag_name" ] && continue
+          ag_co="$(_profile_get "$(_profile_path "$ag_name")" UKU_COMPANY)"
+          [ "$ag_first" = "1" ] || ag_out="$ag_out,"; ag_first=0; ag_n=$((ag_n + 1))
+          ag_out="$ag_out{\"name\":$(_json_str "$ag_name"),\"company\":$(_json_str "$ag_co"),\"active\":$([ "$ag_name" = "$act" ] && printf 'true' || printf 'false')}"
+        done <<EOF
+$(list_profiles)
+EOF
+        ag_out="$ag_out]"
+        _agent_ok "{\"active\":$(_json_str "$act"),\"accounts\":$ag_out}" "$ag_n account(s), active '$act'"
+        return 0
+      fi
       # JSON when piped/--json so the output honors the same contract as everything else (N9)
       if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then
         if have jq; then
@@ -881,22 +1348,24 @@ EOF
     use|switch)
       local name="${1:-}"
       [ -n "$name" ] || die "usage: uku account use <name>" "$EX_USAGE"
-      [ -f "$(_profile_path "$name")" ] || die "No such account: $name  (uku account list)" "$EX_AUTH"
+      [ -f "$(_profile_path "$name")" ] || die "No such account: $name" "$EX_AUTH" @@account.list
       set_active "$name"; info "Now using account $(_bold "$name")."
       ;;
     current|who)
       local act; act="$(active_profile)"
-      if [ "${UKU_JSON:-0}" = "1" ]; then printf '{"active":"%s"}\n' "$act"; else printf '%s\n' "$act"; fi
+      if [ "${UKU_AGENT:-0}" = "1" ]; then _agent_ok "{\"active\":$(_json_str "$act")}" "active account '$act'"
+      elif [ "${UKU_JSON:-0}" = "1" ]; then printf '{"active":"%s"}\n' "$act"
+      else printf '%s\n' "$act"; fi
       ;;
     remove|rm)
       local name="${1:-}"
       [ -n "$name" ] || die "usage: uku account remove <name>" "$EX_USAGE"
       local f; f="$(_profile_path "$name")"
-      [ -f "$f" ] || die "No such account: $name" "$EX_AUTH"
+      [ -f "$f" ] || die "No such account: $name" "$EX_AUTH" @@account.list
       rm -f "$f"; info "Removed account '$name'."
       _reassign_active "$name"
       ;;
-    *) die "usage: uku account <list|add|use|current|remove>" "$EX_USAGE" ;;
+    *) die "usage: uku account <list|add|use|current|remove>" "$EX_USAGE" @@help.topic account ;;
   esac
 }
 
@@ -906,7 +1375,7 @@ list_resource() {
   local -a cols=("$@")
   # --batch is a write flag; accepting it silently on a read would look like it
   # worked. parse_list_flags is shared, so the refusal belongs here.
-  [ -z "${UKU_BATCH:-}" ] || die "--batch creates records — it does nothing on a list. Try: uku <resource> create --batch @lines.jsonl" "$EX_USAGE"
+  [ -z "${UKU_BATCH:-}" ] || die "--batch creates records — it does nothing on a list." "$EX_USAGE" @@help.batch
   load_creds; need_auth
   if [ "${UKU_ALL:-0}" = "1" ]; then
     # Degraded shape (fewer rows), not an unkept promise — see the
@@ -916,6 +1385,7 @@ list_resource() {
   local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
   do_request GET "$path$q"
   check_status "$REPLY_BODY"
+  _after_list "$path" "$REPLY_BODY"
   if [ "${#cols[@]}" -gt 0 ]; then table "$REPLY_BODY" "${cols[@]}"; else render "$REPLY_BODY"; fi
 }
 
@@ -941,6 +1411,7 @@ _list_all() {
   done
   local combined; combined="$(jq -c -s --argjson t "${total:-0}" '{data:., meta:{total:$t, limit:($t), offset:0, has_more:false}}' "$acc")"
   rm -f "$acc"
+  _after_list "$path" "$combined"
   if [ "${#cols[@]}" -gt 0 ]; then table "$combined" "${cols[@]}"; else render "$combined"; fi
 }
 
@@ -948,7 +1419,9 @@ get_resource() {
   local path="$1"
   load_creds; need_auth
   do_request GET "$path"
-  check_status "$REPLY_BODY"; render "$REPLY_BODY"
+  check_status "$REPLY_BODY"
+  _after_get "$path" "$REPLY_BODY"
+  render "$REPLY_BODY"
 }
 
 # write_resource METHOD PATH ACTION-LABEL — deliberate-gated write (needs --yes
@@ -959,12 +1432,19 @@ write_resource() {
   # copied into each of them (tasks/time/clients create all land here).
   if [ -n "${UKU_BATCH:-}" ]; then run_batch "$method" "$path" "$label"; return; fi
   load_creds; need_auth
-  [ -n "${UKU_DATA:-}" ] || die "$label needs a body: --data @file.json (or --data '{...}', or --data @-)" "$EX_USAGE"
+  if [ -z "${UKU_DATA:-}" ]; then
+    local rescmd; rescmd="$(_res_cmd "$path")"
+    local msg="$label needs a body: --data @file.json (or --data '{...}', or --data @-)"
+    if [ -n "$rescmd" ]; then die "$msg" "$EX_USAGE" @@help.topic "$rescmd"; fi
+    die "$msg" "$EX_USAGE" @@api.describe
+  fi
   local payload; payload="$(read_data "$UKU_DATA")"
   _validate_json "$payload"
   confirm_write "$label"
   do_request "$method" "$path" "$payload"
-  check_status "$REPLY_BODY"; render "$REPLY_BODY"
+  check_status "$REPLY_BODY"
+  _after_write "$method" "$path" "$REPLY_BODY"
+  render "$REPLY_BODY"
 }
 
 # ── Bulk input (C3) ──────────────────────────────────────────────────
@@ -1142,15 +1622,15 @@ run_batch() {
   local method="$1" path="$2" label="$3"
   case "$method" in
     POST) : ;;
-    *) die "--batch creates records, so it only supports POST (got $method). Nothing was sent." "$EX_USAGE" ;;
+    *) die "--batch creates records, so it only supports POST (got $method). Nothing was sent." "$EX_USAGE" @@help.batch ;;
   esac
-  [ -z "${UKU_DATA:-}" ] || die "--batch and --data are alternatives — the batch file IS the data. Nothing was sent." "$EX_USAGE"
-  [ "$UKU_SKIP_EXISTING" = "1" ] && [ -z "$UKU_MATCH_ON" ] && die "--skip-existing needs --match-on <field> — otherwise there is nothing to match on. Nothing was sent." "$EX_USAGE"
-  [ -n "$UKU_MATCH_ON" ] && [ "$UKU_SKIP_EXISTING" != "1" ] && die "--match-on only means something with --skip-existing. Nothing was sent." "$EX_USAGE"
+  [ -z "${UKU_DATA:-}" ] || die "--batch and --data are alternatives — the batch file IS the data. Nothing was sent." "$EX_USAGE" @@help.batch
+  [ "$UKU_SKIP_EXISTING" = "1" ] && [ -z "$UKU_MATCH_ON" ] && die "--skip-existing needs --match-on <field> — otherwise there is nothing to match on. Nothing was sent." "$EX_USAGE" @@help.batch
+  [ -n "$UKU_MATCH_ON" ] && [ "$UKU_SKIP_EXISTING" != "1" ] && die "--match-on only means something with --skip-existing. Nothing was sent." "$EX_USAGE" @@help.batch
   if [ "$UKU_SKIP_EXISTING" = "1" ] && ! have jq; then
     # Unkeepable safety promise, not a mere shape change — see the
     # jq-degradation rule near have() — so refuse rather than guess.
-    die "--skip-existing needs jq to compare a field exactly; without it the CLI would have to guess. Use the ledger instead (--resume). Nothing was sent." "$EX_USAGE"
+    die "--skip-existing needs jq to compare a field exactly; without it the CLI would have to guess. Use the ledger instead (--resume). Nothing was sent." "$EX_USAGE" @@help.batch
   fi
   load_creds; need_auth
 
@@ -1164,7 +1644,7 @@ run_batch() {
   case "$src" in
     @-) cat > "$f" ;;
     @*) [ -f "${src#@}" ] || die "batch file not found: ${src#@}" "$EX_USAGE"; cat "${src#@}" > "$f" ;;
-    *)  die "--batch wants a file: --batch @lines.jsonl  (or @- for stdin)" "$EX_USAGE" ;;
+    *)  die "--batch wants a file: --batch @lines.jsonl  (or @- for stdin)" "$EX_USAGE" @@help.batch ;;
   esac
   # awk, not `wc -l`: a final line with no trailing newline still counts.
   local total; total="$(awk '!/^[[:space:]]*$/ && !/^[[:space:]]*#/ {n++} END{print n+0}' "$f" 2>/dev/null || printf '0')"
@@ -1181,7 +1661,7 @@ run_batch() {
   fi
   _valid_name "$rid" || die "invalid --run-id '$rid' (letters, digits, . _ -)" "$EX_USAGE"
   if [ "$UKU_RESUME" = "1" ] && [ "$(_hash_tool)" = "none" ]; then
-    die "--resume needs a content hash and this system has no shasum/sha256sum/cksum. Refusing to guess which lines already landed. Nothing was sent." "$EX_USAGE"
+    die "--resume needs a content hash and this system has no shasum/sha256sum/cksum. Refusing to guess which lines already landed. Nothing was sent." "$EX_USAGE" @@help.batch
   fi
   [ "$(_hash_tool)" = "cksum" ] && warn "hashing with cksum (a 32-bit CRC) — no shasum/sha256sum here. Resume is best-effort; two different lines could in principle collide."
 
@@ -1375,7 +1855,10 @@ run_batch() {
     fi
     if [ -n "$stopped" ]; then printf '  %s %s\n' "$(_color 33 '!')" "stopped: $stopped"; fi
     if [ "$failed" -gt 0 ] || [ -n "$stopped" ]; then
-      printf '  %s\n' "$(_dim "resume: $resume_cmd")"
+      # The remedy, in the same shape every other failure uses. A batch that
+      # stopped or lost lines has exactly one sensible next command, and it is
+      # this one — built from the caller's own argv, so it is theirs, not ours.
+      _hint_line "$resume_cmd"
     fi
     printf '\n'
   } >&2
@@ -1415,62 +1898,64 @@ cmd_batch() {
       fi
       ;;
     show)
-      local rid="${1:-}"; [ -n "$rid" ] || die "usage: uku batch show <run-id>   (uku batch list)" "$EX_USAGE"
+      local rid="${1:-}"; [ -n "$rid" ] || die "usage: uku batch show <run-id>" "$EX_USAGE" @@batch.list
       local fpath; fpath="$(_ledger_file "$rid")"
-      [ -f "$fpath" ] || die "no such batch run: $rid  (uku batch list)" "$EX_USAGE"
+      [ -f "$fpath" ] || die "no such batch run: $rid" "$EX_USAGE" @@batch.list
       cat "$fpath"
       ;;
-    *) die "usage: uku batch <list|show <run-id>>" "$EX_USAGE" ;;
+    *) die "usage: uku batch <list|show <run-id>>" "$EX_USAGE" @@batch.list ;;
   esac
 }
 
 cmd_clients() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/clients id name status type ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku clients get <client_id>" "$EX_USAGE"; get_resource "/api/v3/clients/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku clients get <client_id>" "$EX_USAGE" @@help.topic clients; get_resource "/api/v3/clients/$2" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/clients "create a client" ;;
-    patch)  [ -n "${2:-}" ] || die "usage: uku clients patch <id> --data @f" "$EX_USAGE"; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/clients/$id" "update client $id" ;;
-    *) die "usage: uku clients <list|get|create|patch>" "$EX_USAGE" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku clients patch <id> --data @f" "$EX_USAGE" @@help.topic clients; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/clients/$id" "update client $id" ;;
+    *) die "usage: uku clients <list|get|create|patch>" "$EX_USAGE" @@help.topic clients ;;
   esac
 }
 cmd_tasks() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/tasks id title status client_id ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id>" "$EX_USAGE"; get_resource "/api/v3/tasks/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id>" "$EX_USAGE" @@help.topic tasks; get_resource "/api/v3/tasks/$2" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/tasks "create a task" ;;
-    patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id> --data @f  (e.g. status/date)" "$EX_USAGE"; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
-    *) die "usage: uku tasks <list|get|create|patch>" "$EX_USAGE" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id> --data @f  (e.g. status/date)" "$EX_USAGE" @@help.topic tasks; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
+    *) die "usage: uku tasks <list|get|create|patch>" "$EX_USAGE" @@help.topic tasks ;;
   esac
 }
 cmd_time() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/time-entries id task_id duration billable ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku time get <id>" "$EX_USAGE"; get_resource "/api/v3/time-entries/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku time get <id>" "$EX_USAGE" @@help.topic time; get_resource "/api/v3/time-entries/$2" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/time-entries "create a time entry" ;;
-    *) die "usage: uku time <list|get|create>  (create needs --data with task_id, person_id, start)" "$EX_USAGE" ;;
+    *) die "usage: uku time <list|get|create>  (create needs --data with task_id, person_id, start)" "$EX_USAGE" @@help.topic time ;;
   esac
 }
-cmd_members()   { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/members id name role status ;; get) [ -n "${2:-}" ]||die "usage: uku members get <id>" "$EX_USAGE"; get_resource "/api/v3/members/$2" ;; *) die "usage: uku members <list|get>" "$EX_USAGE" ;; esac; }
-cmd_products()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/products id name ;; get) [ -n "${2:-}" ]||die "usage: uku products get <id>" "$EX_USAGE"; get_resource "/api/v3/products/$2" ;; *) die "usage: uku products <list|get>" "$EX_USAGE" ;; esac; }
-cmd_contracts() { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/contracts id client_id status ;; get) [ -n "${2:-}" ]||die "usage: uku contracts get <id>" "$EX_USAGE"; get_resource "/api/v3/contracts/$2" ;; *) die "usage: uku contracts <list|get>" "$EX_USAGE" ;; esac; }
-cmd_projects()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/projects id name client_id ;; get) [ -n "${2:-}" ]||die "usage: uku projects get <id>" "$EX_USAGE"; get_resource "/api/v3/projects/$2" ;; *) die "usage: uku projects <list|get>" "$EX_USAGE" ;; esac; }
+cmd_members()   { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/members id name role status ;; get) [ -n "${2:-}" ]||die "usage: uku members get <id>" "$EX_USAGE" @@help.topic members; get_resource "/api/v3/members/$2" ;; *) die "usage: uku members <list|get>" "$EX_USAGE" @@help.topic members ;; esac; }
+cmd_products()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/products id name ;; get) [ -n "${2:-}" ]||die "usage: uku products get <id>" "$EX_USAGE" @@help.topic products; get_resource "/api/v3/products/$2" ;; *) die "usage: uku products <list|get>" "$EX_USAGE" @@help.topic products ;; esac; }
+cmd_contracts() { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/contracts id client_id status ;; get) [ -n "${2:-}" ]||die "usage: uku contracts get <id>" "$EX_USAGE" @@help.topic contracts; get_resource "/api/v3/contracts/$2" ;; *) die "usage: uku contracts <list|get>" "$EX_USAGE" @@help.topic contracts ;; esac; }
+cmd_projects()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/projects id name client_id ;; get) [ -n "${2:-}" ]||die "usage: uku projects get <id>" "$EX_USAGE" @@help.topic projects; get_resource "/api/v3/projects/$2" ;; *) die "usage: uku projects <list|get>" "$EX_USAGE" @@help.topic projects ;; esac; }
 # `uku me` — the identity behind this key/account (reuses the validated status).
 cmd_me() { cmd_auth status "$@"; }
 cmd_invoices() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/invoices id invoice_number status client_id ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku invoices get <invoice_id>" "$EX_USAGE"; get_resource "/api/v3/invoices/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku invoices get <invoice_id>" "$EX_USAGE" @@help.topic invoices; get_resource "/api/v3/invoices/$2" ;;
     create)
       shift || true; parse_list_flags "$@"
       if [ -n "${UKU_BATCH:-}" ]; then run_batch POST /api/v3/invoices "create invoices"; return; fi
-      [ -n "${UKU_DATA:-}" ] || die "usage: uku invoices create --data @file.json  (or --data '{...}')" "$EX_USAGE"
+      [ -n "${UKU_DATA:-}" ] || die "usage: uku invoices create --data @file.json  (or --data '{...}')" "$EX_USAGE" @@help.topic invoices
       load_creds; need_auth
       local payload; payload="$(read_data "$UKU_DATA")"
       _validate_json "$payload"
       confirm_write "create an invoice"
       do_request POST /api/v3/invoices "$payload"
-      check_status "$REPLY_BODY"; render "$REPLY_BODY"; info "Invoice created." ;;
-    *) die "usage: uku invoices <list|get|create>" "$EX_USAGE" ;;
+      check_status "$REPLY_BODY"
+      _after_write POST /api/v3/invoices "$REPLY_BODY"
+      render "$REPLY_BODY"; info "Invoice created." ;;
+    *) die "usage: uku invoices <list|get|create>" "$EX_USAGE" @@help.topic invoices ;;
   esac
 }
 
@@ -1479,7 +1964,7 @@ cmd_api() {
   # uku api METHOD PATH [--data X] [--query k=v]...
   if [ "${1:-}" = "--describe" ]; then _api_describe "${2:-}"; return 0; fi
   local method="${1:-}" path="${2:-}"; shift 2 || true
-  [ -n "$method" ] && [ -n "$path" ] || die "usage: uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f] [--query k=v]" "$EX_USAGE"
+  [ -n "$method" ] && [ -n "$path" ] || die "usage: uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f] [--query k=v]" "$EX_USAGE" @@help.topic api
   method="$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')"
   parse_list_flags "$@"
   load_creds; need_auth
@@ -1493,7 +1978,16 @@ cmd_api() {
     *) [ -n "$payload" ] && _validate_json "$payload"; confirm_write "$method $path" ;;
   esac
   do_request "$method" "$path$q" "$payload"
-  check_status "$REPLY_BODY"; render "$REPLY_BODY"
+  check_status "$REPLY_BODY"
+  # `uku api` reaches paths this CLI has no command for, so the breadcrumb is
+  # only offered when the path IS one of the modelled resources; the summary is
+  # always the honest one — the request and what the server answered.
+  case "$method" in
+    GET|HEAD) if [ -n "$(_path_id "$path")" ]; then _after_get "$path" "$REPLY_BODY"; else _after_list "$path" "$REPLY_BODY"; fi ;;
+    *)        _after_write "$method" "$path" "$REPLY_BODY" ;;
+  esac
+  if _wants_extras; then UKU_SUMMARY="$method $path → HTTP $REPLY_STATUS"; fi
+  render "$REPLY_BODY"
 }
 
 # _api_describe — a static map of the main v3 resources so an agent can orient
@@ -1548,6 +2042,35 @@ _doc() { # LEVEL MSG   (ok|warn|fail)
   case "$1" in fail) _DOC_FAILS=$((_DOC_FAILS+1)) ;; warn) _DOC_WARNS=$((_DOC_WARNS+1)) ;; esac
 }
 
+# _doctor_json — the report as one object. Shared by --json (which prints it)
+# and --agent (which carries it as `data`), so the two can never disagree.
+_doctor_json() {
+  if have jq; then
+    printf '%s' "$_DOC_ROWS" | jq -R -s 'split("\n")|map(select(length>0))|map(split("|")|{level:.[0],message:.[1]})
+      | {checks:., fails:(map(select(.level=="fail"))|length), warnings:(map(select(.level=="warn"))|length), ok:(all(.level!="fail"))}'
+    return 0
+  fi
+  # No jq — but --json is a promise ("--json always gives you raw JSON"), and
+  # doctor is the command you reach for when the box is BARE. Printing the raw
+  # level|message accumulator here emitted something that was not JSON at all,
+  # while still exiting 0, so a script parsing it got garbage and no signal that
+  # anything was wrong. _json_str already escapes without jq for the batch
+  # ledger; the same shape is buildable in pure bash.
+  local _dj_first=1 _dj_lvl _dj_msg
+  printf '{"checks":['
+  while IFS='|' read -r _dj_lvl _dj_msg; do
+    [ -z "$_dj_lvl" ] && continue
+    [ "$_dj_first" = "1" ] || printf ','
+    _dj_first=0
+    printf '{"level":%s,"message":%s}' "$(_json_str "$_dj_lvl")" "$(_json_str "$_dj_msg")"
+  done <<EOF
+$(printf '%s' "$_DOC_ROWS")
+EOF
+  local _dj_ok=true; [ "$_DOC_FAILS" -gt 0 ] && _dj_ok=false
+  printf '],"fails":%d,"warnings":%d,"ok":%s}\n' "$_DOC_FAILS" "$_DOC_WARNS" "$_dj_ok"
+  return 0
+}
+
 # uku doctor [--json] — one screen that names what's wrong and how to fix it.
 # Exits 1 when a REQUIRED check fails (curl missing, credentials rejected);
 # offline-safe (the connectivity probe never aborts the report — T3).
@@ -1569,6 +2092,7 @@ cmd_doctor() {
       _doc ok "version $UKU_VERSION (latest release)"
     elif _ver_gt "$remote_v" "$UKU_VERSION"; then
       _doc warn "version $UKU_VERSION — $remote_v is available; run 'uku update'"
+      _bc_add @@update
     else
       # Ahead of the newest release: a development build, or the rolling
       # channel. Not a fault — auto_update only ever moves forward.
@@ -1611,6 +2135,8 @@ cmd_doctor() {
   fi
   local sh; sh="$(_detect_shadow)"
   [ -n "$sh" ] && _doc warn "a shell function/alias 'uku' in $sh shadows this binary — rename it, or call 'command uku'"
+  # doctor is the one command whose whole job is "something is wrong" — so each
+  # check that CAN be fixed by a command offers that command as a breadcrumb.
   have curl && _doc ok "curl present" || _doc fail "curl missing (required)"
   have jq && _doc ok "jq present" || _doc warn "jq missing — tables + --all degrade to raw JSON (brew install jq)"
   _doc ok "bash $BASH_VERSION"
@@ -1621,43 +2147,32 @@ cmd_doctor() {
   load_creds
   if [ -z "${UKU_KEY:-}" ]; then
     _doc warn "no credentials for account '${UKU_PROFILE:-default}' — run: uku auth login"
+    _bc_add @@auth.login
   else
     if UKU_SOFT=1 do_request GET /api/v3/members; then
       case "$REPLY_STATUS" in
         2*) _doc ok "signed in · account '$UKU_PROFILE' → $UKU_BASE · key valid" ;;
-        401|403) _doc fail "credentials for '$UKU_PROFILE' were rejected (HTTP $REPLY_STATUS) — re-run uku auth login" ;;
+        401|403) _doc fail "credentials for '$UKU_PROFILE' were rejected (HTTP $REPLY_STATUS) — re-run uku auth login"; _bc_add @@auth.login ;;
         *) _doc warn "unexpected HTTP $REPLY_STATUS from $UKU_BASE" ;;
       esac
     else
       _doc warn "offline — could not reach $UKU_BASE (checked account '$UKU_PROFILE')"
     fi
   fi
-  [ -f "$HOME/.claude/skills/uku/SKILL.md" ] && _doc ok "Claude Code skill installed" || _doc warn "coding-agent skill not installed — run: uku setup agents"
+  if [ -f "$HOME/.claude/skills/uku/SKILL.md" ]; then _doc ok "Claude Code skill installed"
+  else _doc warn "coding-agent skill not installed — run: uku setup agents"; _bc_add @@setup.agents; fi
 
+  if [ "${UKU_AGENT:-0}" = "1" ]; then
+    local dsum
+    if [ "$_DOC_FAILS" -gt 0 ]; then dsum="$_DOC_FAILS failing, $_DOC_WARNS warning(s)"
+    elif [ "$_DOC_WARNS" -gt 0 ]; then dsum="0 failing, $_DOC_WARNS warning(s)"
+    else dsum="all checks passed"; fi
+    _agent_ok "$(_doctor_json)" "$dsum"
+    [ "$_DOC_FAILS" -gt 0 ] && exit 1
+    return 0
+  fi
   if [ "${UKU_JSON:-0}" = "1" ]; then
-    if have jq; then
-      printf '%s' "$_DOC_ROWS" | jq -R -s 'split("\n")|map(select(length>0))|map(split("|")|{level:.[0],message:.[1]})
-        | {checks:., fails:(map(select(.level=="fail"))|length), warnings:(map(select(.level=="warn"))|length), ok:(all(.level!="fail"))}'
-    else
-      # No jq — but --json is a promise ("--json always gives you raw JSON"),
-      # and doctor is the command you reach for when the box is BARE. Printing
-      # the raw level|message accumulator here emitted something that was not
-      # JSON at all, while still exiting 0, so a script parsing it got garbage
-      # and no signal that anything was wrong. _json_str already escapes without
-      # jq for the batch ledger; the same shape is buildable in pure bash.
-      local _dj_first=1 _dj_lvl _dj_msg
-      printf '{"checks":['
-      while IFS='|' read -r _dj_lvl _dj_msg; do
-        [ -z "$_dj_lvl" ] && continue
-        [ "$_dj_first" = "1" ] || printf ','
-        _dj_first=0
-        printf '{"level":%s,"message":%s}' "$(_json_str "$_dj_lvl")" "$(_json_str "$_dj_msg")"
-      done <<EOF
-$(printf '%s' "$_DOC_ROWS")
-EOF
-      local _dj_ok=true; [ "$_DOC_FAILS" -gt 0 ] && _dj_ok=false
-      printf '],"fails":%d,"warnings":%d,"ok":%s}\n' "$_DOC_FAILS" "$_DOC_WARNS" "$_dj_ok"
-    fi
+    _doctor_json
   else
     # The whole report on STDOUT — heading, every check, the tally. It is this
     # command's output, not commentary on some other output, and it used to be
@@ -1678,6 +2193,7 @@ EOF
     if [ "$_DOC_FAILS" -gt 0 ]; then printf '  %s\n' "$(_red "$_DOC_FAILS failing, $_DOC_WARNS warning(s).")"
     elif [ "$_DOC_WARNS" -gt 0 ]; then printf '  %s\n' "$(_color 33 "$_DOC_WARNS thing(s) to look at.")"
     else printf '  %s %s\n' "$(_green '✓')" "All good."; fi
+    _bc_flush
   fi
   [ "$_DOC_FAILS" -gt 0 ] && exit 1 || return 0
 }
@@ -1760,7 +2276,7 @@ update      |              |                         |                |         
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
 help        |              | auth account setup clients tasks time invoices members products contracts projects batch api | | |  <command>                                     | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
-%global     |              |                         |                | --json --yes -y --dry-run --quiet -q --no-color --fields --account --base --header -H --if-match --all --help -h --version -V --dump-surface | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature
+%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields --account --base --header -H --if-match --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs}; `--json` stays the RAW API body and never changes :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
 TABLE
 }
 
@@ -1808,6 +2324,9 @@ _surface_emit() {
           *)    printf 'gflag %s\n' "$t" ;;
         esac
       done
+      # the global row's notes are the ones an agent needs most (which output
+      # flag means what), so they are facts like any other
+      _surface_split "$notes" | while IFS= read -r t; do printf 'note %s %s\n' "$name" "$t"; done
     else
       printf 'cmd %s\n' "$name"
       for t in $calias; do printf 'cmdalias %s %s\n' "$name" "$t"; done
@@ -1836,10 +2355,94 @@ EOF
 # uku --dump-surface (hidden) — the committed `.surface`, byte for byte.
 _dump_surface() { _surface_emit | LC_ALL=C sort -u; }
 
+# The emitted facts, computed once. `uku --help --agent` asks for them ~120
+# times (six lists for each of nineteen commands) and re-parsing the table each
+# time turned a free operation into a visible pause.
+UKU_SURFACE_CACHE=""
+_surface_facts() {
+  [ -n "$UKU_SURFACE_CACHE" ] || UKU_SURFACE_CACHE="$(_surface_emit)"
+  printf '%s\n' "$UKU_SURFACE_CACHE"
+  return 0
+}
+
 # _surface_field KIND NAME — the third column of every matching fact, space
 # separated. `_surface_field sub clients` → "list get create patch".
 _surface_field() {
-  _surface_emit | awk -v k="$1" -v n="$2" '$1==k && $2==n { printf "%s ", $3 }'
+  _surface_facts | awk -v k="$1" -v n="$2" '$1==k && $2==n { printf "%s ", $3 }'
+  return 0
+}
+
+# _surface_rest KIND NAME — everything after the second column, one per line
+# (`arg` and `note` facts are free text and hold spaces).
+_surface_rest() {
+  _surface_facts | awk -v k="$1" -v n="$2" '$1==k && $2==n { $1=""; $2=""; sub(/^  /, ""); print }'
+  return 0
+}
+
+# ── uku --help --agent — the CLI describing itself ───────────────────
+# The surface table already holds the command tree, the flags, the arguments
+# and — the part an agent cannot get anywhere else — the `notes`, which are the
+# gotchas ("there is NO uku time patch", "money needs an All-scope key"). This
+# emits it as JSON so an agent can discover the CLI without a human pasting
+# `uku --help` into its context.
+_json_arr_words() { # "a b c" → ["a","b","c"]
+  local first=1 w
+  printf '['
+  for w in $1; do [ "$first" = "1" ] || printf ','; first=0; printf '%s' "$(_json_str "$w")"; done
+  printf ']'
+}
+_json_arr_lines() { # newline-separated → ["…","…"]
+  local first=1 l
+  printf '['
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    [ "$first" = "1" ] || printf ','; first=0
+    printf '%s' "$(_json_str "$l")"
+  done <<EOF
+$1
+EOF
+  printf ']'
+}
+_help_agent_cmd() { # NAME
+  local n="$1"
+  printf '{"command":%s' "$(_json_str "$n")"
+  printf ',"aliases":%s' "$(_json_arr_words "$(_surface_field cmdalias "$n")")"
+  printf ',"subcommands":%s' "$(_json_arr_words "$(_surface_field sub "$n")")"
+  printf ',"subcommand_aliases":%s' "$(_json_arr_words "$(_surface_field subalias "$n")")"
+  printf ',"flags":%s' "$(_json_arr_words "$(_surface_field flag "$n")")"
+  printf ',"args":%s' "$(_json_arr_lines "$(_surface_rest arg "$n")")"
+  printf ',"notes":%s' "$(_json_arr_lines "$(_surface_rest note "$n")")"
+  printf '}'
+  return 0
+}
+_help_agent() { # [TOPIC]
+  local topic="${1:-}" c first=1
+  if [ -n "$topic" ]; then
+    # an alias resolves to the command it names, so `uku accounts --help
+    # --agent` describes `account` rather than dying
+    # heredocs, not pipes: see the note on _remedy_get — a consumer that stops
+    # early (grep -q, awk exit) turns into a pipefail on the producer's write.
+    local real=""
+    if grep -qxF "cmd $topic" <<EOF
+$(_surface_facts)
+EOF
+    then real="$topic"
+    else real="$(awk -v a="$topic" '$1=="cmdalias" && $3==a { print $2; exit }' <<EOF
+$(_surface_facts)
+EOF
+)"; fi
+    [ -n "$real" ] || die "no such command: $topic" "$EX_USAGE" @@help.root
+    _help_agent_cmd "$real"; printf '\n'
+    return 0
+  fi
+  printf '{"cli":"uku","version":%s,"commands":[' "$(_json_str "$UKU_VERSION")"
+  for c in $(_surface_facts | awk '$1=="cmd" { print $2 }' | LC_ALL=C sort -u); do
+    [ "$first" = "1" ] || printf ','; first=0
+    _help_agent_cmd "$c"
+  done
+  printf '],"global_flags":%s' "$(_json_arr_words "$(_surface_facts | awk '$1=="gflag" { printf "%s ", $2 }')")"
+  printf ',"notes":%s' "$(_json_arr_lines "$(_surface_rest note '%global')")"
+  printf ',"exit_codes":{"0":"ok","1":"usage","2":"auth","3":"api","4":"confirm","5":"network","6":"conflict"}}\n'
   return 0
 }
 
@@ -1903,7 +2506,7 @@ EOF
         printf '  %s\n' "$(_dim "read-only here. What the API itself allows: uku api --describe $topic")" ;;
       esac
       printf 'Notes:\n'
-      _surface_emit | awk -v n="$topic" '$1=="note" && $2==n { $1="";$2=""; sub(/^  /,""); print "  · " $0 }'
+      _surface_rest note "$topic" | sed 's/^/  · /'
       printf 'Examples:\n  uku %s list --limit 5\n  uku %s list --json | jq %s\n' \
         "$topic" "$topic" "'.data[] | {id}'"
     ;;
@@ -1937,8 +2540,8 @@ $(_bold "THE LEDGER — why --resume can be trusted")
   went out:
     • created (the server confirmed it)  → --resume SKIPS it.
     • the server answered and refused it (422, 500, 412, …) → nothing was
-      created, so --resume $(_bold "re-sends it"). That is what the summary's
-      "resume:" line is for.
+      created, so --resume $(_bold "re-sends it"). That is what the
+      "→ run:" line under the summary is for.
     • sent, and the reply never came — the one line an interruption can catch
       in flight → $(_bold "UNKNOWN"). --resume $(_bold "refuses to re-send it") and tells you
       so: the CLI cannot know whether it landed, and guessing would duplicate a
@@ -1986,7 +2589,7 @@ $(_bold "uku setup agents") — teach your coding agents the uku contract, once
   and a block in ./AGENTS.md. UKU_SETUP_AGENT=claude|cursor|codex|all|none.
 EOF
     ;;
-    *) die "No help for '$topic'. Try: uku help  (or uku <command> --help)" "$EX_USAGE" ;;
+    *) die "No help for '$topic'." "$EX_USAGE" @@help.root ;;
   esac
 }
 
@@ -2036,6 +2639,27 @@ description: Operate a firm's Uku (accounting practice management) from the term
 - `--json` is the default when output is not a TTY — you already receive JSON. Lists wrap as `{ "data": [ … ], "meta": { "total", "limit", "offset", "has_more", "next_cursor" } }`; a single get wraps as `{ "data": { … } }`. Parse `.data`.
 - Exit codes: **0** ok · **1** usage · **2** auth (tell the user to run `uku auth login`) · **3** API error · **4** a write was refused because `--yes` was missing · **5** network / rate limited · **6** conflict: someone else changed the record (HTTP 412).
 
+### `--agent` — ask for the envelope
+`--json` is the raw API body and never changes. `--agent` is the channel built for you; the two are alternatives, and passing both is a usage error.
+
+```
+uku clients list --limit 2 --agent
+{"ok":true,"data":[{"id":41,…}],"meta":{"total":2,…},
+ "summary":"2 clients",
+ "breadcrumbs":[{"cmd":"uku clients get 41","why":"that client in full"}]}
+```
+- `data` and `meta` are **exactly what the API returned**, so `.data` means what it always meant.
+- On failure: `{"ok":false,"error":"…","code":"auth","hint":"uku auth login"}` — and **the exit code is unchanged**. `code` is the stable name of the exit status (`usage` `auth` `api` `confirm` `network` `conflict`), so branch on either.
+- `breadcrumbs` are the commands most plausibly next, with real ids already filled in. They are checked against the CLI's own command surface at build time, so a breadcrumb never names a command that does not exist — you may run one without checking it first. `--no-hints` or `--quiet` empties the array.
+- A `--batch` run keeps its JSONL-per-line output under `--agent`: that stream is already the machine contract, and one envelope could not describe N independent outcomes.
+
+### `uku --help --agent` — discover the CLI instead of guessing
+```
+uku --help --agent          # the whole tree: commands, flags, args, notes, exit codes
+uku time --help --agent     # one command
+```
+The `notes` are the gotchas — above all the negative kind (which subcommand does *not* exist, which flag belongs elsewhere). Read them before inventing a command; it costs one cheap local call and no network.
+
 ## Commands
 - `uku auth status [--json]` — who/which account you're acting as.
 - `uku account list | current | use <name>` — accounts.
@@ -2043,7 +2667,7 @@ description: Operate a firm's Uku (accounting practice management) from the term
 - `uku tasks list` · `uku time list` · `uku invoices list [--status draft]` · `uku invoices get <id>`
 - `uku invoices create --data @file.json --yes` — a deliberate write.
 - `uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]` — every one of the 80+ v3 endpoints. Use this for anything without a first-class command.
-- Global: `--header 'K: V'` (repeatable) · `--if-match '<etag>'` · `--dry-run` (prints the request, sends nothing).
+- Global: `--header 'K: V'` (repeatable) · `--if-match '<etag>'` · `--dry-run` (prints the request, sends nothing) · `--agent` (the envelope above) · `--no-hints`.
 - `uku auth print-header` — the raw auth headers, for the rare case `uku api` can't express something. It prints a **live credential**: never echo it back to the user, never put it in a file you commit, and prefer `uku api`.
 
 ## Building a write payload
@@ -2167,7 +2791,7 @@ _setup_codex() {
 
 cmd_setup() {
   local sub="${1:-agents}"; shift || true
-  [ "$sub" = "agents" ] || die "usage: uku setup agents" "$EX_USAGE"
+  [ "$sub" = "agents" ] || die "usage: uku setup agents" "$EX_USAGE" @@help.topic setup
   local want="${UKU_SETUP_AGENT:-auto}"
   case "$want" in
     none) info "Skipping agent setup (UKU_SETUP_AGENT=none)."; return 0 ;;
@@ -2215,7 +2839,7 @@ parse_list_flags() {
       --retry-unknown) UKU_RETRY_UNKNOWN=1; shift ;;
       --skip-existing) UKU_SKIP_EXISTING=1; shift ;;
       --match-on) _need_val "$@"; UKU_MATCH_ON="$2"; shift 2 ;;
-      *) die "unknown flag: $1  (try: uku <command> --help)" "$EX_USAGE" ;;
+      *) die "unknown flag: $1" "$EX_USAGE" @@help.root ;;
     esac
   done
 }
@@ -2281,7 +2905,16 @@ $(_bold "MORE")
   uku help <command>                  A focused card for one command
 
 $(_bold "GLOBAL FLAGS")
-  --json            Raw JSON (default when stdout is not a TTY)
+  --json            Raw JSON (default when stdout is not a TTY). This is the
+                    API's body, unchanged — parse .data
+  --agent           One envelope for a program to read, instead of the raw body:
+                      {"ok":true,"data":…,"meta":…,"summary":"12 clients",
+                       "breadcrumbs":[{"cmd":"uku clients get 1","why":"…"}]}
+                    On failure: {"ok":false,"error":…,"code":…,"hint":…} with
+                    the same exit code as ever. .data and .meta are exactly what
+                    the API returned. Not combinable with --json.
+                    uku <command> --help --agent  describes the CLI itself.
+  --no-hints        Drop the "Next:" breadcrumb footer (--quiet and --json do too)
   --yes, -y         Confirm a non-interactive write
   --dry-run         Print the request (headers masked) and send nothing
   --all             Page through every row (keeps your filters)
@@ -2327,6 +2960,7 @@ EOF
 
 # ── Global pre-parse (pull out global flags anywhere) ────────────────
 UKU_JSON=0; UKU_YES=0; UKU_ALL=0; UKU_HELP=0; UKU_DRY=0; UKU_QUIET=0; UKU_FIELDS=""; UKU_QUERY=(); UKU_DATA=""
+UKU_AGENT=0; UKU_NO_HINTS=0
 UKU_HEADERS=(); UKU_IF_MATCH=""
 # A header value goes verbatim into the curl -K config file, whose grammar is
 # line-based — so a newline in one would inject a second directive. Reject it.
@@ -2342,6 +2976,8 @@ UKU_ARGV=(${@+"$@"})
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) UKU_JSON=1; shift ;;
+    --agent) UKU_AGENT=1; shift ;;
+    --no-hints) UKU_NO_HINTS=1; shift ;;
     --header|-H) _need_val "$@"; _check_header_arg "$2"; UKU_HEADERS+=("$2"); shift 2 ;;
     --if-match) _need_val "$@"; _check_header_arg "If-Match: $2"; UKU_IF_MATCH="$2"; shift 2 ;;
     -y|--yes) UKU_YES=1; shift ;;
@@ -2357,10 +2993,21 @@ while [ $# -gt 0 ]; do
     # and diffed by scripts/check-surface.sh — the build gate, not a feature.
     # Answered here, before require_curl, so the gate needs nothing installed.
     --dump-surface) _dump_surface; exit "$EX_OK" ;;
+    # hidden: the remedy table, slug<TAB>template. scripts/check-drift.sh
+    # resolves every template against .surface, so no hint or breadcrumb can
+    # name a command the CLI does not have.
+    --dump-remedies) _dump_remedies; exit "$EX_OK" ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# --json and --agent are two different promises about the same stdout: raw API
+# body vs. an envelope around it. Silently picking one would make the other a
+# lie, so say so instead.
+if [ "$UKU_AGENT" = "1" ] && [ "$UKU_JSON" = "1" ]; then
+  die "--json and --agent are alternatives: --json is the raw API body, --agent wraps it in {ok,data,meta,summary,breadcrumbs}. Pick one." "$EX_USAGE" @@help.root
+fi
 
 # ── auto-update ───────────────────────────────────────────────────────
 # Updates should reach people without them thinking about it, but not by
@@ -2425,8 +3072,12 @@ auto_update() {
 }
 
 require_curl
-# --help anywhere → the card for the named command (or global usage)
-[ "$UKU_HELP" = "1" ] && { cmd_help "${1:-}"; exit "$EX_OK"; }
+# --help anywhere → the card for the named command (or global usage).
+# With --agent, the same thing as JSON built from the surface table.
+if [ "$UKU_HELP" = "1" ]; then
+  if [ "$UKU_AGENT" = "1" ]; then _help_agent "${1:-}"; else cmd_help "${1:-}"; fi
+  exit "$EX_OK"
+fi
 
 cmd="${1:-__firstrun__}"; shift || true
 case "$cmd" in
@@ -2455,5 +3106,5 @@ case "$cmd" in
   completions) cmd_completions "$@" ;;
   version)  printf 'uku %s\n' "$UKU_VERSION" ;;
   help)     cmd_help "${1:-}" ;;
-  *) die "unknown command: $cmd  (run 'uku help')" "$EX_USAGE" ;;
+  *) die "unknown command: $cmd" "$EX_USAGE" @@help.root ;;
 esac

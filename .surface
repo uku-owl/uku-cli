@@ -37,6 +37,7 @@ cmd update
 cmd version
 cmdalias account accounts
 cmdalias setup setup-agents
+doc %global --agent
 doc api --describe
 doc clients create
 doc clients patch
@@ -180,9 +181,11 @@ flag time --status
 flag time --stop-on-error
 flag time -d
 gflag --account
+gflag --agent
 gflag --all
 gflag --base
 gflag --dry-run
+gflag --dump-remedies
 gflag --dump-surface
 gflag --fields
 gflag --header
@@ -190,6 +193,7 @@ gflag --help
 gflag --if-match
 gflag --json
 gflag --no-color
+gflag --no-hints
 gflag --quiet
 gflag --version
 gflag --yes
@@ -198,6 +202,12 @@ gflag -V
 gflag -h
 gflag -q
 gflag -y
+note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs}; `--json` stays the RAW API body and never changes
+note %global `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature
+note %global `--json` and `--agent` are alternatives — passing both is a usage error
+note %global `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
+note %global `uku <command> --help --agent` emits this table as JSON, including these notes
+note %global these are parsed ANYWHERE on the line, before the command
 note account `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list`
 note account `add` is sugar for `uku auth login --account <name>`
 note account run `uku account current` before any write — a sandbox and the real firm look identical in the output
