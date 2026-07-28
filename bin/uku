@@ -488,11 +488,17 @@ _pagination_footer() {
 }
 
 # _urlencode STRING — RFC-3986 percent-encode, pure bash, byte-correct (LC_ALL=C).
+#
+# The & 0xFF is load-bearing, not paranoia. bash 3.2 treats the char in "'$c"
+# as SIGNED, so a UTF-8 continuation byte (0xE2 in an em-dash, 0xC3 in "ä")
+# came out as -30 and printf %02X rendered it "%FFFFFFFFFFFFFFE2" — a query the
+# API cannot match. Found while batching against real data; it broke every
+# non-ASCII filter, e.g. --q "Käibedeklaratsioon".
 _urlencode() {
   local LC_ALL=C s="$1" out="" i c
   for (( i=0; i<${#s}; i++ )); do
     c="${s:i:1}"
-    case "$c" in [a-zA-Z0-9.~_-]) out="$out$c" ;; *) out="$out$(printf '%%%02X' "'$c")" ;; esac
+    case "$c" in [a-zA-Z0-9.~_-]) out="$out$c" ;; *) out="$out$(printf '%%%02X' "$(( $(printf '%d' "'$c") & 0xFF ))")" ;; esac
   done
   printf '%s' "$out"
 }
@@ -965,7 +971,11 @@ _body_msg()  { if have jq; then printf '%s' "$1" | jq -r '.error.message // .mes
 # NARROW; the equality test is done here, on the field the user named.
 _batch_match_ids() {
   local p="$1" fld="$2" val="$3"
-  _UKU_NO_HEAL=1 UKU_SOFT=1 do_request GET "$p$(build_query q="$val" limit=100)" || return 1
+  # UKU_DRY=0 deliberately: this is a READ, and it is the only way --dry-run can
+  # honestly tell you which lines --skip-existing would skip. (do_request's own
+  # --dry-run prints-and-exits, which inside this $( ) would just return nothing
+  # and quietly report every line as creatable — the opposite of the truth.)
+  _UKU_NO_HEAL=1 UKU_SOFT=1 UKU_DRY=0 do_request GET "$p$(build_query q="$val" limit=100)" || return 1
   case "$REPLY_STATUS" in 2*) : ;; *) return 1 ;; esac
   printf '%s' "$REPLY_BODY" | jq -r --arg f "$fld" --arg v "$val" \
     '.data[]? | select((.[$f] // empty | tostring) == $v) | .id' 2>/dev/null || true
@@ -1032,8 +1042,8 @@ run_batch() {
     _ledger_init "$rid" "$method" "$path" "$src"
   fi
 
-  local created=0 skipped=0 failed=0 lineno=0 stopped="" line=""
-  printf '  %s\n' "$(_dim "batch $rid · $total line(s) → $method $path${known:+ · ledger holds $known}")" >&2
+  local created=0 skipped=0 failed=0 lineno=0 stopped="" stop_rc="$EX_API" line=""
+  printf '  %s\n' "$(_dim "batch $rid · $total line(s) → $method $path$( [ "$known" -gt 0 ] && printf ' · ledger already holds %s' "$known" || true )")" >&2
 
   exec 3< "$f"
   while IFS= read -r line <&3 || [ -n "$line" ]; do
@@ -1093,9 +1103,17 @@ run_batch() {
       if [ "$mcount" -gt 1 ]; then
         # REFUSE. In an accounting firm every client owns a task called
         # "Käibedeklaratsioon"; picking one of them would be picking wrong.
+        # Measured on real data while building this: "Enter Payroll" matched
+        # every row the query returned, and a title that looked unique in a
+        # 200-row sample turned out to have 18 records.
+        local shown howmany
+        shown="$(printf '%s' "$mids" | head -n5 | tr '\n' ',' | sed 's/,$//')"
+        [ "$mcount" -gt 5 ] && shown="$shown,… "
+        # the match query is capped, so at the cap we only know a lower bound
+        howmany="$mcount"; [ "$mcount" -ge 100 ] && howmany="at least $mcount"
         failed=$((failed + 1))
         _batch_emit "$lineno" failed "" "" AMBIGUOUS_MATCH \
-          "$mcount existing records have $UKU_MATCH_ON='$mval' (ids: $(printf '%s' "$mids" | tr '\n' ',' | sed 's/,$//')) — refusing to guess which one this is. Nothing sent." "$path"
+          "$howmany existing records have $UKU_MATCH_ON='$mval' (ids: $shown) — refusing to guess which one this is. Nothing sent." "$path"
         [ "${UKU_DRY:-0}" = "1" ] || _ledger_add "$rid" fail "$h" "$path" AMBIGUOUS_MATCH "$lineno"
         if [ "$UKU_STOP_ON_ERROR" = "1" ]; then stopped="line $lineno failed (AMBIGUOUS_MATCH)"; break; fi
         continue
@@ -1122,6 +1140,7 @@ run_batch() {
     local w; w="$(_rl_write_wait_secs)"
     if [ "$w" -gt "$UKU_RL_MAX_WAIT" ]; then
       stopped="write rate limit spent; it resets in ${w}s (at $(_rl_when "$(_rl_write_reset)")). Stopped before line $lineno — nothing was sent for it."
+      stop_rc="$EX_NET"
       break
     fi
 
@@ -1147,15 +1166,19 @@ run_batch() {
   exec 3<&-
 
   # ── summary (stderr — stdout stayed machine-clean) ──
+  # Rebuilt from the ORIGINAL argv so --base/--account survive; --dry-run is
+  # dropped (a resume sends), and --resume/--yes are added exactly once.
   local resume_cmd; resume_cmd="uku"
-  local a; for a in ${ARGS[@]+"${ARGS[@]}"}; do
-    case "$a" in --resume) continue ;; esac
+  local a; for a in ${UKU_ARGV[@]+"${UKU_ARGV[@]}"}; do
+    case "$a" in --resume|--dry-run|--yes|-y) continue ;; esac
     case "$a" in *[![:alnum:]@/._=-]*) resume_cmd="$resume_cmd '$(_sq "$a")'" ;; *) resume_cmd="$resume_cmd $a" ;; esac
   done
   resume_cmd="$resume_cmd --resume --yes"   # the run-id is derived from the file, so it needs no flag
   {
     printf '\n'
-    printf '  %s\n' "$(_bold "batch $rid") — $(_green "$created created") · $skipped skipped · $([ "$failed" -gt 0 ] && _red "$failed failed" || printf '%s' "0 failed")  (of $total line(s))"
+    local verb="created" vskip="skipped"
+    [ "${UKU_DRY:-0}" = "1" ] && { verb="would create"; vskip="would skip"; }
+    printf '  %s\n' "$(_bold "batch $rid") — $(_green "$created $verb") · $skipped $vskip · $([ "$failed" -gt 0 ] && _red "$failed failed" || printf '%s' "0 failed")  (of $total line(s))"
     if [ "${UKU_DRY:-0}" = "1" ]; then
       printf '  %s\n' "$(_dim "--dry-run: nothing was sent, no ledger was written.")"
       [ "$known" -gt 0 ] && [ "$UKU_RESUME" != "1" ] && printf '  %s\n' "$(_dim "a ledger for $rid already holds $known created line(s) — add --resume to skip them")"
@@ -1172,7 +1195,9 @@ run_batch() {
     printf '\n'
   } >&2
 
-  [ -n "$stopped" ] && exit "$EX_NET"
+  # 5 only when the rate limit stopped us (a network-shaped, retry-later fact);
+  # a --stop-on-error halt is an API failure, so it is 3.
+  [ -n "$stopped" ] && exit "$stop_rc"
   [ "$failed" -gt 0 ] && exit "$EX_API"
   return 0
 }
@@ -1572,7 +1597,9 @@ $(_bold "WRITES, RATE LIMITS, FAILURES")
   write; if the wait would exceed UKU_RL_MAX_WAIT (${UKU_RL_MAX_WAIT}s) it stops
   cleanly, tells you when the window resets, and leaves a resumable ledger.
   --dry-run validates every line, reports what WOULD happen (including which
-  lines the ledger would skip) and sends nothing.
+  lines the ledger would skip) and sends no write. (With --skip-existing it
+  still runs the read-only match query — otherwise it could not tell you which
+  lines that would skip.)
   Exit: 0 all good · 3 some line failed · 5 stopped on the rate limit · 4 refused.
 EOF
     ;;
@@ -1907,6 +1934,10 @@ _check_header_arg() {
   case "$1" in *:*) : ;; *) die "--header wants 'Name: value' (got: $1)" "$EX_USAGE" ;; esac
 }
 ARGS=()
+# The ORIGINAL argv, before the global flags are stripped out of it. A batch
+# needs it to print an exact resume command: rebuilding from ARGS alone would
+# silently drop --base/--account and point the resume at the wrong company.
+UKU_ARGV=(${@+"$@"})
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) UKU_JSON=1; shift ;;
