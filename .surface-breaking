@@ -15,3 +15,18 @@
 # Format: one verbatim .surface line per row.
 #
 # 2026-07-28 — nothing removed yet.
+
+# 2026-07-28 — two notes REPLACED because they were false, not because the
+# surface went away. Both are restated in the same column, corrected:
+#
+#   * the %global note claimed `--agent` wraps the response and `--json` never
+#     changes shape. A `--batch` run emits bare JSONL under `--agent` and, on
+#     failure, exits 3 with no {"ok":false} at all; and `--fields` projects and
+#     re-serialises `.data` through jq. The skill already said the batch part
+#     correctly, so the CLI's own docs contradicted each other.
+#   * the tasks note said "neither resolution happens ... for an argument that
+#     already looks like an id". That is now true only of a READ: a WRITE
+#     probes an id-shaped argument for an exact name match and refuses a
+#     collision (--by-id / --by-name decide).
+note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs}; `--json` stays the RAW API body and never changes
+note tasks neither resolution happens on a write, in a `--batch`, or for an argument that already looks like an id

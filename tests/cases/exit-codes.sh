@@ -82,7 +82,11 @@ assert_no_requests 'the fixture server saw nothing'
 
 # ── 6 — conflict (412) ───────────────────────────────────────────────
 reset_requests
-uku tasks patch 99 --data '{"title":"y"}' --yes
+# --by-id: `tasks patch <id>` now PROBES an id-shaped argument for a task
+# whose TITLE is that string (tests/cases/ref-safety.sh §1). That probe is a GET
+# on the list endpoint, which this fixture deliberately answers 401/500 — so the
+# flag says "this really is an id" and keeps the test about the code under test.
+uku tasks patch 99 --by-id --data '{"title":"y"}' --yes
 assert_status 6 'exit 6 — HTTP 412 is its own exit code'
 assert_err_contains 'HTTP 412' '412 is named'
 assert_err_contains 'Nothing was written' 'the user is told nothing was written'

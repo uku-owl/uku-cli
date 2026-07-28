@@ -55,6 +55,8 @@ cmdalias projects project
 cmdalias setup setup-agents
 cmdalias tasks task
 doc %global --agent
+doc %global --by-id
+doc %global --by-name
 doc api --describe
 doc clients create
 doc clients patch
@@ -208,6 +210,8 @@ gflag --account
 gflag --agent
 gflag --all
 gflag --base
+gflag --by-id
+gflag --by-name
 gflag --dry-run
 gflag --dump-remedies
 gflag --dump-surface
@@ -226,7 +230,8 @@ gflag -V
 gflag -h
 gflag -q
 gflag -y
-note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs}; `--json` stays the RAW API body and never changes
+note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq
+note %global `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which
 note %global `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature
 note %global `--json` and `--agent` are alternatives — passing both is a usage error
 note %global `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
@@ -248,6 +253,7 @@ note clients --batch belongs to `create`; `uku clients list --batch` is a usage 
 note clients `--client` is not a filter here (you are already listing clients) — use `--q`
 note clients `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks`
 note clients a write needs --yes when stdout is not a TTY (exit 4 otherwise)
+note clients on `patch`, an id-shaped argument costs one extra GET: it is checked against client NAMES too, because `12345678` and `CAFE-1` are both — `--by-id` skips the check
 note completions eval "$(uku completions zsh)" in your rc
 note contracts a contract has no name field, so `get` takes an id or a pasted URL — never a name
 note contracts read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules
@@ -269,11 +275,12 @@ note search NOT a server-side global search — the API offers none this CLI can
 note search `--limit` is per endpoint
 note search a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did
 note setup UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
+note tasks NAME resolution never happens in a `--batch`, and never for an argument that already looks like an id — but on a WRITE an id-shaped argument is still PROBED for a record whose name is that exact string (one extra GET), and a collision is refused until `--by-id` or `--by-name` says which was meant; on a read the id-shaped argument passes straight through with no request
 note tasks `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand
 note tasks `create` needs `title`; status/date/client_id are optional
 note tasks a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from
+note tasks a name lookup reads at most 100 records and compares `meta.total` against them: when more could exist than were examined it refuses, because a match it cannot see the alternatives to is not a unique one
 note tasks an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates
-note tasks neither resolution happens on a write, in a `--batch`, or for an argument that already looks like an id
 note tasks that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs
 note time `create` needs task_id, person_id and start
 note time `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending

@@ -89,7 +89,11 @@ assert_err_contains 'All-scope key' 'the remedy names the key that would work'
 assert_err_contains '→ ' 'and it is rendered as a remedy line'
 
 reset_requests
-uku tasks patch 99 --data '{"title":"x"}' --yes
+# --by-id: `tasks patch <id>` now PROBES an id-shaped argument for a task
+# whose TITLE is that string (tests/cases/ref-safety.sh §1). That probe is a GET
+# on the list endpoint, which this fixture deliberately answers 401/500 — so the
+# flag says "this really is an id" and keeps the test about the code under test.
+uku tasks patch 99 --by-id --data '{"title":"x"}' --yes
 assert_status 6 'a 412 is exit 6'
 assert_err_contains '→ run: uku tasks get 99' 'and the remedy names the exact record to re-read'
 
@@ -232,7 +236,7 @@ assert_equals "$(jqx code)" 'auth' 'code auth'
 assert_out_contains 'All-scope key' 'the hint says which key would work'
 
 reset_requests
-uku tasks patch 99 --data '{"x":1}' --yes --agent
+uku tasks patch 99 --by-id --data '{"x":1}' --yes --agent
 assert_status 6 'a 412 is still exit 6'
 assert_equals "$(jqx code)" 'conflict' 'code conflict'
 assert_equals "$(jqx hint)" 'uku tasks get 99' 'and the hint is the record to re-read'

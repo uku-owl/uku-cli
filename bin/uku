@@ -243,6 +243,8 @@ REPLY_STATUS=0
 REPLY_HEADERS=""
 REPLY_PATH=""    # the path the last request went to — a 412 remedy needs to
                  # name the record to re-read, not just say "re-read it"
+REPLY_METHOD=""  # and its METHOD, because a 5xx remedy is not the same
+                 # sentence for a read as it is for a write
 # curl -K config values live inside "…"; backslash-escape \ and " so a key or
 # company containing them can't silently corrupt the header (T12).
 _cfg_esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
@@ -436,6 +438,7 @@ do_request() {
   local method="$1" path="$2" data="${3:-}"
   local url="$UKU_BASE$path"
   REPLY_PATH="$path"
+  REPLY_METHOD="$method"
   _guard_time_entry "$method" "$path" "$data"
   case "$method" in GET|HEAD) : ;; *) _pace_write ;; esac
   local tmp cfg hdrf; tmp="$(_mktemp)"; cfg="$(_mktemp)"; hdrf="$(_mktemp)"
@@ -716,8 +719,19 @@ check_status() {
       warn "Reads may be retried (the CLI already waits once). A WRITE must not be retried — its outcome is unknown; GET to check whether it landed before resending."
       _api_fail "$EX_NET" "HTTP 429 — rate limited.${rlw:+ The window resets in ${rlw}s.}" "$body" @@ratelimit.wait ;;
     5*)
+      # The remedy splits by METHOD, because the two cases are not alike. On a
+      # write the outcome is genuinely unknown and the only safe next move is a
+      # GET. On a READ nothing was written, so telling the user to "GET the
+      # resource to see whether the write landed" describes an event that did
+      # not happen — and an agent acting on it goes looking for a change nobody
+      # made.
       warn "$(_bold "HTTP $s") — request failed."
-      _api_fail "$EX_API" "HTTP $s — the server failed. For a write the outcome is unknown." "$body" @@unknown.outcome ;;
+      case "${REPLY_METHOD:-}" in
+        GET|HEAD)
+          _api_fail "$EX_API" "HTTP $s — the server failed on a read. Nothing was written." "$body" @@server.read ;;
+        *)
+          _api_fail "$EX_API" "HTTP $s — the server failed. For a write the outcome is unknown." "$body" @@unknown.outcome ;;
+      esac ;;
     400|404|422)
       warn "$(_bold "HTTP $s") — request failed."
       _api_fail "$EX_API" "HTTP $s — $(_body_msg "$body" | tr '\n' ' ' | cut -c1-200)" "$body" @@api.describe ;;
@@ -831,12 +845,15 @@ _remedy_table() {
 @@search.run      | uku search {1}                        | the same query across every list endpoint
 @@filter.unhonoured | the API did not apply client_id on this endpoint, so no --client answer from it can be trusted: re-run without --client and filter the rows yourself, or narrow with --q | -
 @@name.ambiguous  | pass the id of the one you mean — the candidates are listed above, and guessing between them is the one thing this CLI will not do | -
+@@name.truncated  | narrow the name until the lookup can see every candidate (it reads at most 100 records), or pass the id | -
+@@ref.ambiguous   | say which reading you meant: --by-id treats the argument as an id, --by-name resolves it as a name | -
 @@url.host        | paste a URL from the account this CLI is signed in to, or pass the record id | -
 @@money.key       | this needs an All-scope key — create one in Uku (Settings, API), then sign in again with: uku auth login | -
 @@stale.reread    | re-read the record, re-apply your change on top of the CURRENT values, then write again | -
 @@ifmatch.supply  | GET the guarded resource, take its ETag response header, and pass it: uku --if-match '<etag>' ... | -
 @@ratelimit.wait  | wait for the window to reset; after a write, GET first to see whether it landed | -
 @@unknown.outcome | the outcome is unknown — GET the resource to see whether the write landed before re-sending | -
+@@server.read     | nothing was written — this was a read, so it is safe to run the same command again once the server recovers | -
 TABLE
 }
 
@@ -1104,6 +1121,10 @@ _res_one()  { case "$1" in clients) printf 'client' ;; tasks) printf 'task' ;; t
                 invoices) printf 'invoice' ;; members) printf 'member' ;; products) printf 'product' ;;
                 contracts) printf 'contract' ;; projects) printf 'project' ;; *) printf 'record' ;; esac; }
 _res_many() { case "$1" in time) printf 'time entries' ;; *) printf '%s' "$1" ;; esac; }
+# _res_n COUNT RESOURCE — the noun that agrees with the count. Every message
+# that interpolates a number was reading "1 clients"; a tool that writes a
+# firm's invoices should not sound like a stuck template.
+_res_n() { if [ "$1" = "1" ]; then _res_one "$2"; else _res_many "$2"; fi; }
 # _path_id PATH — the id the path names, if its last segment is one.
 _path_id() { local p="${1%%\?*}"; p="${p%/}"; local s="${p##*/}"; _looks_like_id "$s" && printf '%s' "$s" || printf ''; return 0; }
 # _first_id JSON — the id of the first record in an array, or of an object.
@@ -1148,8 +1169,14 @@ _first_id() {
 # OUT LOUD with its id. Several matches refuse and list the candidates — the
 # same doctrine as --skip-existing, for the same measured reason (a task title
 # that looked unique matched 18 records). Nothing else is safe in a tool that
-# writes invoices. It also means a server that ignores `q` altogether degrades
-# to "too many matches, pass an id" — never to acting on the wrong record.
+# writes invoices.
+#
+# "A server that ignores `q` degrades to too many matches" was written here
+# once and was NOT true: it holds only when two rows of the returned PAGE
+# match. One row on a page of 100 out of a meta.total of 4000 looked unique and
+# was written to. What makes the claim true is _refuse_if_truncated, which
+# compares meta.total against the rows actually examined — so the honest
+# statement is: a lookup that could not see every candidate refuses outright.
 _res_path() {
   case "$1" in
     clients)   printf '/api/v3/clients' ;;
@@ -1215,12 +1242,56 @@ _url_last_id() {
   printf '%s' "$last"
 }
 
-# _resolve_ref RESOURCE ARG → sets UKU_REF_ID (dies in the CURRENT shell, so
-# never call it inside $( ) — a die there would be swallowed).
+# _ref_clean REF → the ref with surrounding whitespace removed.
+#
+# A ref arrives from a shell, a copy-paste or an agent's string interpolation,
+# and all three produce " Acme Ltd\n" sooner or later. Trimming it is not
+# cosmetic: `uku clients patch " " --data …` used to reach the SUBSTRING pass
+# with a single space, match every client whose name contains one, resolve to
+# the first of them and PATCH it. A ref that is only whitespace names nothing.
+_ref_clean() { _trim "$1"; }
+
+# The longest ref this CLI will look at. Two reasons, one number:
+#   * a name is a name — no record in an accounting system is called 4 KB of
+#     text, so a ref past this length is a mistake or an injection, not a query;
+#   * _urlencode is a pure-bash per-character loop, so encoding a ref is
+#     QUADRATIC: a 10 KB ref measured 11s of CPU before the CLI sent a 30 KB
+#     query string that no server would match anyway.
+UKU_REF_MAX=200
+
+# --by-id / --by-name: the user's own answer to "did you mean the id or the
+# name?". Empty means "decide by shape", which is the behaviour for a read.
+UKU_BY=""
+
+# _resolve_ref RESOURCE ARG [MODE] → sets UKU_REF_ID (dies in the CURRENT
+# shell, so never call it inside $( ) — a die there would be swallowed).
+#
+# MODE is `read` (default) or `write`, and the difference is deliberate and
+# documented (`uku help names`, README, the skill):
+#
+#   read   an id-shaped ref is used as an id, with no request at all. If it was
+#          really a name, the worst case is a 404 — nothing is changed.
+#   write  an id-shaped ref is ALSO probed for a record whose NAME is that
+#          exact string, because `12345678`, `CAFE-1` and `DECADE` are all
+#          id-shaped AND all plausible names — a Nordic registry code is how a
+#          firm refers to a client every day. If both readings exist, the CLI
+#          refuses and the user says which with --by-id / --by-name. One extra
+#          GET is a fair price on a write: writes are rare and deliberate, and
+#          the alternative is PATCHing a record nobody named.
+#
+# The probe is DEFERRED (see _ref_probe_now) so that a write refused for want
+# of --yes still sends nothing at all.
 UKU_REF_ID=""
+UKU_REF_PROBE_RES=""
+UKU_REF_PROBE_ARG=""
 _resolve_ref() {
-  local res="$1" arg="$2"
-  UKU_REF_ID=""
+  local res="$1" arg="$2" mode="${3:-read}"
+  UKU_REF_ID=""; UKU_REF_PROBE_RES=""; UKU_REF_PROBE_ARG=""
+  arg="$(_ref_clean "$arg")"
+  [ -n "$arg" ] || die "that $(_res_one "$res") reference is empty (or only whitespace), so it names nothing. Nothing was sent." "$EX_USAGE" "@@$res.list"
+  if [ "${#arg}" -gt "$UKU_REF_MAX" ]; then
+    die "that $(_res_one "$res") reference is ${#arg} characters long; the limit is $UKU_REF_MAX. A name that long is a mistake, not a record. Nothing was sent." "$EX_USAGE" "@@$res.list"
+  fi
   if _is_url "$arg"; then
     load_creds
     local want got id
@@ -1234,9 +1305,48 @@ _resolve_ref() {
     _say_resolved "$(_res_one "$res") $id — the last id in the URL you pasted (host $got)"
     return 0
   fi
-  # An id costs nothing: no request, no lookup, no ambiguity.
-  if _looks_like_id "$arg"; then UKU_REF_ID="$arg"; return 0; fi
+  # The user said which meaning they wanted; there is nothing left to decide.
+  if [ "$UKU_BY" = "id" ]; then UKU_REF_ID="$arg"; return 0; fi
+  if [ "$UKU_BY" = "name" ]; then _resolve_name "$res" "$arg"; return 0; fi
+  if _looks_like_id "$arg"; then
+    # A read costs nothing: no request, no lookup, no ambiguity. A write queues
+    # the collision probe instead — run once the write is actually going ahead.
+    UKU_REF_ID="$arg"
+    if [ "$mode" = "write" ]; then UKU_REF_PROBE_RES="$res"; UKU_REF_PROBE_ARG="$arg"; fi
+    return 0
+  fi
   _resolve_name "$res" "$arg"
+}
+
+# _ref_probe_now — run the queued id/name collision probe, if any.
+#
+# Called from write_resource AFTER confirm_write, so a write refused for want
+# of --yes still sends nothing; and with UKU_DRY=0, because the probe is a
+# harmless GET whose whole purpose is to make the previewed write correct.
+_ref_probe_now() {
+  local res="$UKU_REF_PROBE_RES" q="$UKU_REF_PROBE_ARG"
+  UKU_REF_PROBE_RES=""; UKU_REF_PROBE_ARG=""
+  [ -n "$res" ] || return 0
+  local fld path
+  fld="$(_name_field "$res")"
+  [ -n "$fld" ] || return 0   # nothing here has a name, so nothing can collide
+  # Same unkeepable-promise rule as _resolve_name: without jq the CLI cannot
+  # compare a field exactly, so it cannot prove the ref is unambiguous. It says
+  # so and points at the flag that decides, rather than writing on a guess.
+  have jq || die "'$q' is id-shaped, but it could also be the $fld of a $(_res_one "$res") — and checking that needs jq, which is not on this box. Pass --by-id to mean the id. Nothing was written." "$EX_USAGE" @@ref.ambiguous
+  path="$(_res_path "$res")"
+  local rc=0
+  _UKU_NO_HEAL=1 UKU_SOFT=1 UKU_DRY=0 do_request GET "$path$(build_query q="$q" limit=100)" || rc=$?
+  [ "$rc" = "0" ] || die "could not reach $UKU_BASE to check whether '$q' is also a $(_res_one "$res") name (network error). Nothing was written." "$EX_NET" @@doctor
+  check_status "$REPLY_BODY"
+  local hits n listing
+  hits="$(_match_rows "$REPLY_BODY" "$fld" "$q" exact)"
+  n="$(_count_lines "$hits")"
+  [ "$n" = "0" ] && return 0
+  listing="$(printf '%s' "$hits" | head -n 10 | awk -F'\t' 'NF { printf "    %s  %s\n", $1, $2 }')"
+  die "'$q' is id-shaped, but it is ALSO the exact $fld of $n $(_res_n "$n" "$res") — refusing to guess which you meant. Nothing was written.
+$listing
+Say which: --by-id writes to the $(_res_one "$res") whose id is '$q'; --by-name resolves the $fld." "$EX_USAGE" @@ref.ambiguous
 }
 
 # _resolve_name RESOURCE NAME → sets UKU_REF_ID, or dies having written nothing.
@@ -1254,23 +1364,25 @@ _resolve_name() {
   path="$(_res_path "$res")"
   load_creds; need_auth
   local rc=0
-  _UKU_NO_HEAL=1 UKU_SOFT=1 do_request GET "$path$(build_query q="$q" limit=100)" || rc=$?
+  # UKU_DRY=0 deliberately: this is a READ, and do_request's --dry-run branch
+  # prints-and-exits on the FIRST request — which, since resolution moved in
+  # front of the write, meant `--dry-run` previewed the resolution GET and
+  # exited 0, showing the user a request they did not ask about instead of the
+  # write they did. Letting the lookup run is what makes the preview true.
+  _UKU_NO_HEAL=1 UKU_SOFT=1 UKU_DRY=0 do_request GET "$path$(build_query q="$q" limit=100)" || rc=$?
   [ "$rc" = "0" ] || die "could not reach $UKU_BASE to look up '$q' (network error). Nothing was sent." "$EX_NET" @@doctor
   check_status "$REPLY_BODY"
+  _refuse_if_truncated "$res" "$q" "$REPLY_BODY"
 
   local rows exact n
-  rows="$(printf '%s' "$REPLY_BODY" | jq -r --arg f "$fld" '.data[]? | "\(.id)\t\((.[$f] // "-") | tostring)"' 2>/dev/null || true)"
-  # ascii_downcase is jq's only case fold — matching is case-insensitive for
-  # ASCII and exact for everything else. Said here rather than pretended away.
-  exact="$(printf '%s' "$rows" | awk -F'\t' -v v="$q" '
-    BEGIN { lv = tolower(v) } NF && tolower($2) == lv { print }')"
+  rows="$(_match_rows "$REPLY_BODY" "$fld" "$q" all)"
+  exact="$(_match_rows "$REPLY_BODY" "$fld" "$q" exact)"
   n="$(_count_lines "$exact")"
   if [ "$n" = "1" ]; then _use_match "$res" "$exact"; return 0; fi
   if [ "$n" -gt 1 ]; then _refuse_ambiguous "$res" "$q" "exactly" "$exact"; fi
 
   local partial
-  partial="$(printf '%s' "$rows" | awk -F'\t' -v v="$q" '
-    BEGIN { lv = tolower(v) } NF && index(tolower($2), lv) { print }')"
+  partial="$(_match_rows "$REPLY_BODY" "$fld" "$q" substr)"
   n="$(_count_lines "$partial")"
   if [ "$n" = "1" ]; then _use_match "$res" "$partial"; return 0; fi
   if [ "$n" -gt 1 ]; then _refuse_ambiguous "$res" "$q" "on" "$partial"; fi
@@ -1283,6 +1395,59 @@ _resolve_name() {
   [ -n "$near" ] && msg="$msg The closest $(_res_many "$res") that '$q' brought back:
 $near"
   die "$msg" "$EX_USAGE" @@search.run "'$q'"
+}
+
+# _match_rows BODY FIELD QUERY MODE(exact|substr|all) → "id<TAB>name" lines.
+#
+# Both halves of this are load-bearing, and both replace something that was
+# measurably wrong:
+#
+#  * THE MATCH HAPPENS IN jq, not in awk. `awk -v v="$q"` processes escape
+#    sequences in the assignment, so a ref containing a backslash was compared
+#    against something the user never typed: `AB\nCD` could never match the
+#    record actually called `AB\nCD`, and the refusal then listed the very
+#    record it had refused. The same mechanism can also CREATE a match. jq's
+#    --arg is a value, not a program fragment, so neither happens.
+#
+#  * THE ROW IS CONTROL-CHARACTER-SAFE. `jq -r '"\(.id)\t\(.name)"'` emits a
+#    raw newline for a name that contains one, so a client imported as
+#    "Acme\nHoldings" became TWO rows: the fragment "Acme" won the match, the
+#    write went to that record's id, and the CLI announced a name the record
+#    does not have. Imported data with stray newlines and tabs is ordinary.
+#    Matching still uses the RAW field; only the row printed is cleaned.
+#
+# ascii_downcase is jq's only case fold — matching is case-insensitive for
+# ASCII and exact for everything else. Said here rather than pretended away.
+_match_rows() {
+  printf '%s' "$1" | jq -r --arg f "$2" --arg v "$3" --arg m "$4" '
+    def clean: gsub("[[:cntrl:]]"; " ");
+    ($v | ascii_downcase) as $lv
+    | .data[]? | select(type == "object")
+    | ((.[$f] // "-") | tostring) as $nm
+    | select($m == "all"
+             or (if $m == "exact" then ($nm | ascii_downcase) == $lv
+                 else (($nm | ascii_downcase) | index($lv)) != null end))
+    | "\(((.id // "") | tostring | clean))\t\($nm | clean)"' 2>/dev/null || true
+}
+
+# _refuse_if_truncated RESOURCE QUERY BODY — refuse when the lookup saw less
+# than the server says exists.
+#
+# The doctrine one line up ("a server that ignores `q` degrades to too many
+# matches — never to acting on the wrong record") only holds when two rows in
+# the page match. With `meta.total: 4000` and ONE row on page one, `uku clients
+# patch "Smith"` resolved to that row and wrote to it: unique in the page,
+# nowhere near unique in the firm. meta.total is already in the body we hold,
+# so the check costs nothing — and "I only looked at 100 of 4000" is the
+# honest thing to say rather than a match nobody can prove is the only one.
+_refuse_if_truncated() {
+  local res="$1" q="$2" body="$3" total shown
+  total="$(printf '%s' "$body" | jq -r '.meta.total // empty' 2>/dev/null || true)"
+  shown="$(printf '%s' "$body" | jq -r '(.data | length) // 0' 2>/dev/null || true)"
+  case "$total" in ''|*[!0-9]*) return 0 ;; esac   # no total → nothing to compare
+  case "$shown" in ''|*[!0-9]*) shown=0 ;; esac
+  [ "$total" -gt "$shown" ] || return 0
+  die "looking up '$q' saw $shown of $total $(_res_many "$res") — the other $((total - shown)) were never examined, so no match here can be shown to be the only one. Nothing was written." "$EX_USAGE" @@name.truncated
 }
 
 # _count_lines TEXT → the number of non-empty lines (0 for "").
@@ -1308,7 +1473,7 @@ _refuse_ambiguous() { # RESOURCE QUERY HOW "id<TAB>name…"
   listing="$(printf '%s' "$4" | head -n 10 | awk -F'\t' 'NF { printf "    %s  %s\n", $1, $2 }')"
   [ "$(_count_lines "$4")" -gt 10 ] && listing="$listing
     …"
-  die "$n $(_res_many "$1") match '$2' $3 — refusing to guess which one you mean. Nothing was sent.
+  die "$n $(_res_n "$n" "$1") match '$2' $3 — refusing to guess which one you mean. Nothing was sent.
 $listing" "$EX_USAGE" @@name.ambiguous
 }
 
@@ -1379,7 +1544,7 @@ _after_list() { # PATH BODY
   case "$cnt" in ''|-1) cnt="" ;; esac
   if [ -n "$rescmd" ]; then
     if [ "$cnt" = "1" ]; then UKU_SUMMARY="1 $(_res_one "$rescmd")"
-    else UKU_SUMMARY="${cnt:-0} $(_res_many "$rescmd")"; fi
+    else UKU_SUMMARY="${cnt:-0} $(_res_n "${cnt:-0}" "$rescmd")"; fi
   else
     UKU_SUMMARY="${cnt:-0} record(s)"
   fi
@@ -1705,6 +1870,9 @@ write_resource() {
   local payload; payload="$(read_data "$UKU_DATA")"
   _validate_json "$payload"
   confirm_write "$label"
+  # AFTER the confirm, on purpose: a write refused for want of --yes must still
+  # have sent nothing at all, and this probe is a request.
+  _ref_probe_now
   do_request "$method" "$path" "$payload"
   check_status "$REPLY_BODY"
   _after_write "$method" "$path" "$REPLY_BODY"
@@ -1797,7 +1965,18 @@ _json_str() {
 # local refusal, never an observed outcome, so it decides nothing here.
 # Backward compatible with ledgers written by v0.3.0: they hold the same rows,
 # and one with no `fail` row at all still reads `send`-without-`ok` as UNKNOWN.
-_ledger_file() { printf '%s/%s' "$(_batch_dir)" "$1"; }
+# A run-id names ONE file inside the batch directory; it is never a path. This
+# guard is the last line, not the first — every caller validates too — but it
+# is the one that cannot be bypassed by a new caller forgetting to. It shipped
+# missing once: `uku batch show ../profiles/default` printed a live
+# `UKU_KEY=uku_live_…` on stdout and exited 0, in v0.3.0, contradicting this
+# file's own header, the surface note and the skill's "never print the key".
+# The CLI now installs a skill telling agents to run `uku batch show <run-id>`
+# from a breadcrumb, so an untrusted run-id is a real path into a transcript.
+_ledger_file() {
+  _valid_name "$1" || die "invalid run-id '$1' — a run-id names a ledger file (letters, digits, . _ -), never a path. Nothing was read." "$EX_USAGE" @@batch.list
+  printf '%s/%s' "$(_batch_dir)" "$1"
+}
 _ledger_init() {  # RUNID METHOD PATH SOURCE
   local f; f="$(_ledger_file "$1")"
   mkdir -p "$(_batch_dir)" 2>/dev/null || return 0
@@ -2166,6 +2345,12 @@ cmd_batch() {
       ;;
     show)
       local rid="${1:-}"; [ -n "$rid" ] || die "usage: uku batch show <run-id>" "$EX_USAGE" @@batch.list
+      # `run_batch` has always validated the run-id it derives or is given; this
+      # path took the user's string straight to _ledger_file, so a run-id with a
+      # `/` in it read (and printed) any file — `../profiles/default` is a
+      # credential file. _ledger_file now refuses too; this check is here so the
+      # refusal is a clean usage error rather than a swallowed one inside $( ).
+      _valid_name "$rid" || die "invalid run-id '$rid' (letters, digits, . _ -). A run-id names a ledger under $(_batch_dir); it is never a path, and this command reads nothing else." "$EX_USAGE" @@batch.list
       local fpath; fpath="$(_ledger_file "$rid")"
       [ -f "$fpath" ] || die "no such batch run: $rid" "$EX_USAGE" @@batch.list
       cat "$fpath"
@@ -2179,7 +2364,7 @@ cmd_clients() {
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/clients id name status type ;;
     get)  [ -n "${2:-}" ] || die "usage: uku clients get <client_id|name|url>" "$EX_USAGE" @@help.topic clients; _resolve_ref clients "$2"; get_resource "/api/v3/clients/$UKU_REF_ID" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/clients "create a client" ;;
-    patch)  [ -n "${2:-}" ] || die "usage: uku clients patch <id|name|url> --data @f" "$EX_USAGE" @@help.topic clients; _resolve_ref clients "$2"; local id="$UKU_REF_ID"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/clients/$id" "update client $id" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku clients patch <id|name|url> --data @f" "$EX_USAGE" @@help.topic clients; _resolve_ref clients "$2" write; local id="$UKU_REF_ID"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/clients/$id" "update client $id" ;;
     *) die "usage: uku clients <list|get|create|patch>" "$EX_USAGE" @@help.topic clients ;;
   esac
 }
@@ -2188,7 +2373,7 @@ cmd_tasks() {
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/tasks id title status client_id ;;
     get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id|title|url>" "$EX_USAGE" @@help.topic tasks; _resolve_ref tasks "$2"; get_resource "/api/v3/tasks/$UKU_REF_ID" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/tasks "create a task" ;;
-    patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id|title|url> --data @f  (e.g. status/date)" "$EX_USAGE" @@help.topic tasks; _resolve_ref tasks "$2"; local id="$UKU_REF_ID"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id|title|url> --data @f  (e.g. status/date)" "$EX_USAGE" @@help.topic tasks; _resolve_ref tasks "$2" write; local id="$UKU_REF_ID"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
     *) die "usage: uku tasks <list|get|create|patch>" "$EX_USAGE" @@help.topic tasks ;;
   esac
 }
@@ -2616,8 +2801,8 @@ _surface_table() {
 auth        |              | login status logout print-header | print-headers | --account --company --base --key-stdin --format --shell |                                                 | `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api` :: `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored :: `--shell` is shorthand for `--format shell`
 account     | accounts     | list add use current remove | ls switch who rm | --company --key-stdin                               | use <name> :: add <name> :: remove <name>       | `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list` :: `add` is sugar for `uku auth login --account <name>` :: run `uku account current` before any write — a sandbox and the real firm look identical in the output
 setup       | setup-agents | agents                  |                |                                                         |                                                 | UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
-clients     | client       | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id> :: get/patch also take a client NAME or a pasted URL | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read :: `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks` :: `--client` is not a filter here (you are already listing clients) — use `--q`
-tasks       | task         | list get !create !patch |                | @list --client @data @bulk                              | get <task_id> :: patch <task_id> :: get/patch also take a task TITLE or a pasted URL | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from :: an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates :: `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand :: that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs :: neither resolution happens on a write, in a `--batch`, or for an argument that already looks like an id
+clients     | client       | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id> :: get/patch also take a client NAME or a pasted URL | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read :: `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks` :: on `patch`, an id-shaped argument costs one extra GET: it is checked against client NAMES too, because `12345678` and `CAFE-1` are both — `--by-id` skips the check :: `--client` is not a filter here (you are already listing clients) — use `--q`
+tasks       | task         | list get !create !patch |                | @list --client @data @bulk                              | get <task_id> :: patch <task_id> :: get/patch also take a task TITLE or a pasted URL | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from :: an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates :: `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand :: that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs :: NAME resolution never happens in a `--batch`, and never for an argument that already looks like an id — but on a WRITE an id-shaped argument is still PROBED for a record whose name is that exact string (one extra GET), and a collision is refused until `--by-id` or `--by-name` says which was meant; on a read the id-shaped argument passes straight through with no request :: a name lookup reads at most 100 records and compares `meta.total` against them: when more could exist than were examined it refuses, because a match it cannot see the alternatives to is not a unique one
 time        |              | list get !create        |                | @list --client @data @bulk                              | get <id> :: get also takes a pasted URL (no name field here) | there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>` :: `create` needs task_id, person_id and start :: `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending :: a time entry has no name, so `get` takes an id or a pasted URL — never a name
 invoices    | invoice      | list get !create        |                | @list --client @data @bulk                              | get <invoice_id> :: get also takes a pasted URL (no name field here) | money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it :: there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>` :: an invoice has no name field, so `get` takes an id or a pasted URL — never a name
 members     | member       | list get                |                | @list                                                   | get <id> :: get also takes a member NAME or a pasted URL | read-only in the CLI — member writes go through `uku api` :: `get` also takes a member NAME (resolved through `--q`) or a pasted URL
@@ -2633,7 +2818,7 @@ update      |              |                         |                |         
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
 help        |              | auth account setup clients tasks time invoices members products contracts projects batch api search names | | |  <command>                                   | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
-%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields --account --base --header -H --if-match --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs}; `--json` stays the RAW API body and never changes :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
+%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which
 TABLE
 }
 
@@ -2957,8 +3142,28 @@ $(_bold "HOW A NAME IS RESOLVED")  (one request, on the endpoint the command alr
       In a firm dozens of records legitimately share a name; picking one would
       be picking wrong, and this CLI writes invoices.
     • no match           → refused, with whatever the query did bring back.
+    • more records exist than the lookup could see → $(_bold "refused"). It reads at
+      most 100 and compares that against the \`meta.total\` the API reports; one
+      row out of a stated 4000 is not a unique match, it is the first page.
+  A name is trimmed before anything looks at it, an empty or whitespace-only
+  reference is refused, and one longer than $UKU_REF_MAX characters is refused as a
+  mistake rather than encoded into a query string.
   Resolving needs jq (it compares a field exactly). Without jq it refuses
   rather than guess — pass an id.
+
+$(_bold "WHEN AN ARGUMENT IS BOTH")  --by-id · --by-name
+  \`12345678\`, \`CAFE-1\` and \`DECADE\` are id-shaped AND perfectly good names —
+  a Nordic registry code is how a firm names a client every day. So:
+    • $(_bold "on a read") an id-shaped argument is taken as an id, with no request at
+      all. If it was really a name the worst case is a 404 and you try again.
+    • $(_bold "on a write") it is ALSO looked up as a name (one extra GET, after the
+      \`--yes\` confirm, so a refused write still sends nothing). If a record's
+      name is that exact string, the write is $(_bold "refused") — both readings are
+      real and guessing between them is how the wrong ledger gets written.
+  Say which you meant and it proceeds:
+    uku clients patch 12345678 --by-id   --data @f.json --yes
+    uku clients patch 12345678 --by-name --data @f.json --yes
+  Without jq the check cannot be made, so the write is refused until --by-id.
 
 $(_bold "WHICH RESOURCES")  clients (name) · tasks (title) · members, products,
   projects (name). An invoice, a contract and a time entry have no name field,
@@ -2970,9 +3175,9 @@ $(_bold "A URL YOU PASTED")
   the last id-shaped segment — the command already names the resource, so no
   knowledge of the web app's routes is involved.
 
-$(_bold "WHAT NEVER RESOLVES")  an argument that already looks like an id (no
-  request at all) · a write body · any line of a --batch. A batch line carries
-  its own fields; guessing an id into one would be inventing data.
+$(_bold "WHAT NEVER RESOLVES")  an argument that already looks like an id on a
+  READ (no request at all) · a write body · any line of a --batch. A batch line
+  carries its own fields; guessing an id into one would be inventing data.
 EOF
     ;;
     search) cat <<EOF
@@ -3070,10 +3275,10 @@ uku clients list --limit 2 --agent
  "summary":"2 clients",
  "breadcrumbs":[{"cmd":"uku clients get 41","why":"that client in full"}]}
 ```
-- `data` and `meta` are **exactly what the API returned**, so `.data` means what it always meant.
+- `data` and `meta` are the API's own values, spliced out of its body — the same values `--json` gives you. The one exception is `--fields`, which projects each row to the keys you named and re-serialises it through jq; ask for `--fields` and you are asking for a reshaped `.data`.
 - On failure: `{"ok":false,"error":"…","code":"auth","hint":"uku auth login"}` — and **the exit code is unchanged**. `code` is the stable name of the exit status (`usage` `auth` `api` `confirm` `network` `conflict`), so branch on either.
-- `breadcrumbs` are the commands most plausibly next, with real ids already filled in. They are checked against the CLI's own command surface at build time, so a breadcrumb never names a command that does not exist — you may run one without checking it first. `--no-hints` or `--quiet` empties the array.
-- A `--batch` run keeps its JSONL-per-line output under `--agent`: that stream is already the machine contract, and one envelope could not describe N independent outcomes.
+- `breadcrumbs` are the commands most plausibly next, with real ids already filled in. They are checked against the CLI's own command surface at build time, so a breadcrumb never names a command that does not exist. That is all it proves: a breadcrumb may still be a WRITE (`uku clients get 41` suggests `uku clients patch 41`), and a write always needs the same treatment as any other — state what it would change and let the human confirm before you add `--yes`. Read the command before you run it. `--no-hints` or `--quiet` empties the array.
+- A `--batch` run keeps its JSONL-per-line output under `--agent`: that stream is already the machine contract, and one envelope could not describe N independent outcomes. So there is **no `{"ok":…}` envelope at all** for a batch — including on failure, where the run exits **3** and the per-line objects are the only report. Parse the lines, not an envelope.
 
 ### `uku --help --agent` — discover the CLI instead of guessing
 ```
@@ -3091,7 +3296,7 @@ The `notes` are the gotchas — above all the negative kind (which subcommand do
 - `uku search <query>` — one `--q` fanned out over the list endpoints that have a name field. See below; it is **not** a global search endpoint.
 - `uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]` — every one of the 80+ v3 endpoints. Use this for anything without a first-class command.
 - Singular aliases work everywhere: `uku client get 41` = `uku clients get 41` (also `task`, `invoice`, `member`, `product`, `project`, `contract`).
-- Global: `--header 'K: V'` (repeatable) · `--if-match '<etag>'` · `--dry-run` (prints the request, sends nothing) · `--agent` (the envelope above) · `--no-hints`.
+- Global: `--header 'K: V'` (repeatable) · `--if-match '<etag>'` · `--dry-run` (prints the request, sends nothing — a name/id lookup still runs, so the request you are shown is the write itself, with the resolved id in the path) · `--agent` (the envelope above) · `--no-hints` · `--by-id` / `--by-name` (see below).
 - `uku auth print-header` — the raw auth headers, for the rare case `uku api` can't express something. It prints a **live credential**: never echo it back to the user, never put it in a file you commit, and prefer `uku api`.
 
 ## Naming a record you have no id for
@@ -3106,11 +3311,12 @@ uku clients get 'https://<same host as the account>/…/41'
 uku tasks list --client "Acme Ltd"    # resolves once, then filters by client_id
 ```
 
-- **How a name resolves:** the CLI sends the same `--q` a list takes, on the endpoint the command already names, then matches exact (ASCII case-insensitive) then unique substring. **Exactly one match** is used and the chosen record + id are printed on stderr. **Several matches → refused** (exit 1) with the candidates listed: pick one and re-run with its id — do not retry the same name, and never pick one yourself by re-running with a longer guess unless the user confirms it. **No match → refused.** Resolving needs `jq`.
+- **How a name resolves:** the CLI sends the same `--q` a list takes, on the endpoint the command already names, then matches exact (ASCII case-insensitive) then unique substring. **Exactly one match** is used and the chosen record + id are printed on stderr. **Several matches → refused** (exit 1) with the candidates listed: pick one and re-run with its id — do not retry the same name, and never pick one yourself by re-running with a longer guess unless the user confirms it. **No match → refused.** **More records than the lookup could see → refused**: it reads at most 100 and compares that against `meta.total`, so one row out of a stated 4000 is the first page, not a unique match — narrow the name or pass the id. Resolving needs `jq`. An empty or whitespace-only argument, and one over 200 characters, are refused before anything is sent.
 - **Which resources have a name to match:** clients (`name`), tasks (`title`), members, products, projects (`name`). An invoice, a contract and a time entry have **no** name field — there, only an id or a URL works.
 - **A URL** must be on the same host as the account's base URL; anything else is refused and nothing is sent. The id taken is the last id-shaped segment.
-- **Never resolved:** an argument that already looks like an id (no request is made), a write body, or any line of a `--batch`. `--client` on a write or a batch is a usage error.
-- **`--client` verifies itself.** After the response comes back the CLI compares `client_id` on every returned row against the one asked for. A mismatch means the endpoint ignored the filter, and the command fails with **exit 3** — so a `--client` result that succeeded really is that client's data. Do not work around that error by re-running without `--client` and presenting the rows as the client's; they are not.
+- **Never resolved by name:** a write body, or any line of a `--batch`. `--client` on a write or a batch is a usage error.
+- **`--by-id` / `--by-name` — when the argument is both.** `12345678`, `CAFE-1` and `DECADE` are id-shaped *and* perfectly good names; a registry code is how a firm names a client every day. On a **read**, an id-shaped argument is taken as an id with no request at all. On a **write** it is *also* looked up as a name (one extra GET, after the `--yes` confirm, so a refused write still sends nothing); if a record's name is that exact string the write is **refused** (exit 1) rather than aimed at a guess. Do not pick for the user: pass `--by-id` (treat it as an id) or `--by-name` (resolve it as a name) only once you know which they meant, and say which you used.
+- **`--client` verifies itself.** After the response comes back the CLI compares `client_id` on every returned row against the one asked for. A mismatch means the endpoint ignored the filter, and the command fails with **exit 3**. What that proves is narrow and worth being exact about: the API honoured `client_id` **for the id it was sent**. It cannot prove that id is the client the user named — that is the job of the resolution line printed on stderr (`→ client 41 — Acme Ltd`), which you should read back to the user. Do not work around the exit 3 by re-running without `--client` and presenting the rows as the client's; they are not.
 
 ## `uku search <query>` — what it is and is not
 
@@ -3142,7 +3348,7 @@ Read the status, not the vibe. Each of these means something different:
 | **428** PRECONDITION_REQUIRED | The server refused the write for want of an `If-Match`. **Nothing happened.** | Safe to re-send once with the ETag. **The CLI does this for you when the path names a record** (`PATCH /contracts/{id}`, `POST /contracts/{id}/rows`, `DELETE …/{id}`), automatically and only once. On a **collection POST** (`POST /api/v3/tasks`) there is no record to read an ETag from, so it is not healed: GET the relevant resource and pass `--if-match '<etag>'` yourself. If a heal still fails, do the same. |
 | **412** STALE_WRITE (exit **6**) | Someone else changed the record after you read it. **Nothing was written.** | **STOP.** Re-read the record, re-apply your change on top of the *current* values, then write again. **Never** retry automatically — a blind retry silently overwrites their edit. Tell the user what changed. |
 | **429** rate limited (exit **5**) | Outcome **unknown** for a write. | **Never auto-retry a write.** GET to check whether it landed. The message tells you how many seconds until the window resets — wait, don't poll. Reads are safe and the CLI already waits once for you. |
-| **5xx / timeout** (exit 3/5) | Outcome **unknown**. | Same as 429: GET first, never blind-resend a write. |
+| **5xx / timeout** (exit 3/5) | On a **write**, outcome **unknown**. On a **read**, nothing was written. | Write: same as 429 — GET first, never blind-resend. Read: nothing happened, so re-running the same read once the server recovers is safe. The CLI's own remedy line now says which case you are in. |
 | **409** domain conflict | The action isn't allowed right now (`*_LOCKED`, `*_EXISTS`, `TIMER_ALREADY_RUNNING`). | Re-sending the identical request fails identically. Change the request or tell the user. |
 
 **Reads are idempotent; the CLI re-issues one at most once, and only when the connection itself failed — an HTTP status is never re-sent for you. A write is re-sent automatically in exactly one case — a 428 on a path that names a record, where the server refused it and nothing happened. You must never resend any other failed write yourself: outside a 428 the outcome is unknown, so GET first.**
@@ -3385,7 +3591,9 @@ $(_bold "GLOBAL FLAGS")
                     uku <command> --help --agent  describes the CLI itself.
   --no-hints        Drop the "Next:" breadcrumb footer (--quiet and --json do too)
   --yes, -y         Confirm a non-interactive write
-  --dry-run         Print the request (headers masked) and send nothing
+  --dry-run         Print the request (headers masked) and send nothing. A name
+                    or id lookup still runs — it is a read — so what you are
+                    shown is the write itself, with the resolved id in the path
   --all             Page through every row (keeps your filters)
   --fields a,b      Keep only these fields: table columns on a TTY, and the keys
                     each row is reduced to in JSON (needs jq)
@@ -3406,6 +3614,12 @@ $(_bold "GLOBAL FLAGS")
                     then CHECKED: if any row comes back belonging to another
                     client, the endpoint ignored the filter and the command
                     fails (exit 3) instead of passing off an unfiltered list
+  --by-id, --by-name  Say how to read the argument that names a record, when it
+                    could be either. A client called "12345678" or "CAFE-1" is
+                    id-shaped AND a name; on a WRITE the CLI checks for that
+                    collision and refuses rather than pick. --by-id takes the
+                    argument as an id (no lookup); --by-name resolves it as a
+                    name. See: uku help names
   --account <name>  Run against a specific account (default: the active one)
   --base <url>      Override the API base URL
   --header, -H 'K: V'  Add a request header (repeatable; off argv, like the key)
@@ -3458,6 +3672,8 @@ while [ $# -gt 0 ]; do
     --if-match) _need_val "$@"; _check_header_arg "If-Match: $2"; UKU_IF_MATCH="$2"; shift 2 ;;
     -y|--yes) UKU_YES=1; shift ;;
     --dry-run) UKU_DRY=1; shift ;;
+    --by-id)   if [ "$UKU_BY" = "name" ]; then die "--by-id and --by-name are opposites; pass one." "$EX_USAGE" @@help.root; fi; UKU_BY=id; shift ;;
+    --by-name) if [ "$UKU_BY" = "id" ];   then die "--by-id and --by-name are opposites; pass one." "$EX_USAGE" @@help.root; fi; UKU_BY=name; shift ;;
     --quiet|-q) UKU_QUIET=1; shift ;;
     --no-color) NO_COLOR=1; export NO_COLOR; shift ;;
     --fields) _need_val "$@"; UKU_FIELDS="$2"; shift 2 ;;

@@ -108,7 +108,11 @@ assert_request_count 1 'a 500 write is sent exactly once'
 assert_err_contains 'HTTP 500' 'the status is reported'
 
 reset_requests
-uku clients patch 5 --data '{"name":"x"}' --yes
+# --by-id: `clients patch <id>` now PROBES an id-shaped argument for a client
+# whose NAME is that string (tests/cases/ref-safety.sh §1). That probe is a GET
+# on the list endpoint, which this fixture deliberately answers 401/500 — so the
+# flag says "this really is an id" and keeps the test about the code under test.
+uku clients patch 5 --by-id --data '{"name":"x"}' --yes
 assert_status 3 'a 503 on a write is an API error'
 assert_request_count 1 'a 503 write is sent exactly once'
 teardown_case

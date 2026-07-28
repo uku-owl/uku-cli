@@ -141,11 +141,41 @@ back: exact first (case-insensitive for ASCII), then a unique substring.
   turned out to have 18 records. Guessing between them is the one thing a tool
   that writes invoices must never do.
 * **no match** → refused, with whatever the query *did* bring back.
+* **more records than the lookup could see** → **refused**. It reads at most 100 and
+  compares that against the `meta.total` the API reports. One row out of a stated
+  4000 is the first page, not a unique match — and a server that ignores `q`
+  altogether lands exactly here rather than on the wrong record.
 
-Resolving costs one request, and only when it has to: an argument that already
-looks like an id goes straight through, and nothing is ever resolved inside a
-`--batch` line. It needs `jq` (it compares a field exactly); without `jq` it
-refuses rather than guess.
+The argument is trimmed before anything looks at it; an empty or whitespace-only
+reference names nothing and is refused, and one longer than 200 characters is
+refused as a mistake rather than percent-encoded into a query string.
+
+Resolving costs one request, and only when it has to: on a **read**, an argument
+that already looks like an id goes straight through, and nothing is ever resolved
+inside a `--batch` line. It needs `jq` (it compares a field exactly); without `jq`
+it refuses rather than guess.
+
+#### When the argument is both — `--by-id` / `--by-name`
+
+`12345678`, `CAFE-1` and `DECADE` are id-shaped **and** perfectly good names; a
+Nordic registry code is how a firm refers to a client every day. The two readings
+are treated differently, on purpose:
+
+* on a **read**, an id-shaped argument is taken as an id, with no request at all. If
+  it was really a name, the worst case is a 404 and you try again.
+* on a **write**, it is *also* looked up as a name — one extra GET, run *after* the
+  `--yes` confirm so a refused write still sends nothing. If a record's name is that
+  exact string, the write is **refused**: both readings are real, and picking one is
+  how the wrong ledger gets written. Writes are rare and deliberate; a request is a
+  fair price for not guessing on one.
+
+```sh
+uku clients patch 12345678 --by-id   --data @f.json --yes   # the record with that id
+uku clients patch 12345678 --by-name --data @f.json --yes   # the record with that name
+```
+
+Without `jq` the collision cannot be checked, so an id-shaped write is refused until
+`--by-id` says which was meant.
 
 Which resources have a name to match is not a guess either — it is the field each
 list command already declares: **clients** (`name`), **tasks** (`title`),
@@ -172,7 +202,11 @@ a filter is the one fact in this feature that could not be verified from the rep
 so the CLI does not take it on trust. Every response is measured against the request:
 if a returned row carries a `client_id` that differs from the one asked for, the
 endpoint ignored the parameter, and the command **fails with exit 3** saying so
-rather than handing back an unfiltered list that looks like an answer. A row with no
+rather than handing back an unfiltered list that looks like an answer. Be exact
+about what that proves: the API honoured `client_id` **for the id it was sent**. It
+cannot prove that id is the client you named — that is what the resolution line on
+stderr (`→ client 41 — Acme Ltd`) is for, and it is printed before the request goes
+out precisely so you can check it. A row with no
 `client_id` field, or a null one, proves nothing and never trips it. The comparison
 needs `jq`, so `--client` refuses up front without it — the same rule name
 resolution follows. The day that endpoint's behaviour changes, you are told.
@@ -286,10 +320,14 @@ without ever being able to move money.
 ## Output & scripting
 
 - `--json` prints the raw API JSON. It is the **default when stdout is not a TTY**,
-  so pipes and agents get JSON automatically. **This never changes shape:** it is
-  the API's body, and `.data` means what the API says it means.
+  so pipes and agents get JSON automatically. It is the API's body, and `.data`
+  means what the API says it means. **One flag changes that, and only that one:**
+  `--fields` reduces each row in `.data` to the keys you named and re-serialises
+  the result through `jq` (which also pretty-prints it). Ask for `--fields` and you
+  are asking for a reshaped `.data`; leave it off and the body is the API's.
 - `--agent` is the second channel — one envelope, for a program that wants the
-  CLI's own reading of what just happened. See below.
+  CLI's own reading of what just happened. See below. **A `--batch` run is the one
+  exception**: it stays JSONL, one object per input line, under `--agent` too.
 - With a TTY and `jq` installed, list commands print a compact table.
 
 ### `--agent` — one envelope, for a program
@@ -309,8 +347,9 @@ uku clients list --limit 2 --agent
  "breadcrumbs":[{"cmd":"uku clients get 41","why":"that client in full"}]}
 ```
 
-`data` and `meta` are **exactly the bytes the API returned** — spliced out, never
-re-serialised — so `.data` means the same thing it means under `--json`.
+`data` and `meta` are spliced out of the API's own body, so `.data` means the same
+thing it means under `--json` — the same caveat and no other: with `--fields`, rows
+are projected and re-serialised through `jq` before they get here.
 
 A failure is the same envelope, inverted, and **the exit code is unchanged**:
 
@@ -330,12 +369,21 @@ exit 2
 `code` is the stable name of the exit status (`ok` `usage` `auth` `api` `confirm`
 `network` `conflict`), so you can branch on either.
 
+**A `--batch` run has no envelope, in either direction.** Its stdout stays JSONL —
+one `{line, outcome, id, status, code, message}` object per input line — under
+`--agent` as well, because one envelope cannot describe N independent outcomes.
+That includes failure: a run with failed lines exits **3** and emits no
+`{"ok":false}` object at all. Parse the lines.
+
 **Breadcrumbs** are the commands you most plausibly want next, with the real ids
 already filled in — the first row of a list, the id of the record you just
 created. On a terminal they are a dim `Next:` footer; under `--agent` they are the
 array above. `--no-hints`, `--quiet` and `--json` all suppress them. Every command
 a breadcrumb can name is checked against the CLI's declared surface at build time,
-so it can never point at something that does not exist.
+so it can never point at something that does not exist. That is all the check
+proves, and it is worth saying plainly: a breadcrumb can still be a **write** —
+`uku clients get 41` offers `uku clients patch 41` as the next step. Read one
+before you run it; the guarantee is that the command exists, not that you want it.
 
 **Hints** do the same job for failures: a second line on stderr saying what to run
 next, and the `hint` field above. Where no honest next step exists there is none.
