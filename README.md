@@ -111,6 +111,88 @@ uku api GET  /api/v3/members --query limit=5
 uku api POST /api/v3/tasks --data @task.json --yes
 ```
 
+## Creating many records — `--batch`
+
+One JSON object per line, one confirm for the whole file, and a ledger that makes
+the run restartable.
+
+```sh
+uku tasks create   --batch @tasks.jsonl --yes
+uku clients create --batch @clients.jsonl --yes
+uku api POST /api/v3/tasks --batch @tasks.jsonl --yes
+cat tasks.jsonl | uku tasks create --batch @- --yes
+```
+
+Blank lines and `#` comments are skipped; a final line without a newline is fine.
+A malformed line fails **by itself** and never aborts the run.
+
+**stdout is JSONL — one result per input line**, so it pipes and greps. Everything
+human (progress, the summary) goes to stderr.
+
+```sh
+uku tasks create --batch @tasks.jsonl --yes | jq -r 'select(.outcome=="failed")'
+{"line":1,"outcome":"created","path":"/api/v3/tasks","id":"19639631","status":201,"code":null,"message":null}
+{"line":2,"outcome":"skipped","path":"/api/v3/tasks","id":"19639632","status":null,"code":"LEDGER_HIT","message":"already created by run liveresume"}
+{"line":3,"outcome":"failed","path":"/api/v3/tasks","id":null,"status":422,"code":"VALIDATION_ERROR","message":"…"}
+```
+
+### The ledger — why `--resume` can be trusted
+
+Every created line is recorded as a **hash of its content** plus the id the server
+returned, appended to `~/.config/uku/batches/<run-id>` the moment the create is
+confirmed — one open-write-close per line, never buffered. Kill the run at any
+point and the ledger is complete up to the last record that actually landed.
+
+```sh
+uku tasks create --batch @tasks.jsonl --yes       # interrupted at line 6 of 8
+uku tasks create --batch @tasks.jsonl --resume --yes
+```
+
+Lines already created are skipped; the rest are created; **nothing is duplicated**.
+The run-id is derived from the target plus a hash of the file, so `--resume` works
+without your having remembered anything (`--run-id NAME` overrides it).
+
+The ledger stores a **hash, never the line** — no client data is written to disk.
+
+`uku batch list` · `uku batch show <run-id>` show what a previous run did.
+
+**One line can be caught in flight**: the request left, the reply never came. That
+line is recorded as *sent*, not created, and `--resume` **refuses to re-send it**
+and says so — the CLI cannot know whether it landed, and guessing would duplicate a
+record. Check that one, then `--retry-unknown` to send it. This is the same doctrine
+the CLI already applies to a `429` or a `5xx` on a write.
+
+### `--skip-existing --match-on <field>` — read this before you use it
+
+It queries the API for a record whose field equals this line's value and skips the
+line if it finds exactly one.
+
+**It is fragile, and the fragility is not hypothetical.** In an accounting firm
+dozens of records legitimately share a title — every client has a
+"Käibedeklaratsioon". Run against a real firm's data while this was being built, a
+title that looked unique in a 200-row sample turned out to have 18 records, and
+"Enter Payroll" matched every row the query returned.
+
+So when more than one record matches, the CLI **refuses that line**
+(`AMBIGUOUS_MATCH`) and records why, rather than silently picking one.
+
+> **The ledger, not `--match-on`, is the trustworthy path to idempotency.** Use
+> `--match-on` only against a field that is genuinely unique in your firm, and only
+> for records this CLI did not create.
+
+### Batch write discipline
+
+| | |
+|---|---|
+| `--yes` | confirms the batch **once** (line count, target, account) — not once per line. Without a TTY and without `--yes` the batch is refused (exit `4`). |
+| a failed line | is recorded and the run **continues**. `--stop-on-error` halts instead. |
+| `412` | fails that line and is **never** auto-retried. |
+| `429` | never becomes a hot loop: the run paces itself through the same limiter as every other write (the write budget is 30/min). If the wait would exceed `UKU_RL_MAX_WAIT` it stops cleanly, tells you when the window resets, and leaves a resumable ledger. |
+| `--dry-run` | validates every line, reports what *would* happen — including which lines the ledger would skip — and sends no write. |
+| exit | `0` all good · `3` some line failed · `5` stopped on the rate limit · `4` refused. |
+
+Full reference: `uku help batch`.
+
 ### Scoped keys — money has its own key
 
 API keys are scoped **Read**, **Edit**, or **All**. Anything financial requires the
@@ -133,7 +215,7 @@ without ever being able to move money.
 | `2`  | not authenticated / credentials rejected |
 | `3`  | the API returned an error status (4xx/5xx) |
 | `4`  | a deliberate write was refused (no `--yes`, no TTY) |
-| `5`  | network error, or rate limited (HTTP 429) |
+| `5`  | network error, or rate limited (HTTP 429); a `--batch` stopped on the rate limit |
 | `6`  | conflict — someone else changed the record (HTTP 412). Re-read and re-apply. |
 
 ## Concurrency: version checks (If-Match / ETag)

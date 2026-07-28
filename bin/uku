@@ -1219,8 +1219,12 @@ run_batch() {
     case "$REPLY_STATUS" in
       2*)
         local nid; nid="$(_body_id "$REPLY_BODY")"
-        created=$((created + 1)); UKU_BATCH_DONE="$created"
+        # Ledger row FIRST, counter second. A signal is delivered between two
+        # commands, and the live proof caught exactly that gap: the handler
+        # reported "6 recorded" when the 6th ledger row had not been written
+        # yet. The number a person is told must never be ahead of the file.
         _ledger_add "$rid" ok "$h" "$path" "${nid:-?}" "$lineno"
+        created=$((created + 1)); UKU_BATCH_DONE="$created"
         _batch_emit "$lineno" created "$nid" "$REPLY_STATUS" "" "" "$path"
         ;;
       *)
