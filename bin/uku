@@ -15,7 +15,7 @@
 #     exit codes, and `uku api` passes through to any endpoint.
 set -euo pipefail
 
-UKU_VERSION="0.2.0"
+UKU_VERSION="0.3.0"
 UKU_BASE_DEFAULT="https://app.getuku.com"
 UKU_CONFIG_HOME="${UKU_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/uku}"
 UKU_PROFILE_DIR="$UKU_CONFIG_HOME/profiles"   # one file per account (0600)
