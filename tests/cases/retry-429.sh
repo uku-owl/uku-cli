@@ -31,8 +31,18 @@ start_server
 uku clients list
 assert_status 0 'a rate-limited read eventually succeeds'
 assert_out_contains '"id": 1' 'the caller gets the successful page'
-assert_err_contains 'waiting 2s for the window to reset, then retrying this read once' \
-  'the CLI announces the wait and the single retry'
+# The number of seconds is deliberately NOT asserted. X-RateLimit-Reset is an
+# absolute timestamp ({{now+2}}); the CLI subtracts the current time when it
+# reads the header, so if the wall clock ticks over between the two the correct
+# answer is 1s, not 2s. Pinning the digit made this case fail roughly once in
+# ten — and a flaky assertion in the gate is worse than no assertion, because it
+# teaches you to shrug at red. What matters is that the CLI says it is waiting
+# for the window and retrying exactly once; the wait itself is proven by the
+# request count below.
+assert_err_contains 'rate limited — waiting' \
+  'the CLI announces that it is waiting on the rate-limit window'
+assert_err_contains 'for the window to reset, then retrying this read once' \
+  'and says it will retry the read exactly once'
 assert_request_count 2 'the 429 reached the CLI itself: one attempt, one retry after the wait'
 teardown_case
 
