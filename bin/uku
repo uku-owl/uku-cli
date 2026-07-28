@@ -56,7 +56,31 @@ _mktemp()  { local f; f="$(mktemp)" || die "cannot create a temp file" "$EX_USAG
 # disk until the process exits. The EXIT trap stays the backstop for the rest.
 _rmtmp()   { local f; for f in "$@"; do [ -n "$f" ] || continue; rm -f "$f" 2>/dev/null || true; UKU_TMPFILES="${UKU_TMPFILES// $f/}"; done; return 0; }
 _cleanup() { [ -n "$UKU_TMPFILES" ] && rm -f $UKU_TMPFILES 2>/dev/null; return 0; }
-trap _cleanup EXIT INT TERM
+# A signal trap whose handler RETURNS resumes the script where it was
+# interrupted — so `trap _cleanup INT` quietly made Ctrl-C a no-op: uku swept
+# its temp files and carried straight on. Measured 2026-07-28: SIGINT during a
+# 10-line batch cost nothing, all 10 were still created. That is intolerable
+# for bulk writes, where Ctrl-C is how a person says stop. So: clean up, drop
+# the trap, and re-raise the signal with its default disposition, which both
+# really stops us and reports the conventional 128+signal.
+# HUP is included on purpose — a closed lid or a lost terminal must stop the
+# writes, not orphan a run that keeps creating records.
+_on_signal() {
+  _cleanup
+  # If a batch is mid-flight, the one thing the user needs at this exact
+  # moment is how to pick it up again. The ledger is already complete up to
+  # the last record that landed (every create is appended before the next line
+  # is read), so this is always safe advice.
+  if [ "${UKU_BATCH_RUNNING:-0}" = "1" ]; then
+    printf '\n  %s\n  %s\n' "interrupted — ${UKU_BATCH_DONE:-0} record(s) created and recorded in the ledger." \
+      "resume: ${UKU_BATCH_RESUME_HINT:-uku batch list}" >&2
+  fi
+  trap - "$1" EXIT; kill -s "$1" $$
+}
+trap _cleanup EXIT
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+trap '_on_signal HUP'  HUP
 
 require_curl() { have curl || die "curl is required but not installed." "$EX_USAGE"; }
 
@@ -858,7 +882,8 @@ write_resource() {
 #
 # The ledger stores a HASH, never the line: this file lives in ~/.config/uku
 # and client PII must not.
-UKU_BATCH=""; UKU_RESUME=0; UKU_RUN_ID=""; UKU_STOP_ON_ERROR=0; UKU_SKIP_EXISTING=0; UKU_MATCH_ON=""
+UKU_BATCH=""; UKU_RESUME=0; UKU_RUN_ID=""; UKU_STOP_ON_ERROR=0; UKU_SKIP_EXISTING=0; UKU_MATCH_ON=""; UKU_RETRY_UNKNOWN=0
+UKU_BATCH_RUNNING=0; UKU_BATCH_RESUME_HINT=""; UKU_BATCH_DONE=0   # read by _on_signal
 
 _batch_dir() { printf '%s/batches' "$UKU_CONFIG_HOME"; }
 
@@ -904,7 +929,20 @@ _json_str() {
 }
 
 # ── the ledger ───────────────────────────────────────────────────────
-# TSV, one record per line:  ok|fail <TAB> hash <TAB> path <TAB> id|status <TAB> iso8601 <TAB> lineno
+# TSV, one record per line:  send|ok|fail <TAB> hash <TAB> path <TAB> id|status <TAB> iso8601 <TAB> lineno
+#
+# TWO phases, and the reason is the whole point of the feature. A `send` row is
+# written BEFORE the request goes out, `ok` (with the new id) only after the
+# server confirms. Kill a run and one line can be caught between the two: the
+# POST reached the server but its reply never arrived. Measured, not imagined —
+# a real Ctrl-C during a 10-line run left the server holding 4 records and the
+# ledger holding 3.
+#
+# Recording only successes would make --resume re-create that line: an exact
+# duplicate, in the one command whose entire promise is that it never does
+# that. So a hash with `send` and no `ok` is UNKNOWN, and --resume refuses to
+# re-send it and says why. That is the same doctrine the CLI already applies to
+# a 429 or a 5xx on a write: the outcome is unknown, so GET before resending.
 _ledger_file() { printf '%s/%s' "$(_batch_dir)" "$1"; }
 _ledger_init() {  # RUNID METHOD PATH SOURCE
   local f; f="$(_ledger_file "$1")"
@@ -922,12 +960,16 @@ _ledger_init() {  # RUNID METHOD PATH SOURCE
   chmod 600 "$f" 2>/dev/null || true
 }
 _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '-'; }
-# _ledger_id RUNID HASH — the id a previous run created for this content, or "".
-_ledger_id() {
+# _ledger_state RUNID HASH → "ok <id>" · "send" · "" (never recorded).
+# `ok` wins over `send` whatever the order: a confirmed create is a fact.
+_ledger_state() {
   local f; f="$(_ledger_file "$1")"
   [ -f "$f" ] || return 0
   [ -n "$2" ] || return 0
-  awk -F'\t' -v h="$2" '$1=="ok" && $2==h { print $4; exit }' "$f" 2>/dev/null || true
+  awk -F'\t' -v h="$2" '
+    $2==h && $1=="ok"   { id=$4; ok=1 }
+    $2==h && $1=="send" { sent=1 }
+    END { if (ok) printf "ok %s", id; else if (sent) printf "send" }' "$f" 2>/dev/null || true
 }
 # _ledger_add RUNID STATE HASH PATH ID_OR_STATUS LINENO — append AND flush.
 # A separate open/write/close per line is the point: nothing is buffered, so an
@@ -1042,6 +1084,18 @@ run_batch() {
     _ledger_init "$rid" "$method" "$path" "$src"
   fi
 
+  # Built before the loop, not after: the signal handler needs it (see _on_signal).
+  # Rebuilt from the ORIGINAL argv so --base/--account survive; --dry-run is
+  # dropped (a resume sends), and --resume/--yes are added exactly once.
+  local resume_cmd; resume_cmd="uku"
+  local a; for a in ${UKU_ARGV[@]+"${UKU_ARGV[@]}"}; do
+    case "$a" in --resume|--dry-run|--yes|-y) continue ;; esac
+    case "$a" in *[![:alnum:]@/._=-]*) resume_cmd="$resume_cmd '$(_sq "$a")'" ;; *) resume_cmd="$resume_cmd $a" ;; esac
+  done
+  resume_cmd="$resume_cmd --resume --yes"   # the run-id is derived from the file, so it needs no flag
+  case "$src" in @-) resume_cmd="re-feed the same lines and add --resume  (stdin can't be replayed for you)" ;; esac
+  if [ "${UKU_DRY:-0}" != "1" ]; then UKU_BATCH_RESUME_HINT="$resume_cmd"; UKU_BATCH_RUNNING=1; UKU_BATCH_DONE=0; fi
+
   local created=0 skipped=0 failed=0 lineno=0 stopped="" stop_rc="$EX_API" line=""
   printf '  %s\n' "$(_dim "batch $rid · $total line(s) → $method $path$( [ "$known" -gt 0 ] && printf ' · ledger already holds %s' "$known" || true )")" >&2
 
@@ -1063,15 +1117,29 @@ run_batch() {
       continue
     fi
 
-    local canon h prev
+    local canon h state
     canon="$(_canon_line "$t")"; h="$(printf '%s' "$canon" | _hash)"
-    prev=""; [ -n "$h" ] && prev="$(_ledger_id "$rid" "$h")"
+    state=""; [ -n "$h" ] && state="$(_ledger_state "$rid" "$h")"
 
     # 2 — the ledger. This is the idempotency that can be trusted.
-    if [ "$UKU_RESUME" = "1" ] && [ -n "$prev" ]; then
-      skipped=$((skipped + 1))
-      _batch_emit "$lineno" "$([ "${UKU_DRY:-0}" = "1" ] && printf 'would_skip' || printf 'skipped')" "$prev" "" LEDGER_HIT "already created by run $rid" "$path"
-      continue
+    if [ "$UKU_RESUME" = "1" ] && [ -n "$state" ]; then
+      case "$state" in
+        ok\ *)
+          skipped=$((skipped + 1))
+          _batch_emit "$lineno" "$([ "${UKU_DRY:-0}" = "1" ] && printf 'would_skip' || printf 'skipped')" "${state#ok }" "" LEDGER_HIT "already created by run $rid" "$path"
+          continue ;;
+        send)
+          # Sent, never confirmed — the line the interruption caught in flight.
+          if [ "$UKU_RETRY_UNKNOWN" != "1" ]; then
+            failed=$((failed + 1))
+            _batch_emit "$lineno" failed "" "" UNKNOWN_OUTCOME \
+              "sent by run $rid but never confirmed (the run was interrupted mid-request) — it may or may not exist. Check the server, then re-send this line with --retry-unknown, or leave it. NOT re-sent: that could duplicate it." "$path"
+            [ "${UKU_DRY:-0}" = "1" ] || _ledger_add "$rid" fail "$h" "$path" UNKNOWN_OUTCOME "$lineno"
+            if [ "$UKU_STOP_ON_ERROR" = "1" ]; then stopped="line $lineno unresolved (UNKNOWN_OUTCOME)"; break; fi
+            continue
+          fi
+          warn "line $lineno: re-sending a request whose outcome was unknown (--retry-unknown)." ;;
+      esac
     fi
 
     # 3 — the same guard every single write gets (a time entry with a duration
@@ -1144,11 +1212,14 @@ run_batch() {
       break
     fi
 
+    # `send` BEFORE the wire, so an interruption between here and the reply is
+    # recorded as unknown rather than as never-attempted (see the ledger note).
+    _ledger_add "$rid" send "$h" "$path" - "$lineno"
     do_request "$method" "$path" "$t"
     case "$REPLY_STATUS" in
       2*)
         local nid; nid="$(_body_id "$REPLY_BODY")"
-        created=$((created + 1))
+        created=$((created + 1)); UKU_BATCH_DONE="$created"
         _ledger_add "$rid" ok "$h" "$path" "${nid:-?}" "$lineno"
         _batch_emit "$lineno" created "$nid" "$REPLY_STATUS" "" "" "$path"
         ;;
@@ -1164,16 +1235,9 @@ run_batch() {
     esac
   done
   exec 3<&-
+  UKU_BATCH_RUNNING=0
 
   # ── summary (stderr — stdout stayed machine-clean) ──
-  # Rebuilt from the ORIGINAL argv so --base/--account survive; --dry-run is
-  # dropped (a resume sends), and --resume/--yes are added exactly once.
-  local resume_cmd; resume_cmd="uku"
-  local a; for a in ${UKU_ARGV[@]+"${UKU_ARGV[@]}"}; do
-    case "$a" in --resume|--dry-run|--yes|-y) continue ;; esac
-    case "$a" in *[![:alnum:]@/._=-]*) resume_cmd="$resume_cmd '$(_sq "$a")'" ;; *) resume_cmd="$resume_cmd $a" ;; esac
-  done
-  resume_cmd="$resume_cmd --resume --yes"   # the run-id is derived from the file, so it needs no flag
   {
     printf '\n'
     local verb="created" vskip="skipped"
@@ -1187,10 +1251,7 @@ run_batch() {
     fi
     if [ -n "$stopped" ]; then printf '  %s %s\n' "$(_color 33 '!')" "stopped: $stopped"; fi
     if [ "$failed" -gt 0 ] || [ -n "$stopped" ]; then
-      case "$src" in
-        @-) printf '  %s\n' "$(_dim "resume: re-feed the same lines and add --resume  (stdin can't be replayed for you)")" ;;
-        *)  printf '  %s\n' "$(_dim "resume: $resume_cmd")" ;;
-      esac
+      printf '  %s\n' "$(_dim "resume: $resume_cmd")"
     fi
     printf '\n'
   } >&2
@@ -1574,6 +1635,11 @@ $(_bold "THE LEDGER — why --resume can be trusted")
   exact lines are skipped — no duplicates, no server-side matching, no guessing.
   The run-id is derived from the target plus a hash of the file, so --resume
   works without having remembered anything. --run-id NAME overrides it.
+
+  One line can be caught in flight — the request left, the reply never came.
+  That line is recorded as SENT, not created, and --resume $(_bold "refuses to re-send
+  it") and tells you so: the CLI cannot know whether it landed, and guessing
+  would duplicate a record. Check that one, then --retry-unknown to send it.
   The ledger stores a hash, never the line: no client data is written to disk.
     uku batch list · uku batch show <run-id>
 
@@ -1831,6 +1897,7 @@ parse_list_flags() {
       --resume) UKU_RESUME=1; shift ;;
       --run-id) _need_val "$@"; UKU_RUN_ID="$2"; shift 2 ;;
       --stop-on-error) UKU_STOP_ON_ERROR=1; shift ;;
+      --retry-unknown) UKU_RETRY_UNKNOWN=1; shift ;;
       --skip-existing) UKU_SKIP_EXISTING=1; shift ;;
       --match-on) _need_val "$@"; UKU_MATCH_ON="$2"; shift 2 ;;
       *) die "unknown flag: $1  (try: uku <command> --help)" "$EX_USAGE" ;;
@@ -1899,6 +1966,8 @@ $(_bold "GLOBAL FLAGS")
   --resume          With --batch: skip lines the run's ledger already created
   --run-id NAME     Name the ledger (default: derived from target + file hash)
   --stop-on-error   With --batch: halt on the first failed line (default: go on)
+  --retry-unknown   With --resume: also re-send a line that was sent but never
+                    confirmed. Check the server first — it may already exist.
   --skip-existing --match-on FIELD    Query before creating. Read the hazard in
                     uku help batch first — the ledger is the trustworthy path.
   --account <name>  Run against a specific account (default: the active one)
