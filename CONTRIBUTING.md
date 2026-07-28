@@ -24,13 +24,38 @@ step, no compilation — the script *is* the tool.
 - **Portable output.** Respect `NO_COLOR`; degrade gracefully when `column`/`jq`
   are missing.
 
-## Before you open a PR
+## Before you push — `bin/ci` is mandatory
 
 ```sh
-bash -n bin/uku && sh -n scripts/install.sh scripts/release.sh   # syntax
-shellcheck bin/uku scripts/*.sh                                  # if installed
-./bin/uku doctor                                                 # self-check
+bin/ci      # syntax · bash 3.2 · surface · drift · tests. Non-zero on any failure.
 ```
+
+Run it before every push and before opening a PR. It is the whole gate, and it
+is the same command a human and an agent run. Optional extras: `shellcheck
+bin/uku scripts/*.sh`, `./bin/uku doctor`.
+
+### The surface gate (why `bin/ci` fails on a doc change)
+
+The agent-facing contract is prose — `README.md`, `uku --help`, and the skill
+`uku setup agents` installs — and prose drifts from code silently. So the
+command surface is **declared** in one table in `bin/uku` (`_surface_table`),
+`uku --dump-surface` prints it one fact per line, and that output is committed
+as `.surface`.
+
+- **New surface** → `scripts/check-surface.sh --update`, and commit `.surface`
+  with the change. Cheap, but never accidental: the diff is the review.
+- **Removed surface** → paste the exact `.surface` line into
+  `.surface-breaking` under a dated comment, then `--update`. That file is the
+  changelog of everything we have taken away, and an entry only counts while
+  the line is genuinely gone.
+- **Docs may not promise fiction, and the table may not hide surface.**
+  `scripts/check-drift.sh` checks both directions, including by *executing*
+  every declared command against the real dispatcher. Deliberately hidden
+  surface goes in `.surface-internal` with a reason.
+
+Adding a command means: the `case` label, the `cmd_*` function, a row in the
+table, `--update`, and a line in `usage()` — the gate names whichever you
+forgot.
 
 Test any change against a **sandbox account** (`uku auth login --account sandbox`)
 before a real one — never rehearse a write on production books.

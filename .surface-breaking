@@ -1,0 +1,17 @@
+# .surface-breaking — the changelog of surface we have deliberately TAKEN AWAY.
+#
+# scripts/check-surface.sh fails on any fact that disappears from the surface,
+# because someone out there has it in a script. To remove one on purpose, paste
+# the exact `.surface` line here under a dated comment saying why, then run
+# `scripts/check-surface.sh --update`.
+#
+# Two rules keep this file honest:
+#   * an entry only counts while the line is genuinely gone. Listing a line that
+#     still exists is an error (a stale acknowledgement would pre-authorise a
+#     future removal nobody reviewed).
+#   * entries are never deleted after the fact — this file is the record of what
+#     a user's old script may be relying on.
+#
+# Format: one verbatim .surface line per row.
+#
+# 2026-07-28 — nothing removed yet.

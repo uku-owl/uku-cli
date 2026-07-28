@@ -5,7 +5,7 @@ It gives terminals, scripts, CI, and coding agents (Claude Code, Cursor, Codex) 
 native way to operate a firm's Uku data — within the exact permissions of the API
 key you hand it.
 
-> **Status:** v0.2.0 — MVP. Read + the essential writes, plus an `api` escape
+> **Status:** MVP. Read + the essential writes, plus an `api` escape
 > hatch to every endpoint. Built on the real API v3 (no invented endpoints).
 
 ## Install

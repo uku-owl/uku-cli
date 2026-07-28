@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# bin/ci — the whole gate, in one command. Run it before you push.
+#
+#   bin/ci
+#
+# Five stages, in the order in which a failure is cheapest to understand:
+#
+#   1  bash -n            the file parses at all
+#   2  bash 3.2           no construct macOS's shipped bash cannot run
+#   3  check-surface.sh   the committed .surface matches the declared one
+#   4  check-drift.sh     docs, code and help all agree with the table
+#   5  tests/run.sh       the behaviour itself
+#
+# Stages 3 and 4 come BEFORE the tests on purpose: they are seconds, they need
+# no fixture server, and a surface or doc break is the kind of thing a green
+# test suite happily hides.
+#
+# Exit: 0 only if every stage passed.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+FAILED=""
+STAGE=0
+_stage() { STAGE=$((STAGE + 1)); printf '\n\033[1m[%d/5] %s\033[0m\n' "$STAGE" "$1"; }
+_verdict() { # NAME RC
+  if [ "$2" = "0" ]; then printf '  \033[32m✓\033[0m %s\n' "$1"
+  else printf '  \033[31m✗\033[0m %s (exit %s)\n' "$1" "$2"; FAILED="$FAILED $1"; fi
+}
+
+printf '\033[1muku CI\033[0m — %s\n' "$ROOT"
+
+# ── 1 syntax ─────────────────────────────────────────────────────────
+_stage 'syntax — bash -n bin/uku, sh -n the installer'
+rc=0
+bash -n bin/uku || rc=$?
+sh -n scripts/install.sh || rc=$?
+sh -n scripts/release.sh || rc=$?
+for f in scripts/check-surface.sh scripts/check-drift.sh bin/ci; do bash -n "$f" || rc=$?; done
+_verdict 'syntax' "$rc"
+
+# ── 2 bash 3.2 ───────────────────────────────────────────────────────
+# macOS ships bash 3.2 and that is where most users run this. These four
+# constructs are the ones that parse fine on the developer's bash 5 and then
+# fail on a customer's Mac, so they are banned outright (CONTRIBUTING.md).
+_stage 'bash 3.2 — no declare -A, ${var^^}, mapfile/readarray, &>>'
+rc=0
+scan() { # LABEL PATTERN FILE…
+  local label="$1" pat="$2"; shift 2
+  local hits; hits="$(grep -nE "$pat" "$@" | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)"
+  if [ -n "$hits" ]; then
+    printf '  bash 4+ only (%s):\n' "$label"
+    printf '%s\n' "$hits" | sed 's/^/    /'
+    rc=1
+  fi
+}
+# bin/ci itself is not scanned: it must SPELL the banned constructs to search
+# for them, so it would always match itself. It is parsed in stage 1 and, by
+# inspection, uses none of them.
+BASH_FILES="bin/uku scripts/check-surface.sh scripts/check-drift.sh tests/run.sh tests/lib/harness.sh"
+for f in tests/cases/*.sh; do BASH_FILES="$BASH_FILES $f"; done
+scan 'associative arrays'  'declare[[:space:]]+-A|local[[:space:]]+-A' $BASH_FILES
+scan 'case conversion'     '\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\^\^|\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?,,' $BASH_FILES
+scan 'mapfile/readarray'   '\b(mapfile|readarray)\b' $BASH_FILES
+scan 'append both streams' '&>>' $BASH_FILES
+_verdict 'bash 3.2 constructs' "$rc"
+
+# ── 3 surface ────────────────────────────────────────────────────────
+_stage 'surface — the committed .surface matches bin/uku'
+rc=0
+scripts/check-surface.sh || rc=$?
+_verdict 'surface' "$rc"
+
+# ── 4 drift ──────────────────────────────────────────────────────────
+_stage 'drift — docs, code and help agree with the table'
+rc=0
+scripts/check-drift.sh || rc=$?
+_verdict 'drift' "$rc"
+
+# ── 5 tests ──────────────────────────────────────────────────────────
+_stage 'tests — tests/run.sh'
+rc=0
+tests/run.sh || rc=$?
+_verdict 'tests' "$rc"
+
+# ── verdict ──────────────────────────────────────────────────────────
+printf '\n════════════════════════════════════════════════\n'
+if [ -n "$FAILED" ]; then
+  printf '\033[31mCI FAILED\033[0m —%s\n' "$FAILED"
+  printf '════════════════════════════════════════════════\n'
+  exit 1
+fi
+printf '\033[32mCI PASSED\033[0m — syntax · bash 3.2 · surface · drift · tests\n'
+printf '════════════════════════════════════════════════\n'
+exit 0

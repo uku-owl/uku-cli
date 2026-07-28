@@ -1,0 +1,13 @@
+# .surface-internal — surface that is deliberately NOT in `uku --help`.
+#
+# scripts/check-drift.sh requires every command and every global flag in
+# .surface to be discoverable in `uku --help`; anything genuinely internal is
+# excused here, one fact per line, with the reason after `#`. Keep it short —
+# a long file here means we are hiding things, not documenting them.
+#
+# (Subcommand-level discoverability is not blanket-checked: the table marks the
+# ones that MUST be documented with `!`, and those are checked exactly.)
+#
+# Seeded 2026-07-28 with the honest state of the tree at that commit.
+
+gflag --dump-surface   # the build gate's own hook: prints .surface, one fact per line. It is CI plumbing, not a user feature, and putting it in the help would invite agents to parse it as a product contract. scripts/check-surface.sh is the only caller.

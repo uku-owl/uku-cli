@@ -1707,10 +1707,147 @@ cmd_update() {
   UKU_BIN_DIR="$dir" UKU_SKIP_SETUP=1 UKU_NO_AUTO_UPDATE=1 UKU_CHANNEL="$chan" curl -fsSL "$url" | sh
 }
 
+# ── THE COMMAND SURFACE TABLE ────────────────────────────────────────
+# Bash has no command tree to reflect over, so the surface is DECLARED here —
+# one row per command — and everything else reads from this one place:
+#
+#   • `uku --dump-surface` prints it as sorted, one-fact-per-line text, which is
+#     committed as `.surface` and diffed by scripts/check-surface.sh. A new
+#     fact needs `--update`; a vanished fact is a compatibility break and needs
+#     an entry in `.surface-breaking`.
+#   • scripts/check-drift.sh checks it BOTH ways: nothing in README.md or the
+#     embedded skill may name a command or a flag that is not here, and nothing
+#     the dispatcher actually answers to may be missing from here.
+#   • `uku help <resource>` and `uku completions` are GENERATED from it, so a
+#     row and its help card cannot disagree.
+#
+# ROW FORMAT — seven `|`-separated columns; everything after the sixth `|`
+# belongs to notes, so notes may contain pipes:
+#
+#   name | cmd-aliases | subcommands | sub-aliases | flags | args | notes
+#
+#   * `!name` on a subcommand or a flag means MUST BE DOCUMENTED: the literal
+#     `uku <cmd> <name>` has to appear in `uku --help`. Use it for surface an
+#     agent will otherwise never find.
+#   * `@list`, `@data`, `@bulk` expand to the shared flag sets below — the
+#     expansion is what lands in `.surface`, so the committed file stays
+#     explicit even though the table stays short.
+#   * `args` and `notes` hold several entries separated by ` :: `, one fact per
+#     entry. `notes` is free text for the agent-facing gotcha — above all the
+#     negative kind ("this is NOT a flag here, use X"), which is the knowledge
+#     that stops an agent guessing.
+#   * a name starting with `%` is a pseudo-row (only `%global`, the flags that
+#     work anywhere) — not a command, never dispatched, never probed.
+_surface_table() {
+  cat <<'TABLE'
+# name    | cmd-aliases  | subcommands             | sub-aliases    | flags                                                   | args                                            | notes
+auth        |              | login status logout print-header | print-headers | --account --company --base --key-stdin --format --shell |                                                 | `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api` :: `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored :: `--shell` is shorthand for `--format shell`
+account     | accounts     | list add use current remove | ls switch who rm | --company --key-stdin                               | use <name> :: add <name> :: remove <name>       | `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list` :: `add` is sugar for `uku auth login --account <name>` :: run `uku account current` before any write — a sandbox and the real firm look identical in the output
+setup       | setup-agents | agents                  |                |                                                         |                                                 | UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
+clients     |              | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id>            | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read
+tasks       |              | list get !create !patch |                | @list @data @bulk                                       | get <task_id> :: patch <task_id>                | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from
+time        |              | list get !create        |                | @list @data @bulk                                       | get <id>                                        | there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>` :: `create` needs task_id, person_id and start :: `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending
+invoices    |              | list get !create        |                | @list @data @bulk                                       | get <invoice_id>                                | money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it :: there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>`
+members     |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI — member writes go through `uku api`
+products    |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI; the API does accept `POST /api/v3/products` (needs `name`) — reach it with `uku api`
+contracts   |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules
+projects    |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI; the API does accept `POST /api/v3/projects` (needs `name`) — reach it with `uku api`
+me          |              |                         |                |                                                         |                                                 | prints exactly what `uku auth status` prints — the identity behind the active key
+api         |              |                         |                | !--describe @list @data @bulk                           | <METHOD> :: </api/v3/...>                       | METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks` :: `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient :: this reaches every v3 endpoint, so prefer it over dropping to curl
+batch       |              | list show               | ls             |                                                         | show <run-id>                                   | reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request :: `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
+doctor      |              |                         |                |                                                         |                                                 | `--json` (the global flag) gives the whole report as JSON :: exits 1 only when a REQUIRED check fails, never for a warning
+update      |              |                         |                |                                                         |                                                 | re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
+completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
+version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
+help        |              | auth account setup clients tasks time invoices members products contracts projects batch api | | |  <command>                                     | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
+%global     |              |                         |                | --json --yes -y --dry-run --quiet -q --no-color --fields --account --base --header -H --if-match --all --help -h --version -V --dump-surface | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature
+TABLE
+}
+
+# shared flag sets — expanded into the committed surface, so `.surface` stays
+# explicit while the table stays readable.
+_surface_expand() { # FLAGS… → the same list with @groups expanded
+  local t out=""
+  for t in $1; do
+    case "$t" in
+      @list) out="$out --limit --offset --q --search --status --sort --query --cursor --all" ;;
+      @data) out="$out --data -d" ;;
+      @bulk) out="$out --batch --resume --run-id --stop-on-error --retry-unknown --skip-existing --match-on" ;;
+      *)     out="$out $t" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# _surface_split TEXT — the ` :: `-separated entries of one column, one per line.
+_surface_split() {
+  local s="$1" item
+  while [ -n "$s" ]; do
+    case "$s" in
+      *" :: "*) item="${s%%" :: "*}"; s="${s#*" :: "}" ;;
+      *)        item="$s"; s="" ;;
+    esac
+    item="$(_trim "$item")"
+    [ -n "$item" ] && printf '%s\n' "$item"
+  done
+  return 0
+}
+
+# _surface_emit — the table as facts. One fact per line, deliberately flat:
+#   cmd NAME · cmdalias NAME ALIAS · sub NAME SUB · subalias NAME ALIAS
+#   flag NAME --f · gflag --f · doc NAME TOKEN · arg NAME TEXT · note NAME TEXT
+_surface_emit() {
+  local name calias subs salias flags args notes t
+  while IFS='|' read -r name calias subs salias flags args notes; do
+    name="$(_trim "$name")"
+    case "$name" in ''|'#'*) continue ;; esac
+    if [ "$name" = "%global" ]; then
+      for t in $(_surface_expand "$flags"); do
+        case "$t" in
+          '!'*) printf 'gflag %s\n' "${t#!}"; printf 'doc %s %s\n' "$name" "${t#!}" ;;
+          *)    printf 'gflag %s\n' "$t" ;;
+        esac
+      done
+    else
+      printf 'cmd %s\n' "$name"
+      for t in $calias; do printf 'cmdalias %s %s\n' "$name" "$t"; done
+      for t in $subs; do
+        case "$t" in
+          '!'*) printf 'sub %s %s\n' "$name" "${t#!}"; printf 'doc %s %s\n' "$name" "${t#!}" ;;
+          *)    printf 'sub %s %s\n' "$name" "$t" ;;
+        esac
+      done
+      for t in $salias; do printf 'subalias %s %s\n' "$name" "$t"; done
+      for t in $(_surface_expand "$flags"); do
+        case "$t" in
+          '!'*) printf 'flag %s %s\n' "$name" "${t#!}"; printf 'doc %s %s\n' "$name" "${t#!}" ;;
+          *)    printf 'flag %s %s\n' "$name" "$t" ;;
+        esac
+      done
+      _surface_split "$args"  | while IFS= read -r t; do printf 'arg %s %s\n' "$name" "$t"; done
+      _surface_split "$notes" | while IFS= read -r t; do printf 'note %s %s\n' "$name" "$t"; done
+    fi
+  done <<EOF
+$(_surface_table)
+EOF
+  return 0
+}
+
+# uku --dump-surface (hidden) — the committed `.surface`, byte for byte.
+_dump_surface() { _surface_emit | LC_ALL=C sort -u; }
+
+# _surface_field KIND NAME — the third column of every matching fact, space
+# separated. `_surface_field sub clients` → "list get create patch".
+_surface_field() {
+  _surface_emit | awk -v k="$1" -v n="$2" '$1==k && $2==n { printf "%s ", $3 }'
+  return 0
+}
+
 # uku completions <bash|zsh> — source-able completion for the top-level commands.
 cmd_completions() {
   local shell="${1:-}"
-  local cmds="auth account setup clients tasks time invoices members products contracts projects me api batch doctor update completions help version"
+  local cmds; cmds="$(_surface_emit | awk '$1=="cmd"{printf "%s ",$2}')"
+  cmds="$(_trim "$cmds")"
   case "$shell" in
     bash) printf 'complete -W "%s" uku\n' "$cmds" ;;
     # compdef form works under `eval "$(uku completions zsh)"` (needs compinit loaded)
@@ -1748,14 +1885,27 @@ $(_bold "uku account") — one login, many companies (keep a sandbox beside your
   uku --account <name> <command>   run one command against a specific account
 EOF
     ;;
-    clients|tasks|time|invoices|members|products|contracts|projects) cat <<EOF
-$(_bold "uku $topic") — list/get$( [ "$topic" = time ] && printf '/create' || printf '/create/patch' 2>/dev/null || true)
-  uku $topic list [--q X] [--status S] [--limit N] [--offset N] [--all] [--json]
-  uku $topic get <id>
-Examples:
-  uku $topic list --limit 5
-  uku $topic list --json | jq '.data[] | {id}'
-EOF
+    clients|tasks|time|invoices|members|products|contracts|projects)
+      # Generated from the surface table, so a card can never claim a
+      # subcommand the dispatcher does not have (or hide one it does).
+      local subs; subs=" $(_surface_field sub "$topic")"
+      printf '%s — %s\n' "$(_bold "uku $topic")" "$(printf '%s' "$subs" | tr -s ' ' | sed 's/^ //;s/ $//;s/ /\//g')"
+      printf '  uku %s list [--q X] [--status S] [--limit N] [--offset N] [--all] [--json]\n' "$topic"
+      printf '  uku %s get <id>\n' "$topic"
+      case "$subs" in *" create "*)
+        printf '  uku %s create --data @file.json --yes\n' "$topic"
+        printf '  uku %s create --batch @file.jsonl --yes      many at once — see: uku help batch\n' "$topic" ;;
+      esac
+      case "$subs" in *" patch "*)
+        printf '  uku %s patch <id> --data @file.json --yes\n' "$topic" ;;
+      esac
+      case "$subs" in *" create "*|*" patch "*) : ;; *)
+        printf '  %s\n' "$(_dim "read-only here. What the API itself allows: uku api --describe $topic")" ;;
+      esac
+      printf 'Notes:\n'
+      _surface_emit | awk -v n="$topic" '$1=="note" && $2==n { $1="";$2=""; sub(/^  /,""); print "  · " $0 }'
+      printf 'Examples:\n  uku %s list --limit 5\n  uku %s list --json | jq %s\n' \
+        "$topic" "$topic" "'.data[] | {id}'"
     ;;
     batch) cat <<EOF
 $(_bold "uku batch") — create many records from one file, safely restartable
@@ -2082,16 +2232,23 @@ $(_bold "AUTH")
   uku auth status             Show who you're signed in as
   uku auth logout             Remove stored credentials
 
-$(_bold "RESOURCES")  (read with any key)
-  uku clients list [--q X] [--status S] [--limit N]
-  uku clients get <id>
-  uku tasks list [--limit N]
-  uku time list [--limit N]
-  uku invoices list [--limit N]
-  uku invoices get <id>
+$(_bold "RESOURCES")  (read with any key · every one takes list [flags] and get <id>)
+  uku clients list [--q X] [--status S] [--limit N]      uku clients get <id>
+  uku tasks list [--limit N]                             uku tasks get <id>
+  uku time list [--limit N]                              uku time get <id>
+  uku invoices list [--status draft]                     uku invoices get <id>
+  uku members list                                       uku members get <id>
+  uku products list                                      uku products get <id>
+  uku contracts list                                     uku contracts get <id>
+  uku projects list                                      uku projects get <id>
 
 $(_bold "WRITES")  (deliberate — need a TTY or --yes; money needs an All key)
+  uku clients create --data @client.json [--yes]         uku clients patch <id> --data @f
+  uku tasks create --data @task.json [--yes]             uku tasks patch <id> --data @f
+  uku time create --data @entry.json [--yes]      task_id + person_id + start; a
+                                      start with no end is a TIMER, not logged work
   uku invoices create --data @invoice.json [--yes]
+  No patch for time or invoices — use: uku api PATCH /api/v3/<resource>/<id>
 
 $(_bold "BULK")  (one JSON object per line; one confirm for the whole file)
   uku tasks create --batch @tasks.jsonl --yes
@@ -2101,7 +2258,8 @@ $(_bold "BULK")  (one JSON object per line; one confirm for the whole file)
   uku batch list · uku batch show <run-id>       What a previous run did
   See: uku help batch
 
-$(_bold "ESCAPE HATCH")  (any endpoint in the API v3)
+$(_bold "ESCAPE HATCH")  (any endpoint in the API v3 — METHOD and PATH are positional)
+  uku api --describe [resource]       The resource map: paths + required fields
   uku api GET  /api/v3/members --query limit=5
   uku api POST /api/v3/tasks --data @task.json --yes
 
@@ -2117,8 +2275,10 @@ $(_bold "MORE")
   uku update                          Upgrade in place to the newest release
                                       (installed from its tag, checksum-verified)
   uku completions <bash|zsh>          Shell completion
-  uku me · uku members|products|contracts|projects list
-  uku batch list|show <run-id>        Ledgers of previous --batch runs
+  uku me                              Who this key acts as (= uku auth status)
+  uku version                         Print the version (= uku --version)
+  uku batch list · uku batch show <run-id>       Ledgers of previous --batch runs
+  uku help <command>                  A focused card for one command
 
 $(_bold "GLOBAL FLAGS")
   --json            Raw JSON (default when stdout is not a TTY)
@@ -2139,13 +2299,13 @@ $(_bold "GLOBAL FLAGS")
                     uku help batch first — the ledger is the trustworthy path.
   --account <name>  Run against a specific account (default: the active one)
   --base <url>      Override the API base URL
-  --header 'K: V'   Add a request header (repeatable; sent off argv, like the key)
+  --header, -H 'K: V'  Add a request header (repeatable; off argv, like the key)
   --if-match <etag> Version check for a write. Omit it and, when the path names
                     a record, a 428 makes the CLI fetch the ETag and re-send
                     once. A collection POST (e.g. POST /api/v3/tasks) has no
                     record to read one from, so pass --if-match yourself there.
                     On 412 it stops — see exit 6.
-  -h, --help        This help   ·   --version
+  -h, --help        This help   ·   --version, -V   The version
 
 $(_bold "EXIT CODES")  0 ok · 1 usage · 2 auth · 3 API error · 4 write refused · 5 network · 6 conflict (412)
 
@@ -2193,6 +2353,10 @@ while [ $# -gt 0 ]; do
     --base) _need_val "$@"; UKU_BASE_CLI="$2"; shift 2 ;;
     -h|--help) UKU_HELP=1; shift ;;   # routed to per-command help below
     --version|-V) printf 'uku %s\n' "$UKU_VERSION"; exit "$EX_OK" ;;
+    # hidden: the declared surface as one fact per line. Committed as .surface
+    # and diffed by scripts/check-surface.sh — the build gate, not a feature.
+    # Answered here, before require_curl, so the gate needs nothing installed.
+    --dump-surface) _dump_surface; exit "$EX_OK" ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done

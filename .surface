@@ -1,0 +1,288 @@
+arg account add <name>
+arg account remove <name>
+arg account use <name>
+arg api </api/v3/...>
+arg api <METHOD>
+arg batch show <run-id>
+arg clients get <client_id>
+arg clients patch <client_id>
+arg completions <shell>
+arg contracts get <id>
+arg help <command>
+arg invoices get <invoice_id>
+arg members get <id>
+arg products get <id>
+arg projects get <id>
+arg tasks get <task_id>
+arg tasks patch <task_id>
+arg time get <id>
+cmd account
+cmd api
+cmd auth
+cmd batch
+cmd clients
+cmd completions
+cmd contracts
+cmd doctor
+cmd help
+cmd invoices
+cmd me
+cmd members
+cmd products
+cmd projects
+cmd setup
+cmd tasks
+cmd time
+cmd update
+cmd version
+cmdalias account accounts
+cmdalias setup setup-agents
+doc api --describe
+doc clients create
+doc clients patch
+doc invoices create
+doc tasks create
+doc tasks patch
+doc time create
+flag account --company
+flag account --key-stdin
+flag api --all
+flag api --batch
+flag api --cursor
+flag api --data
+flag api --describe
+flag api --limit
+flag api --match-on
+flag api --offset
+flag api --q
+flag api --query
+flag api --resume
+flag api --retry-unknown
+flag api --run-id
+flag api --search
+flag api --skip-existing
+flag api --sort
+flag api --status
+flag api --stop-on-error
+flag api -d
+flag auth --account
+flag auth --base
+flag auth --company
+flag auth --format
+flag auth --key-stdin
+flag auth --shell
+flag clients --all
+flag clients --batch
+flag clients --cursor
+flag clients --data
+flag clients --limit
+flag clients --match-on
+flag clients --offset
+flag clients --q
+flag clients --query
+flag clients --resume
+flag clients --retry-unknown
+flag clients --run-id
+flag clients --search
+flag clients --skip-existing
+flag clients --sort
+flag clients --status
+flag clients --stop-on-error
+flag clients -d
+flag contracts --all
+flag contracts --cursor
+flag contracts --limit
+flag contracts --offset
+flag contracts --q
+flag contracts --query
+flag contracts --search
+flag contracts --sort
+flag contracts --status
+flag invoices --all
+flag invoices --batch
+flag invoices --cursor
+flag invoices --data
+flag invoices --limit
+flag invoices --match-on
+flag invoices --offset
+flag invoices --q
+flag invoices --query
+flag invoices --resume
+flag invoices --retry-unknown
+flag invoices --run-id
+flag invoices --search
+flag invoices --skip-existing
+flag invoices --sort
+flag invoices --status
+flag invoices --stop-on-error
+flag invoices -d
+flag members --all
+flag members --cursor
+flag members --limit
+flag members --offset
+flag members --q
+flag members --query
+flag members --search
+flag members --sort
+flag members --status
+flag products --all
+flag products --cursor
+flag products --limit
+flag products --offset
+flag products --q
+flag products --query
+flag products --search
+flag products --sort
+flag products --status
+flag projects --all
+flag projects --cursor
+flag projects --limit
+flag projects --offset
+flag projects --q
+flag projects --query
+flag projects --search
+flag projects --sort
+flag projects --status
+flag tasks --all
+flag tasks --batch
+flag tasks --cursor
+flag tasks --data
+flag tasks --limit
+flag tasks --match-on
+flag tasks --offset
+flag tasks --q
+flag tasks --query
+flag tasks --resume
+flag tasks --retry-unknown
+flag tasks --run-id
+flag tasks --search
+flag tasks --skip-existing
+flag tasks --sort
+flag tasks --status
+flag tasks --stop-on-error
+flag tasks -d
+flag time --all
+flag time --batch
+flag time --cursor
+flag time --data
+flag time --limit
+flag time --match-on
+flag time --offset
+flag time --q
+flag time --query
+flag time --resume
+flag time --retry-unknown
+flag time --run-id
+flag time --search
+flag time --skip-existing
+flag time --sort
+flag time --status
+flag time --stop-on-error
+flag time -d
+gflag --account
+gflag --all
+gflag --base
+gflag --dry-run
+gflag --dump-surface
+gflag --fields
+gflag --header
+gflag --help
+gflag --if-match
+gflag --json
+gflag --no-color
+gflag --quiet
+gflag --version
+gflag --yes
+gflag -H
+gflag -V
+gflag -h
+gflag -q
+gflag -y
+note account `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list`
+note account `add` is sugar for `uku auth login --account <name>`
+note account run `uku account current` before any write — a sandbox and the real firm look identical in the output
+note api METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks`
+note api `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient
+note api this reaches every v3 endpoint, so prefer it over dropping to curl
+note auth `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored
+note auth `--shell` is shorthand for `--format shell`
+note auth `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api`
+note batch `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
+note batch reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request
+note clients --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read
+note clients a write needs --yes when stdout is not a TTY (exit 4 otherwise)
+note completions eval "$(uku completions zsh)" in your rc
+note contracts read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules
+note doctor `--json` (the global flag) gives the whole report as JSON
+note doctor exits 1 only when a REQUIRED check fails, never for a warning
+note help `uku <command> --help` prints the same card
+note help a topic with no card is a usage error, not an empty page
+note invoices money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it
+note invoices there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>`
+note me prints exactly what `uku auth status` prints — the identity behind the active key
+note members read-only in the CLI — member writes go through `uku api`
+note products read-only in the CLI; the API does accept `POST /api/v3/products` (needs `name`) — reach it with `uku api`
+note projects read-only in the CLI; the API does accept `POST /api/v3/projects` (needs `name`) — reach it with `uku api`
+note setup UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
+note tasks `create` needs `title`; status/date/client_id are optional
+note tasks a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from
+note time `create` needs task_id, person_id and start
+note time `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending
+note time there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>`
+note update re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
+note version identical to `uku --version`
+sub account add
+sub account current
+sub account list
+sub account remove
+sub account use
+sub auth login
+sub auth logout
+sub auth print-header
+sub auth status
+sub batch list
+sub batch show
+sub clients create
+sub clients get
+sub clients list
+sub clients patch
+sub completions bash
+sub completions zsh
+sub contracts get
+sub contracts list
+sub help account
+sub help api
+sub help auth
+sub help batch
+sub help clients
+sub help contracts
+sub help invoices
+sub help members
+sub help products
+sub help projects
+sub help setup
+sub help tasks
+sub help time
+sub invoices create
+sub invoices get
+sub invoices list
+sub members get
+sub members list
+sub products get
+sub products list
+sub projects get
+sub projects list
+sub setup agents
+sub tasks create
+sub tasks get
+sub tasks list
+sub tasks patch
+sub time create
+sub time get
+sub time list
+subalias account ls
+subalias account rm
+subalias account switch
+subalias account who
+subalias auth print-headers
+subalias batch ls

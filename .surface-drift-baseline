@@ -1,0 +1,18 @@
+# .surface-drift-baseline — drift findings we tolerate, and why.
+#
+# scripts/check-drift.sh gives every finding a stable slug (printed in the
+# failure). Putting the slug here silences that one finding — for a
+# pre-existing mismatch whose only alternative is a big-bang rewrite. Nothing
+# goes in without a `#` comment saying why, and every entry is a debt, not a
+# decision.
+#
+# Slugs:
+#   doc-cmd NAME · doc-sub CMD SUB · doc-flag --flag   (docs promise fiction)
+#   code-fn NAME · code-label NAME · probe NAME        (table lies by omission)
+#   help-cmd NAME · help-gflag --flag · help-doc CMD TOKEN  (undiscoverable)
+#
+# 2026-07-28 — EMPTY, and it should stay that way. The first honest run of the
+# gate found no fiction in README.md or in the embedded skill; the five
+# undiscoverable commands it did find (time create, products, projects,
+# contracts, api --describe) were fixed in `uku --help` rather than tolerated
+# here.
