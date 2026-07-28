@@ -111,6 +111,89 @@ uku api GET  /api/v3/members --query limit=5
 uku api POST /api/v3/tasks --data @task.json --yes
 ```
 
+Singular and plural are the same command — `uku client get 41` is `uku clients get 41`.
+The aliases are `client`, `task`, `invoice`, `member`, `product`, `project`, `contract`,
+and they are one dispatch path, not a copy that can drift.
+
+## Finding a record when you don't have its id
+
+Nobody has ids in their head. Three ways in, and none of them guesses.
+
+```sh
+uku clients get "Acme Ltd"                # a name
+uku clients get 41                        # an id — no lookup at all
+uku clients get 'https://app.getuku.com/…/41'   # a URL you pasted from the browser
+uku tasks list --client "Acme Ltd"        # the same, as a filter
+uku search "acme"                         # when you're not sure what you're after
+```
+
+### A name
+
+The CLI sends the same `--q` a list already takes, **to the endpoint the command
+already names** — no new endpoint, no new parameter — and then matches what came
+back: exact first (case-insensitive for ASCII), then a unique substring.
+
+* **exactly one match** → it is used, and the record and its id are printed on
+  stderr *before* anything else happens. You always see what was chosen.
+* **several matches** → **refused**, with the candidates and their ids. This is the
+  same doctrine as `--skip-existing`, for the same measured reason: in a firm
+  dozens of records legitimately share a name, and a title that looked unique
+  turned out to have 18 records. Guessing between them is the one thing a tool
+  that writes invoices must never do.
+* **no match** → refused, with whatever the query *did* bring back.
+
+Resolving costs one request, and only when it has to: an argument that already
+looks like an id goes straight through, and nothing is ever resolved inside a
+`--batch` line. It needs `jq` (it compares a field exactly); without `jq` it
+refuses rather than guess.
+
+Which resources have a name to match is not a guess either — it is the field each
+list command already declares: **clients** (`name`), **tasks** (`title`),
+**members**, **products**, **projects** (`name`). An **invoice**, a **contract** and
+a **time entry** have no name field, so there an id or a URL is the only way in.
+
+### A URL you pasted
+
+The host must match the base URL this account uses; a link from anywhere else is
+refused and **nothing is sent**. The id is simply the last id-shaped segment — the
+command already names the resource, so the CLI needs to know nothing about the web
+app's routes (and deliberately encodes none of them).
+
+### `--client <name|id>`
+
+Resolves the name once, then sends `client_id=<id>` — the same query pair you would
+type by hand. It is accepted only where the records carry a client_id (tasks, time,
+invoices, contracts, projects); anywhere else it is a usage error rather than a
+filter that silently does nothing. On a write or a batch it is refused: a batch line
+carries its own fields, and resolving one into a body would be inventing data.
+
+**And then it checks that the API actually did it.** That `client_id` is honoured as
+a filter is the one fact in this feature that could not be verified from the repo —
+so the CLI does not take it on trust. Every response is measured against the request:
+if a returned row carries a `client_id` that differs from the one asked for, the
+endpoint ignored the parameter, and the command **fails with exit 3** saying so
+rather than handing back an unfiltered list that looks like an answer. A row with no
+`client_id` field, or a null one, proves nothing and never trips it. The comparison
+needs `jq`, so `--client` refuses up front without it — the same rule name
+resolution follows. The day that endpoint's behaviour changes, you are told.
+
+### `uku search <query>`
+
+**Not a server-side global search.** The API offers none this CLI can verify, and
+inventing an endpoint is how a tool starts lying. `uku search` is the loop you would
+otherwise write: the same `--q`, run once against each list endpoint that has a name
+field — clients, tasks, members, products, projects. One request each, no
+server-side join, no ranking across resources. `--limit` is per endpoint.
+
+If an endpoint errors it is reported as **failed**, never folded into "0 results" —
+"no such client" when nobody actually looked is the worst thing a search can say.
+Exit 3 when any endpoint failed, 0 when they all answered.
+
+```sh
+uku search "acme" --limit 3
+uku search "acme" --json | jq '.resources[] | select(.count > 0)'
+```
+
 ## Creating many records — `--batch`
 
 One JSON object per line, one confirm for the whole file, and a ledger that makes

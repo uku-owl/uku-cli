@@ -15,7 +15,7 @@
 #     exit codes, and `uku api` passes through to any endpoint.
 set -euo pipefail
 
-UKU_VERSION="0.3.0"
+UKU_VERSION="0.4.0"
 UKU_BASE_DEFAULT="https://app.getuku.com"
 UKU_CONFIG_HOME="${UKU_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/uku}"
 UKU_PROFILE_DIR="$UKU_CONFIG_HOME/profiles"   # one file per account (0600)
@@ -824,6 +824,14 @@ _remedy_table() {
 @@products.get    | uku products get {1}                  | that product in full
 @@contracts.get   | uku contracts get {1}                 | that contract in full
 @@projects.get    | uku projects get {1}                  | that project in full
+@@members.list    | uku members list                      | the members
+@@products.list   | uku products list                     | the products
+@@contracts.list  | uku contracts list                    | the contracts
+@@projects.list   | uku projects list                     | the projects
+@@search.run      | uku search {1}                        | the same query across every list endpoint
+@@filter.unhonoured | the API did not apply client_id on this endpoint, so no --client answer from it can be trusted: re-run without --client and filter the rows yourself, or narrow with --q | -
+@@name.ambiguous  | pass the id of the one you mean — the candidates are listed above, and guessing between them is the one thing this CLI will not do | -
+@@url.host        | paste a URL from the account this CLI is signed in to, or pass the record id | -
 @@money.key       | this needs an All-scope key — create one in Uku (Settings, API), then sign in again with: uku auth login | -
 @@stale.reread    | re-read the record, re-apply your change on top of the CURRENT values, then write again | -
 @@ifmatch.supply  | GET the guarded resource, take its ETag response header, and pass it: uku --if-match '<etag>' ... | -
@@ -1110,6 +1118,257 @@ _first_id() {
   return 0
 }
 
+# ── naming a record: an id, a name, or a URL you pasted ──────────────
+#
+# A person reading Uku in a browser has a NAME on screen and a URL on the
+# clipboard; they do not have the id. Three declared tables carry everything
+# this feature knows, because the alternative — guessing an endpoint, a query
+# parameter or a web route — is exactly the failure this CLI was hardened
+# against. Nothing below invents any of the three:
+#
+#   _res_path       the collection paths already in `uku api --describe`.
+#   _name_field     the field a name is matched on, taken from the columns each
+#                   list command already declares (clients id name status type,
+#                   tasks id title status client_id, …). A resource with no
+#                   name-shaped column is NOT resolvable by name — it is not
+#                   given a guessed one.
+#   _takes_client_filter   the collections whose own list columns carry a
+#                   client_id (tasks, invoices, contracts, projects) plus
+#                   time-entries, which the README, the embedded skill and the
+#                   test fixture have always filtered with `--query client_id=`.
+#                   `--client` is sugar for exactly that pair — the CLI resolves
+#                   the name, the query key is the one already documented.
+#
+# The query used to find a name is the `--q` that parse_list_flags has always
+# sent, on the very endpoint the command already names. No new endpoint, no new
+# parameter, no URL route.
+#
+# THE MATCH RULE, and why it refuses rather than picks: exact (ASCII
+# case-insensitive) first, then unique substring. One match is used and SAID
+# OUT LOUD with its id. Several matches refuse and list the candidates — the
+# same doctrine as --skip-existing, for the same measured reason (a task title
+# that looked unique matched 18 records). Nothing else is safe in a tool that
+# writes invoices. It also means a server that ignores `q` altogether degrades
+# to "too many matches, pass an id" — never to acting on the wrong record.
+_res_path() {
+  case "$1" in
+    clients)   printf '/api/v3/clients' ;;
+    tasks)     printf '/api/v3/tasks' ;;
+    time)      printf '/api/v3/time-entries' ;;
+    invoices)  printf '/api/v3/invoices' ;;
+    members)   printf '/api/v3/members' ;;
+    products)  printf '/api/v3/products' ;;
+    contracts) printf '/api/v3/contracts' ;;
+    projects)  printf '/api/v3/projects' ;;
+    *)         printf '' ;;
+  esac
+}
+_name_field() {
+  case "$1" in
+    clients)  printf 'name' ;;
+    tasks)    printf 'title' ;;
+    members)  printf 'name' ;;
+    products) printf 'name' ;;
+    projects) printf 'name' ;;
+    *)        printf '' ;;   # invoices/contracts/time: no name column to match
+  esac
+}
+# The resources `uku search` fans out over — the ones that have a name field,
+# so a text query has something to mean there.
+UKU_SEARCH_RESOURCES="clients tasks members products projects"
+_takes_client_filter() {
+  case "$1" in
+    /api/v3/tasks|/api/v3/time-entries|/api/v3/invoices|/api/v3/contracts|/api/v3/projects) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _say_resolved TEXT — which record was chosen, on stderr. NOT routed through
+# info(): --quiet may silence a ✓, but never the sentence that says which
+# record the next command is about to act on.
+_say_resolved() { printf '%s %s\n' "$(_green '→')" "$1" >&2; return 0; }
+
+_is_url() { case "$1" in http://*|https://*) return 0 ;; *) return 1 ;; esac; }
+# _url_host URL → host[:port], lowercased, userinfo stripped.
+_url_host() {
+  local u="${1#*://}"
+  u="${u%%/*}"; u="${u%%\?*}"; u="${u%%#*}"; u="${u##*@}"
+  printf '%s' "$u" | tr '[:upper:]' '[:lower:]'
+}
+# _url_path URL → the path part, or "".
+_url_path() {
+  local u="${1#*://}"
+  case "$u" in */*) printf '/%s' "${u#*/}" ;; *) printf '' ;; esac
+}
+# _url_last_id PATH → the LAST id-shaped segment. The command already names the
+# resource, so the CLI needs to know nothing about the web app's routes — only
+# which segment is an id. `set -f` because an unquoted split would glob.
+_url_last_id() {
+  local p="${1%%#*}"; p="${p%%\?*}"
+  local seg last="" old_ifs="$IFS"
+  set -f; IFS='/'
+  for seg in $p; do
+    [ -n "$seg" ] || continue
+    _looks_like_id "$seg" && last="$seg"
+  done
+  IFS="$old_ifs"; set +f
+  printf '%s' "$last"
+}
+
+# _resolve_ref RESOURCE ARG → sets UKU_REF_ID (dies in the CURRENT shell, so
+# never call it inside $( ) — a die there would be swallowed).
+UKU_REF_ID=""
+_resolve_ref() {
+  local res="$1" arg="$2"
+  UKU_REF_ID=""
+  if _is_url "$arg"; then
+    load_creds
+    local want got id
+    want="$(_url_host "$UKU_BASE")"; got="$(_url_host "$arg")"
+    if [ "$got" != "$want" ]; then
+      die "that URL is on '$got', but this account talks to '$want'. Nothing was sent — a link from another host can't name a record here." "$EX_USAGE" @@url.host
+    fi
+    id="$(_url_last_id "$(_url_path "$arg")")"
+    [ -n "$id" ] || die "no id-shaped segment in that URL, so it does not name a record. Pass the id, or a URL that ends in one." "$EX_USAGE" @@url.host
+    UKU_REF_ID="$id"
+    _say_resolved "$(_res_one "$res") $id — the last id in the URL you pasted (host $got)"
+    return 0
+  fi
+  # An id costs nothing: no request, no lookup, no ambiguity.
+  if _looks_like_id "$arg"; then UKU_REF_ID="$arg"; return 0; fi
+  _resolve_name "$res" "$arg"
+}
+
+# _resolve_name RESOURCE NAME → sets UKU_REF_ID, or dies having written nothing.
+_resolve_name() {
+  local res="$1" q="$2" fld path
+  fld="$(_name_field "$res")"
+  if [ -z "$fld" ]; then
+    die "'$q' is not an id, and $(_res_many "$res") have no name field this CLI can search — pass the id." "$EX_USAGE" "@@$res.list"
+  fi
+  # An UNKEEPABLE SAFETY PROMISE without jq (see the jq-degradation rule near
+  # have()): the promise is that one record is chosen only when it is
+  # unambiguous, and comparing a field exactly is what proves that. Refuse
+  # BEFORE any request, so "nothing was sent" is literally true.
+  have jq || die "resolving a name needs jq to compare the '$fld' field exactly; without it the CLI would have to guess which record you meant. Pass the id instead. Nothing was sent." "$EX_USAGE" "@@$res.list"
+  path="$(_res_path "$res")"
+  load_creds; need_auth
+  local rc=0
+  _UKU_NO_HEAL=1 UKU_SOFT=1 do_request GET "$path$(build_query q="$q" limit=100)" || rc=$?
+  [ "$rc" = "0" ] || die "could not reach $UKU_BASE to look up '$q' (network error). Nothing was sent." "$EX_NET" @@doctor
+  check_status "$REPLY_BODY"
+
+  local rows exact n
+  rows="$(printf '%s' "$REPLY_BODY" | jq -r --arg f "$fld" '.data[]? | "\(.id)\t\((.[$f] // "-") | tostring)"' 2>/dev/null || true)"
+  # ascii_downcase is jq's only case fold — matching is case-insensitive for
+  # ASCII and exact for everything else. Said here rather than pretended away.
+  exact="$(printf '%s' "$rows" | awk -F'\t' -v v="$q" '
+    BEGIN { lv = tolower(v) } NF && tolower($2) == lv { print }')"
+  n="$(_count_lines "$exact")"
+  if [ "$n" = "1" ]; then _use_match "$res" "$exact"; return 0; fi
+  if [ "$n" -gt 1 ]; then _refuse_ambiguous "$res" "$q" "exactly" "$exact"; fi
+
+  local partial
+  partial="$(printf '%s' "$rows" | awk -F'\t' -v v="$q" '
+    BEGIN { lv = tolower(v) } NF && index(tolower($2), lv) { print }')"
+  n="$(_count_lines "$partial")"
+  if [ "$n" = "1" ]; then _use_match "$res" "$partial"; return 0; fi
+  if [ "$n" -gt 1 ]; then _refuse_ambiguous "$res" "$q" "on" "$partial"; fi
+
+  # Nothing matched. What the server's own `q` DID return is the only honest
+  # "did you mean" available — it is a suggestion from the API, not a guess.
+  local near msg
+  near="$(printf '%s' "$rows" | head -n 5 | awk -F'\t' 'NF { printf "    %s  %s\n", $1, $2 }')"
+  msg="no $(_res_one "$res") named '$q'."
+  [ -n "$near" ] && msg="$msg The closest $(_res_many "$res") that '$q' brought back:
+$near"
+  die "$msg" "$EX_USAGE" @@search.run "'$q'"
+}
+
+# _count_lines TEXT → the number of non-empty lines (0 for "").
+# awk, not `grep -c`: grep exits 1 on no match, and under `set -o pipefail`
+# that would make the enclosing assignment fail rather than report zero.
+_count_lines() {
+  [ -n "$1" ] || { printf '0'; return 0; }
+  printf '%s\n' "$1" | awk 'NF { n++ } END { printf "%d", n + 0 }'
+}
+_use_match() { # RESOURCE "id<TAB>name"
+  local id name
+  id="$(printf '%s' "$2" | head -n1 | cut -f1)"
+  name="$(printf '%s' "$2" | head -n1 | cut -f2)"
+  UKU_REF_ID="$id"
+  _say_resolved "$(_res_one "$1") $id — $name"
+  return 0
+}
+_refuse_ambiguous() { # RESOURCE QUERY HOW "id<TAB>name…"
+  local n listing
+  n="$(_count_lines "$4")"
+  # the lookup is capped at 100, so at the cap we only know a lower bound
+  [ "$n" -ge 100 ] && n="at least $n"
+  listing="$(printf '%s' "$4" | head -n 10 | awk -F'\t' 'NF { printf "    %s  %s\n", $1, $2 }')"
+  [ "$(_count_lines "$4")" -gt 10 ] && listing="$listing
+    …"
+  die "$n $(_res_many "$1") match '$2' $3 — refusing to guess which one you mean. Nothing was sent.
+$listing" "$EX_USAGE" @@name.ambiguous
+}
+
+# --client: resolve a name once, then send the query key that was already
+# documented for these collections. Refused where the records carry no
+# client_id, rather than sent anyway and silently ignored by the server.
+#
+# `client_id` as a FILTER is the one thing in this feature that could not be
+# verified offline — the resource map declares no query parameters, and the
+# only evidence is that the README, the embedded skill and the fixture have
+# always used `--query client_id=…`. So the CLI does not assume it: it
+# MEASURES it, on every response (_verify_client_filter). If the endpoint
+# honoured the parameter, every row it returns carries that client_id; if it
+# ignored it, the rows say so. An unfiltered list handed back as though it
+# were an answer is the exact failure this round exists to prevent, so a
+# mismatch is an error, not a footnote.
+UKU_CLIENT_REF=""
+UKU_CLIENT_ID=""
+_apply_client_filter() { # PATH
+  [ -n "${UKU_CLIENT_REF:-}" ] || return 0
+  if ! _takes_client_filter "${1%%\?*}"; then
+    die "--client filters records that belong to a client; ${1%%\?*} is not one of those. Use --q to search this endpoint by text." "$EX_USAGE" @@help.root
+  fi
+  # Same rule as name resolution, and for the same reason: the promise here is
+  # "these rows are that client's", and the only thing that can keep it is an
+  # exact field comparison. Without jq there is none, so refuse BEFORE sending.
+  have jq || die "--client needs jq: the CLI verifies that the API actually applied the filter by comparing client_id on every row returned, and without jq it cannot. Nothing was sent." "$EX_USAGE" @@help.root
+  _resolve_ref clients "$UKU_CLIENT_REF"
+  UKU_CLIENT_ID="$UKU_REF_ID"
+  UKU_QUERY+=("client_id=$UKU_REF_ID")
+  return 0
+}
+
+# _verify_client_filter BODY — the measurement. One pass over rows we already
+# hold; no extra request.
+#
+#   * a row whose client_id is present and DIFFERENT from the one asked for is
+#     proof the filter was not applied → refuse (exit 3, an API-behaviour fact).
+#   * a row with no client_id field, or a null one, proves nothing: absence is
+#     not a mismatch, and a projection (--fields) or a leaner response shape
+#     must not turn into a false alarm.
+_verify_client_filter() {
+  [ -n "${UKU_CLIENT_ID:-}" ] || return 0
+  have jq || return 0   # unreachable: _apply_client_filter already refused
+  local bad n sample
+  bad="$(printf '%s' "$1" | jq -r --arg want "$UKU_CLIENT_ID" '
+    [ .data[]? | select(type == "object") | select(has("client_id"))
+      | .client_id | select(. != null) | tostring | select(. != $want) ] | .[]' 2>/dev/null || true)"
+  n="$(_count_lines "$bad")"
+  [ "$n" = "0" ] && return 0
+  sample="$(printf '%s' "$bad" | LC_ALL=C sort -u | head -n 3 | tr '\n' ',' | sed 's/,$//')"
+  die "--client asked for client_id=$UKU_CLIENT_ID, but $n of the rows the API returned belong to other clients (client_id $sample). The endpoint did not apply that filter, so this is NOT that client's data — refusing to hand it back as though it were an answer." "$EX_API" @@filter.unhonoured
+}
+# A write never resolves a name for you: a batch line carries its own fields,
+# and guessing a client_id into a body would be inventing data.
+_reject_client_ref() { # CONTEXT
+  [ -n "${UKU_CLIENT_REF:-}" ] || return 0
+  die "--client filters a READ; it cannot be applied to $1 — put client_id in the body instead. Nothing was sent." "$EX_USAGE" @@api.describe
+}
+
 # ── what a successful command offers next ────────────────────────────
 _after_list() { # PATH BODY
   _wants_extras || return 0
@@ -1377,6 +1636,7 @@ list_resource() {
   # worked. parse_list_flags is shared, so the refusal belongs here.
   [ -z "${UKU_BATCH:-}" ] || die "--batch creates records — it does nothing on a list." "$EX_USAGE" @@help.batch
   load_creds; need_auth
+  _apply_client_filter "$path"
   if [ "${UKU_ALL:-0}" = "1" ]; then
     # Degraded shape (fewer rows), not an unkept promise — see the
     # jq-degradation rule near have() — so warn and continue rather than refuse.
@@ -1385,6 +1645,7 @@ list_resource() {
   local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
   do_request GET "$path$q"
   check_status "$REPLY_BODY"
+  _verify_client_filter "$REPLY_BODY"
   _after_list "$path" "$REPLY_BODY"
   if [ "${#cols[@]}" -gt 0 ]; then table "$REPLY_BODY" "${cols[@]}"; else render "$REPLY_BODY"; fi
 }
@@ -1403,6 +1664,7 @@ _list_all() {
   while [ "$more" = "1" ]; do
     do_request GET "$path$(build_query limit=$page offset=$offset ${filters[@]+"${filters[@]}"})"
     check_status "$REPLY_BODY"
+    _verify_client_filter "$REPLY_BODY"
     local got
     got="$(printf '%s' "$REPLY_BODY" | jq -r '.data[]? | @json' 2>/dev/null | tee -a "$acc" | wc -l | tr -d '[:space:]')"
     total="$(printf '%s' "$REPLY_BODY" | jq -r '.meta.total // 0' 2>/dev/null || echo 0)"
@@ -1429,8 +1691,10 @@ get_resource() {
 write_resource() {
   local method="$1" path="$2" label="$3"
   # ONE batch implementation, reached from the resource commands rather than
-  # copied into each of them (tasks/time/clients create all land here).
+  # copied into each of them (tasks/time/clients create all land here). The
+  # --client refusal comes AFTER, so a batch is told it is a batch.
   if [ -n "${UKU_BATCH:-}" ]; then run_batch "$method" "$path" "$label"; return; fi
+  _reject_client_ref "a write"
   load_creds; need_auth
   if [ -z "${UKU_DATA:-}" ]; then
     local rescmd; rescmd="$(_res_cmd "$path")"
@@ -1620,6 +1884,9 @@ _batch_match_ids() {
 # routes through (write_resource, invoices create, uku api).
 run_batch() {
   local method="$1" path="$2" label="$3"
+  # Resolution costs an API call and is a judgement call about ONE record — a
+  # batch line has neither. It carries its own fields and is never resolved.
+  _reject_client_ref "a batch"
   case "$method" in
     POST) : ;;
     *) die "--batch creates records, so it only supports POST (got $method). Nothing was sent." "$EX_USAGE" @@help.batch ;;
@@ -1910,42 +2177,43 @@ cmd_batch() {
 cmd_clients() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/clients id name status type ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku clients get <client_id>" "$EX_USAGE" @@help.topic clients; get_resource "/api/v3/clients/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku clients get <client_id|name|url>" "$EX_USAGE" @@help.topic clients; _resolve_ref clients "$2"; get_resource "/api/v3/clients/$UKU_REF_ID" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/clients "create a client" ;;
-    patch)  [ -n "${2:-}" ] || die "usage: uku clients patch <id> --data @f" "$EX_USAGE" @@help.topic clients; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/clients/$id" "update client $id" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku clients patch <id|name|url> --data @f" "$EX_USAGE" @@help.topic clients; _resolve_ref clients "$2"; local id="$UKU_REF_ID"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/clients/$id" "update client $id" ;;
     *) die "usage: uku clients <list|get|create|patch>" "$EX_USAGE" @@help.topic clients ;;
   esac
 }
 cmd_tasks() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/tasks id title status client_id ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id>" "$EX_USAGE" @@help.topic tasks; get_resource "/api/v3/tasks/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id|title|url>" "$EX_USAGE" @@help.topic tasks; _resolve_ref tasks "$2"; get_resource "/api/v3/tasks/$UKU_REF_ID" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/tasks "create a task" ;;
-    patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id> --data @f  (e.g. status/date)" "$EX_USAGE" @@help.topic tasks; local id="$2"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
+    patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id|title|url> --data @f  (e.g. status/date)" "$EX_USAGE" @@help.topic tasks; _resolve_ref tasks "$2"; local id="$UKU_REF_ID"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
     *) die "usage: uku tasks <list|get|create|patch>" "$EX_USAGE" @@help.topic tasks ;;
   esac
 }
 cmd_time() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/time-entries id task_id duration billable ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku time get <id>" "$EX_USAGE" @@help.topic time; get_resource "/api/v3/time-entries/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku time get <id|url>" "$EX_USAGE" @@help.topic time; _resolve_ref time "$2"; get_resource "/api/v3/time-entries/$UKU_REF_ID" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/time-entries "create a time entry" ;;
     *) die "usage: uku time <list|get|create>  (create needs --data with task_id, person_id, start)" "$EX_USAGE" @@help.topic time ;;
   esac
 }
-cmd_members()   { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/members id name role status ;; get) [ -n "${2:-}" ]||die "usage: uku members get <id>" "$EX_USAGE" @@help.topic members; get_resource "/api/v3/members/$2" ;; *) die "usage: uku members <list|get>" "$EX_USAGE" @@help.topic members ;; esac; }
-cmd_products()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/products id name ;; get) [ -n "${2:-}" ]||die "usage: uku products get <id>" "$EX_USAGE" @@help.topic products; get_resource "/api/v3/products/$2" ;; *) die "usage: uku products <list|get>" "$EX_USAGE" @@help.topic products ;; esac; }
-cmd_contracts() { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/contracts id client_id status ;; get) [ -n "${2:-}" ]||die "usage: uku contracts get <id>" "$EX_USAGE" @@help.topic contracts; get_resource "/api/v3/contracts/$2" ;; *) die "usage: uku contracts <list|get>" "$EX_USAGE" @@help.topic contracts ;; esac; }
-cmd_projects()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/projects id name client_id ;; get) [ -n "${2:-}" ]||die "usage: uku projects get <id>" "$EX_USAGE" @@help.topic projects; get_resource "/api/v3/projects/$2" ;; *) die "usage: uku projects <list|get>" "$EX_USAGE" @@help.topic projects ;; esac; }
+cmd_members()   { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/members id name role status ;; get) [ -n "${2:-}" ]||die "usage: uku members get <id or name or url>" "$EX_USAGE" @@help.topic members; _resolve_ref members "$2"; get_resource "/api/v3/members/$UKU_REF_ID" ;; *) die "usage: uku members <list|get>" "$EX_USAGE" @@help.topic members ;; esac; }
+cmd_products()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/products id name ;; get) [ -n "${2:-}" ]||die "usage: uku products get <id or name or url>" "$EX_USAGE" @@help.topic products; _resolve_ref products "$2"; get_resource "/api/v3/products/$UKU_REF_ID" ;; *) die "usage: uku products <list|get>" "$EX_USAGE" @@help.topic products ;; esac; }
+cmd_contracts() { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/contracts id client_id status ;; get) [ -n "${2:-}" ]||die "usage: uku contracts get <id|url>" "$EX_USAGE" @@help.topic contracts; _resolve_ref contracts "$2"; get_resource "/api/v3/contracts/$UKU_REF_ID" ;; *) die "usage: uku contracts <list|get>" "$EX_USAGE" @@help.topic contracts ;; esac; }
+cmd_projects()  { case "${1:-list}" in list) shift||true; parse_list_flags "$@"; list_resource /api/v3/projects id name client_id ;; get) [ -n "${2:-}" ]||die "usage: uku projects get <id or name or url>" "$EX_USAGE" @@help.topic projects; _resolve_ref projects "$2"; get_resource "/api/v3/projects/$UKU_REF_ID" ;; *) die "usage: uku projects <list|get>" "$EX_USAGE" @@help.topic projects ;; esac; }
 # `uku me` — the identity behind this key/account (reuses the validated status).
 cmd_me() { cmd_auth status "$@"; }
 cmd_invoices() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/invoices id invoice_number status client_id ;;
-    get)  [ -n "${2:-}" ] || die "usage: uku invoices get <invoice_id>" "$EX_USAGE" @@help.topic invoices; get_resource "/api/v3/invoices/$2" ;;
+    get)  [ -n "${2:-}" ] || die "usage: uku invoices get <invoice_id|url>" "$EX_USAGE" @@help.topic invoices; _resolve_ref invoices "$2"; get_resource "/api/v3/invoices/$UKU_REF_ID" ;;
     create)
       shift || true; parse_list_flags "$@"
       if [ -n "${UKU_BATCH:-}" ]; then run_batch POST /api/v3/invoices "create invoices"; return; fi
+      _reject_client_ref "a write"
       [ -n "${UKU_DATA:-}" ] || die "usage: uku invoices create --data @file.json  (or --data '{...}')" "$EX_USAGE" @@help.topic invoices
       load_creds; need_auth
       local payload; payload="$(read_data "$UKU_DATA")"
@@ -1959,6 +2227,92 @@ cmd_invoices() {
   esac
 }
 
+# ── uku search — ONE query, fanned out ───────────────────────────────
+# What this is, exactly, because the difference matters: the Uku API v3 offers
+# no global search endpoint that this CLI can verify, and inventing one is how
+# a tool starts lying. So `uku search` is the loop a person would otherwise
+# type by hand — the SAME `--q` that `uku <res> list --q` has always sent, run
+# once against each list endpoint in UKU_SEARCH_RESOURCES (the ones with a name
+# field, so a text query means something there). One request per resource, no
+# server-side join, no ranking across resources.
+#
+# A resource that ERRORS is reported as failed. Folding an HTTP 500 into "0
+# results" would tell the user their firm has no such client when the truth is
+# that nobody looked — the single most dangerous thing a search can do.
+cmd_search() {
+  local q="" limit=10
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit) _need_val "$@"; limit="$2"; shift 2 ;;
+      --*) die "unknown flag for search: $1  (search takes a query and --limit)" "$EX_USAGE" @@help.topic search ;;
+      *) [ -z "$q" ] || die "uku search takes ONE query — quote it: uku search 'acme ltd'" "$EX_USAGE" @@help.topic search
+         q="$1"; shift ;;
+    esac
+  done
+  [ -n "$q" ] || die "usage: uku search <query> [--limit N]" "$EX_USAGE" @@help.topic search
+  load_creds; need_auth
+
+  local res path rc data cnt fld nl
+  local json="" first=1 hits=0 failed=0 tty_rows="" bc_res="" bc_id=""
+  for res in $UKU_SEARCH_RESOURCES; do
+    path="$(_res_path "$res")"; fld="$(_name_field "$res")"
+    rc=0
+    _UKU_NO_HEAL=1 UKU_SOFT=1 do_request GET "$path$(build_query q="$q" limit="$limit")" || rc=$?
+    [ "$first" = "1" ] || json="$json,"; first=0
+    if [ "$rc" != "0" ]; then
+      failed=$((failed + 1))
+      json="$json{\"resource\":$(_json_str "$res"),\"path\":$(_json_str "$path"),\"ok\":false,\"status\":null,\"error\":$(_json_str "could not reach $UKU_BASE"),\"count\":null,\"data\":null}"
+      tty_rows="$tty_rows$res	FAILED — could not reach $UKU_BASE"$'\n'
+      continue
+    fi
+    case "$REPLY_STATUS" in
+      2*) : ;;
+      *)
+        failed=$((failed + 1))
+        json="$json{\"resource\":$(_json_str "$res"),\"path\":$(_json_str "$path"),\"ok\":false,\"status\":$REPLY_STATUS,\"error\":$(_json_str "HTTP $REPLY_STATUS — $(_body_msg "$REPLY_BODY" | tr '\n' ' ' | cut -c1-120)"),\"count\":null,\"data\":null}"
+        tty_rows="$tty_rows$res	FAILED — HTTP $REPLY_STATUS (not searched, NOT zero results)"$'\n'
+        continue ;;
+    esac
+    data="$(printf '%s' "$REPLY_BODY" | _json_scan field data)"
+    [ -n "$data" ] || data="[]"
+    cnt="$(printf '%s' "$data" | _json_scan len -)"
+    case "$cnt" in ''|-1) cnt=0 ;; esac
+    hits=$((hits + cnt))
+    json="$json{\"resource\":$(_json_str "$res"),\"path\":$(_json_str "$path"),\"ok\":true,\"status\":$REPLY_STATUS,\"error\":null,\"count\":$cnt,\"data\":$data}"
+    local names=""
+    if have jq && [ "$cnt" -gt 0 ]; then
+      names="$(printf '%s' "$REPLY_BODY" | jq -r --arg f "$fld" '.data[]? | "\(.id)  \((.[$f] // "-") | tostring)"' 2>/dev/null | head -n "$limit" || true)"
+      [ -z "$bc_id" ] && bc_res="$res" && bc_id="$(printf '%s' "$names" | head -n1 | awk '{print $1}')"
+    fi
+    tty_rows="$tty_rows$res	$cnt"$'\n'
+    if [ -n "$names" ]; then
+      while IFS= read -r nl; do [ -n "$nl" ] || continue; tty_rows="$tty_rows 	  $nl"$'\n'; done <<EOF
+$names
+EOF
+    fi
+  done
+  json="{\"query\":$(_json_str "$q"),\"kind\":\"fanout\",\"resources\":[$json]}"
+
+  local summary="$hits match(es) for '$q' across $(printf '%s' "$UKU_SEARCH_RESOURCES" | wc -w | tr -d '[:space:]') list endpoints"
+  [ "$failed" -gt 0 ] && summary="$summary · $failed endpoint(s) FAILED and were not searched"
+  if _wants_extras; then
+    UKU_SUMMARY="$summary"
+    [ -n "$bc_id" ] && _bc_add "@@$bc_res.get" "$bc_id"
+  fi
+  if [ "${UKU_AGENT:-0}" = "1" ]; then _agent_ok "$json" "$summary"
+  elif [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then printf '%s\n' "$json"
+  else
+    printf '  %s %s\n' "$(_bold "search \"$q\"")" \
+      "$(_dim '— one --q per list endpoint. Not a server-side search: the API has none.')"
+    printf '%s' "$tty_rows" | { have column && column -t -s "$(printf '\t')" || tr '\t' ' '; }
+    have jq || warn "install jq to see the matching records, not just the counts."
+    [ "$failed" -gt 0 ] && warn "$failed endpoint(s) failed — those are UNSEARCHED, not empty."
+    _bc_flush
+  fi
+  [ "$failed" -gt 0 ] && exit "$EX_API"
+  return 0
+}
+
 cmd_api() {
   # uku api --describe            → the endpoint catalog (agent self-orientation)
   # uku api METHOD PATH [--data X] [--query k=v]...
@@ -1970,6 +2324,7 @@ cmd_api() {
   load_creds; need_auth
   case "$path" in /*) : ;; *) path="/$path" ;; esac
   if [ -n "${UKU_BATCH:-}" ]; then run_batch "$method" "$path" "$method $path"; return; fi
+  case "$method" in GET|HEAD) _apply_client_filter "$path" ;; *) _reject_client_ref "a write" ;; esac
   local q; q="$(build_query ${UKU_QUERY[@]+"${UKU_QUERY[@]}"})"
   local payload=""; [ -n "${UKU_DATA:-}" ] && payload="$(read_data "$UKU_DATA")"
   case "$method" in
@@ -1979,6 +2334,7 @@ cmd_api() {
   esac
   do_request "$method" "$path$q" "$payload"
   check_status "$REPLY_BODY"
+  _verify_client_filter "$REPLY_BODY"
   # `uku api` reaches paths this CLI has no command for, so the breadcrumb is
   # only offered when the path IS one of the modelled resources; the summary is
   # always the honest one — the request and what the server answered.
@@ -2260,22 +2616,23 @@ _surface_table() {
 auth        |              | login status logout print-header | print-headers | --account --company --base --key-stdin --format --shell |                                                 | `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api` :: `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored :: `--shell` is shorthand for `--format shell`
 account     | accounts     | list add use current remove | ls switch who rm | --company --key-stdin                               | use <name> :: add <name> :: remove <name>       | `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list` :: `add` is sugar for `uku auth login --account <name>` :: run `uku account current` before any write — a sandbox and the real firm look identical in the output
 setup       | setup-agents | agents                  |                |                                                         |                                                 | UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
-clients     |              | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id>            | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read
-tasks       |              | list get !create !patch |                | @list @data @bulk                                       | get <task_id> :: patch <task_id>                | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from
-time        |              | list get !create        |                | @list @data @bulk                                       | get <id>                                        | there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>` :: `create` needs task_id, person_id and start :: `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending
-invoices    |              | list get !create        |                | @list @data @bulk                                       | get <invoice_id>                                | money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it :: there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>`
-members     |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI — member writes go through `uku api`
-products    |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI; the API does accept `POST /api/v3/products` (needs `name`) — reach it with `uku api`
-contracts   |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules
-projects    |              | list get                |                | @list                                                   | get <id>                                        | read-only in the CLI; the API does accept `POST /api/v3/projects` (needs `name`) — reach it with `uku api`
+clients     | client       | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id> :: get/patch also take a client NAME or a pasted URL | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read :: `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks` :: `--client` is not a filter here (you are already listing clients) — use `--q`
+tasks       | task         | list get !create !patch |                | @list --client @data @bulk                              | get <task_id> :: patch <task_id> :: get/patch also take a task TITLE or a pasted URL | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from :: an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates :: `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand :: that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs :: neither resolution happens on a write, in a `--batch`, or for an argument that already looks like an id
+time        |              | list get !create        |                | @list --client @data @bulk                              | get <id> :: get also takes a pasted URL (no name field here) | there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>` :: `create` needs task_id, person_id and start :: `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending :: a time entry has no name, so `get` takes an id or a pasted URL — never a name
+invoices    | invoice      | list get !create        |                | @list --client @data @bulk                              | get <invoice_id> :: get also takes a pasted URL (no name field here) | money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it :: there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>` :: an invoice has no name field, so `get` takes an id or a pasted URL — never a name
+members     | member       | list get                |                | @list                                                   | get <id> :: get also takes a member NAME or a pasted URL | read-only in the CLI — member writes go through `uku api` :: `get` also takes a member NAME (resolved through `--q`) or a pasted URL
+products    | product      | list get                |                | @list                                                   | get <id> :: get also takes a product NAME or a pasted URL | read-only in the CLI; the API does accept `POST /api/v3/products` (needs `name`) — reach it with `uku api` :: `get` also takes a product NAME or a pasted URL
+contracts   | contract     | list get                |                | @list --client                                          | get <id> :: get also takes a pasted URL (no name field here) | read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules :: a contract has no name field, so `get` takes an id or a pasted URL — never a name
+projects    | project      | list get                |                | @list --client                                          | get <id> :: get also takes a project NAME or a pasted URL | read-only in the CLI; the API does accept `POST /api/v3/projects` (needs `name`) — reach it with `uku api` :: `get` also takes a project NAME or a pasted URL
 me          |              |                         |                |                                                         |                                                 | prints exactly what `uku auth status` prints — the identity behind the active key
-api         |              |                         |                | !--describe @list @data @bulk                           | <METHOD> :: </api/v3/...>                       | METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks` :: `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient :: this reaches every v3 endpoint, so prefer it over dropping to curl
+search      |              |                         |                | --limit                                                 | <query>                                         | NOT a server-side global search — the API offers none this CLI can verify. It is ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), one request each :: a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did :: `--limit` is per endpoint
+api         |              |                         |                | !--describe @list --client @data @bulk                  | <METHOD> :: </api/v3/...>                       | METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks` :: `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient :: this reaches every v3 endpoint, so prefer it over dropping to curl :: `--client NAME` works on a GET whose path is one of the collections that carry a client_id; on a write it is a usage error
 batch       |              | list show               | ls             |                                                         | show <run-id>                                   | reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request :: `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
 doctor      |              |                         |                |                                                         |                                                 | `--json` (the global flag) gives the whole report as JSON :: exits 1 only when a REQUIRED check fails, never for a warning
 update      |              |                         |                |                                                         |                                                 | re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
-help        |              | auth account setup clients tasks time invoices members products contracts projects batch api | | |  <command>                                     | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
+help        |              | auth account setup clients tasks time invoices members products contracts projects batch api search names | | |  <command>                                   | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
 %global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields --account --base --header -H --if-match --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs}; `--json` stays the RAW API body and never changes :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
 TABLE
 }
@@ -2494,7 +2851,11 @@ EOF
       local subs; subs=" $(_surface_field sub "$topic")"
       printf '%s — %s\n' "$(_bold "uku $topic")" "$(printf '%s' "$subs" | tr -s ' ' | sed 's/^ //;s/ $//;s/ /\//g')"
       printf '  uku %s list [--q X] [--status S] [--limit N] [--offset N] [--all] [--json]\n' "$topic"
-      printf '  uku %s get <id>\n' "$topic"
+      if [ -n "$(_name_field "$topic")" ]; then
+        printf '  uku %s get <id>          also takes a name, or a URL you pasted — see: uku help names\n' "$topic"
+      else
+        printf '  uku %s get <id>          also takes a URL you pasted (no name field here) — see: uku help names\n' "$topic"
+      fi
       case "$subs" in *" create "*)
         printf '  uku %s create --data @file.json --yes\n' "$topic"
         printf '  uku %s create --batch @file.jsonl --yes      many at once — see: uku help batch\n' "$topic" ;;
@@ -2573,6 +2934,67 @@ $(_bold "WRITES, RATE LIMITS, FAILURES")
   still runs the read-only match query — otherwise it could not tell you which
   lines that would skip.)
   Exit: 0 all good · 3 some line failed · 5 stopped on the rate limit · 4 refused.
+EOF
+    ;;
+    names) cat <<EOF
+$(_bold "uku … <name>") — naming a record without knowing its id
+
+  uku clients get "Acme Ltd"            a name instead of an id
+  uku clients get 41                    an id passes straight through — no lookup
+  uku clients get '$UKU_BASE_DEFAULT/…/41'
+                                        a URL you pasted from the browser (the
+                                        CLI reads the last id in it — whatever
+                                        the page's route happens to be)
+  uku tasks list --client "Acme"        the same, as a filter
+  uku search "acme"                     when you are not sure what you are after
+
+$(_bold "HOW A NAME IS RESOLVED")  (one request, on the endpoint the command already names)
+  The CLI sends the same \`--q\` a list takes, then matches what came back:
+  exact first (case-insensitive for ASCII), then a unique substring.
+    • exactly one match  → it is used, and the record + its id are printed on
+      stderr before anything else happens. You always see what was chosen.
+    • several matches    → $(_bold "refused"), with the candidates and their ids.
+      In a firm dozens of records legitimately share a name; picking one would
+      be picking wrong, and this CLI writes invoices.
+    • no match           → refused, with whatever the query did bring back.
+  Resolving needs jq (it compares a field exactly). Without jq it refuses
+  rather than guess — pass an id.
+
+$(_bold "WHICH RESOURCES")  clients (name) · tasks (title) · members, products,
+  projects (name). An invoice, a contract and a time entry have no name field,
+  so there they take an id or a URL — never a name.
+
+$(_bold "A URL YOU PASTED")
+  The host must match the base URL this account uses ($UKU_BASE_DEFAULT by
+  default); a link from anywhere else is refused and nothing is sent. The id is
+  the last id-shaped segment — the command already names the resource, so no
+  knowledge of the web app's routes is involved.
+
+$(_bold "WHAT NEVER RESOLVES")  an argument that already looks like an id (no
+  request at all) · a write body · any line of a --batch. A batch line carries
+  its own fields; guessing an id into one would be inventing data.
+EOF
+    ;;
+    search) cat <<EOF
+$(_bold "uku search") — one query, fanned out over the list endpoints
+
+  uku search "acme"
+  uku search "acme" --limit 3
+  uku search "acme" --json | jq '.resources[] | select(.count > 0)'
+
+$(_bold "WHAT THIS IS, EXACTLY")
+  Not a server-side global search: the Uku API v3 offers none that this CLI can
+  verify, and inventing an endpoint is how a tool starts lying. This is the
+  loop you would otherwise type — the SAME \`--q\` that \`uku <res> list --q\`
+  sends, run once against each list endpoint that has a name field:
+    clients · tasks · members · products · projects
+  One request per resource. No server-side join, no ranking across resources.
+  --limit is per endpoint (default 10).
+
+$(_bold "A FAILING ENDPOINT IS REPORTED, NEVER SWALLOWED")
+  If one of them errors it is listed as FAILED — not as zero results. "No such
+  client" when nobody actually looked is the most dangerous thing a search can
+  say. Exit 3 when any endpoint failed; 0 when all of them answered.
 EOF
     ;;
     api) cat <<EOF
@@ -2666,9 +3088,40 @@ The `notes` are the gotchas — above all the negative kind (which subcommand do
 - `uku clients list [--q X] [--status S] [--limit N]` · `uku clients get <id>`
 - `uku tasks list` · `uku time list` · `uku invoices list [--status draft]` · `uku invoices get <id>`
 - `uku invoices create --data @file.json --yes` — a deliberate write.
+- `uku search <query>` — one `--q` fanned out over the list endpoints that have a name field. See below; it is **not** a global search endpoint.
 - `uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]` — every one of the 80+ v3 endpoints. Use this for anything without a first-class command.
+- Singular aliases work everywhere: `uku client get 41` = `uku clients get 41` (also `task`, `invoice`, `member`, `product`, `project`, `contract`).
 - Global: `--header 'K: V'` (repeatable) · `--if-match '<etag>'` · `--dry-run` (prints the request, sends nothing) · `--agent` (the envelope above) · `--no-hints`.
 - `uku auth print-header` — the raw auth headers, for the rare case `uku api` can't express something. It prints a **live credential**: never echo it back to the user, never put it in a file you commit, and prefer `uku api`.
+
+## Naming a record you have no id for
+
+The user will give you a **name** or paste a **URL**, not an id. Both work as the
+argument, and both are safe because neither ever guesses:
+
+```
+uku clients get "Acme Ltd"            # resolved by name
+uku clients get 41                    # an id — passes through, no lookup request
+uku clients get 'https://<same host as the account>/…/41'
+uku tasks list --client "Acme Ltd"    # resolves once, then filters by client_id
+```
+
+- **How a name resolves:** the CLI sends the same `--q` a list takes, on the endpoint the command already names, then matches exact (ASCII case-insensitive) then unique substring. **Exactly one match** is used and the chosen record + id are printed on stderr. **Several matches → refused** (exit 1) with the candidates listed: pick one and re-run with its id — do not retry the same name, and never pick one yourself by re-running with a longer guess unless the user confirms it. **No match → refused.** Resolving needs `jq`.
+- **Which resources have a name to match:** clients (`name`), tasks (`title`), members, products, projects (`name`). An invoice, a contract and a time entry have **no** name field — there, only an id or a URL works.
+- **A URL** must be on the same host as the account's base URL; anything else is refused and nothing is sent. The id taken is the last id-shaped segment.
+- **Never resolved:** an argument that already looks like an id (no request is made), a write body, or any line of a `--batch`. `--client` on a write or a batch is a usage error.
+- **`--client` verifies itself.** After the response comes back the CLI compares `client_id` on every returned row against the one asked for. A mismatch means the endpoint ignored the filter, and the command fails with **exit 3** — so a `--client` result that succeeded really is that client's data. Do not work around that error by re-running without `--client` and presenting the rows as the client's; they are not.
+
+## `uku search <query>` — what it is and is not
+
+It is **not** a server-side global search; the API offers none. It is one `--q` run
+against each list endpoint that has a name field (clients, tasks, members, products,
+projects) — one request each. `--limit` is per endpoint.
+
+Output is `{query, kind:"fanout", resources:[{resource, path, ok, status, error, count, data}]}`.
+**An endpoint that errored has `ok:false` and `count:null` — that is "nobody looked",
+not "nothing found". Never report it to the user as zero results.** Exit 3 if any
+endpoint failed.
 
 ## Building a write payload
 You must supply the body; the CLI does not invent fields. Discover the shape from
@@ -2825,6 +3278,9 @@ parse_list_flags() {
       --limit) _need_val "$@"; UKU_QUERY+=("limit=$2"); shift 2 ;;
       --offset) _need_val "$@"; UKU_QUERY+=("offset=$2"); shift 2 ;;
       --q|--search) _need_val "$@"; UKU_QUERY+=("q=$2"); shift 2 ;;
+      # A NAME or an id. A name costs one lookup and is resolved where the
+      # path is known (list_resource / uku api), never on a write or a batch.
+      --client) _need_val "$@"; UKU_CLIENT_REF="$2"; shift 2 ;;
       --status) _need_val "$@"; UKU_QUERY+=("status=$2"); shift 2 ;;
       --sort) _need_val "$@"; UKU_QUERY+=("sort=$2"); shift 2 ;;
       --query) _need_val "$@"; UKU_QUERY+=("$2"); shift 2 ;;
@@ -2855,6 +3311,19 @@ $(_bold "AUTH")
   uku auth login              Sign in (stores a scoped API key, 0600)
   uku auth status             Show who you're signed in as
   uku auth logout             Remove stored credentials
+
+$(_bold "FINDING A RECORD")  (you rarely have the id — see: uku help names)
+  uku clients get "Acme Ltd"          A name instead of an id. Exactly one
+                                      match is used and named on stderr;
+                                      several refuse and list the candidates.
+  uku clients get 'https://…/41'      A URL you pasted. The host must be this
+                                      account's; the last id in it is the id.
+  uku tasks list --client "Acme"      Resolve once, filter by client_id
+  uku search "acme"                   One --q across the list endpoints that
+                                      have a name field. NOT a server-side
+                                      search — the API has none. See:
+                                      uku help search
+  Singular works everywhere: uku client get 41 = uku clients get 41
 
 $(_bold "RESOURCES")  (read with any key · every one takes list [flags] and get <id>)
   uku clients list [--q X] [--status S] [--limit N]      uku clients get <id>
@@ -2930,6 +3399,13 @@ $(_bold "GLOBAL FLAGS")
                     confirmed. Check the server first — it may already exist.
   --skip-existing --match-on FIELD    Query before creating. Read the hazard in
                     uku help batch first — the ledger is the trustworthy path.
+  --client <name|id>  Filter a list by client. A name is resolved first (one
+                    request, and it refuses rather than guess); an id is sent
+                    as it stands. Only where the records carry a client_id —
+                    tasks, time, invoices, contracts, projects. The result is
+                    then CHECKED: if any row comes back belonging to another
+                    client, the endpoint ignored the filter and the command
+                    fails (exit 3) instead of passing off an unfiltered list
   --account <name>  Run against a specific account (default: the active one)
   --base <url>      Override the API base URL
   --header, -H 'K: V'  Add a request header (repeatable; off argv, like the key)
@@ -3089,15 +3565,20 @@ case "$cmd" in
   auth)     cmd_auth "$@" ;;
   account|accounts) cmd_account "$@" ;;
   setup)    cmd_setup "$@" ;;
-  clients)  cmd_clients "$@" ;;
-  tasks)    cmd_tasks "$@" ;;
-  time)     cmd_time "$@" ;;
-  invoices) cmd_invoices "$@" ;;
-  members)  cmd_members "$@" ;;
-  products) cmd_products "$@" ;;
-  contracts) cmd_contracts "$@" ;;
-  projects) cmd_projects "$@" ;;
+  # Singular and plural are the SAME label on the same case arm, not a second
+  # arm calling the same function: an alias that is its own code path is a
+  # thing that can drift. `uku client get 1` and `uku clients get 1` are one
+  # command by construction.
+  clients|client)     cmd_clients "$@" ;;
+  tasks|task)         cmd_tasks "$@" ;;
+  time)               cmd_time "$@" ;;
+  invoices|invoice)   cmd_invoices "$@" ;;
+  members|member)     cmd_members "$@" ;;
+  products|product)   cmd_products "$@" ;;
+  contracts|contract) cmd_contracts "$@" ;;
+  projects|project)   cmd_projects "$@" ;;
   me)       cmd_me "$@" ;;
+  search)   cmd_search "$@" ;;
   api)      cmd_api "$@" ;;
   batch)    cmd_batch "$@" ;;
   doctor)   cmd_doctor "$@" ;;

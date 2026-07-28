@@ -5,17 +5,26 @@ arg api </api/v3/...>
 arg api <METHOD>
 arg batch show <run-id>
 arg clients get <client_id>
+arg clients get/patch also take a client NAME or a pasted URL
 arg clients patch <client_id>
 arg completions <shell>
 arg contracts get <id>
+arg contracts get also takes a pasted URL (no name field here)
 arg help <command>
 arg invoices get <invoice_id>
+arg invoices get also takes a pasted URL (no name field here)
 arg members get <id>
+arg members get also takes a member NAME or a pasted URL
 arg products get <id>
+arg products get also takes a product NAME or a pasted URL
 arg projects get <id>
+arg projects get also takes a project NAME or a pasted URL
+arg search <query>
 arg tasks get <task_id>
+arg tasks get/patch also take a task TITLE or a pasted URL
 arg tasks patch <task_id>
 arg time get <id>
+arg time get also takes a pasted URL (no name field here)
 cmd account
 cmd api
 cmd auth
@@ -30,13 +39,21 @@ cmd me
 cmd members
 cmd products
 cmd projects
+cmd search
 cmd setup
 cmd tasks
 cmd time
 cmd update
 cmd version
 cmdalias account accounts
+cmdalias clients client
+cmdalias contracts contract
+cmdalias invoices invoice
+cmdalias members member
+cmdalias products product
+cmdalias projects project
 cmdalias setup setup-agents
+cmdalias tasks task
 doc %global --agent
 doc api --describe
 doc clients create
@@ -49,6 +66,7 @@ flag account --company
 flag account --key-stdin
 flag api --all
 flag api --batch
+flag api --client
 flag api --cursor
 flag api --data
 flag api --describe
@@ -91,6 +109,7 @@ flag clients --status
 flag clients --stop-on-error
 flag clients -d
 flag contracts --all
+flag contracts --client
 flag contracts --cursor
 flag contracts --limit
 flag contracts --offset
@@ -101,6 +120,7 @@ flag contracts --sort
 flag contracts --status
 flag invoices --all
 flag invoices --batch
+flag invoices --client
 flag invoices --cursor
 flag invoices --data
 flag invoices --limit
@@ -136,6 +156,7 @@ flag products --search
 flag products --sort
 flag products --status
 flag projects --all
+flag projects --client
 flag projects --cursor
 flag projects --limit
 flag projects --offset
@@ -144,8 +165,10 @@ flag projects --query
 flag projects --search
 flag projects --sort
 flag projects --status
+flag search --limit
 flag tasks --all
 flag tasks --batch
+flag tasks --client
 flag tasks --cursor
 flag tasks --data
 flag tasks --limit
@@ -164,6 +187,7 @@ flag tasks --stop-on-error
 flag tasks -d
 flag time --all
 flag time --batch
+flag time --client
 flag time --cursor
 flag time --data
 flag time --limit
@@ -212,6 +236,7 @@ note account `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --
 note account `add` is sugar for `uku auth login --account <name>`
 note account run `uku account current` before any write — a sandbox and the real firm look identical in the output
 note api METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks`
+note api `--client NAME` works on a GET whose path is one of the collections that carry a client_id; on a write it is a usage error
 note api `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient
 note api this reaches every v3 endpoint, so prefer it over dropping to curl
 note auth `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored
@@ -220,24 +245,39 @@ note auth `print-header` prints a LIVE credential on stdout — never echo it ba
 note batch `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
 note batch reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request
 note clients --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read
+note clients `--client` is not a filter here (you are already listing clients) — use `--q`
+note clients `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks`
 note clients a write needs --yes when stdout is not a TTY (exit 4 otherwise)
 note completions eval "$(uku completions zsh)" in your rc
+note contracts a contract has no name field, so `get` takes an id or a pasted URL — never a name
 note contracts read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules
 note doctor `--json` (the global flag) gives the whole report as JSON
 note doctor exits 1 only when a REQUIRED check fails, never for a warning
 note help `uku <command> --help` prints the same card
 note help a topic with no card is a usage error, not an empty page
+note invoices an invoice has no name field, so `get` takes an id or a pasted URL — never a name
 note invoices money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it
 note invoices there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>`
 note me prints exactly what `uku auth status` prints — the identity behind the active key
+note members `get` also takes a member NAME (resolved through `--q`) or a pasted URL
 note members read-only in the CLI — member writes go through `uku api`
+note products `get` also takes a product NAME or a pasted URL
 note products read-only in the CLI; the API does accept `POST /api/v3/products` (needs `name`) — reach it with `uku api`
+note projects `get` also takes a project NAME or a pasted URL
 note projects read-only in the CLI; the API does accept `POST /api/v3/projects` (needs `name`) — reach it with `uku api`
+note search NOT a server-side global search — the API offers none this CLI can verify. It is ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), one request each
+note search `--limit` is per endpoint
+note search a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did
 note setup UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
+note tasks `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand
 note tasks `create` needs `title`; status/date/client_id are optional
 note tasks a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from
+note tasks an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates
+note tasks neither resolution happens on a write, in a `--batch`, or for an argument that already looks like an id
+note tasks that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs
 note time `create` needs task_id, person_id and start
 note time `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending
+note time a time entry has no name, so `get` takes an id or a pasted URL — never a name
 note time there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>`
 note update re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
 note version identical to `uku --version`
@@ -268,8 +308,10 @@ sub help clients
 sub help contracts
 sub help invoices
 sub help members
+sub help names
 sub help products
 sub help projects
+sub help search
 sub help setup
 sub help tasks
 sub help time
