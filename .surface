@@ -264,6 +264,7 @@ note help a topic with no card is a usage error, not an empty page
 note invoices an invoice has no name field, so `get` takes an id or a pasted URL — never a name
 note invoices money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it
 note invoices there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>`
+note invoices there is no `uku invoices send` and no `uku invoices mark-paid` either — the API has both as POSTs, so use `uku api POST /api/v3/invoices/<id>/send --yes` and `uku api POST /api/v3/invoices/<id>/mark-paid --yes`. Do not guess a subcommand for a money action
 note me prints exactly what `uku auth status` prints — the identity behind the active key
 note members `get` also takes a member NAME (resolved through `--q`) or a pasted URL
 note members read-only in the CLI — member writes go through `uku api`
