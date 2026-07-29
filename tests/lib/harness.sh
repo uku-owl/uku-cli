@@ -265,6 +265,33 @@ uku() {
   return 0
 }
 
+# uku_tty — same as uku(), but stdout is attached to a REAL pty via
+# tests/lib/pty_run.py, never a plain file. Every other case runs uku() with
+# stdout redirected to $OUT_FILE specifically so the "no --yes, no tty"
+# refusal is testable — but that also means bin/uku's `table()` TTY-only
+# branch (the one --fields codepath that used to splice field names into a
+# jq program, S4 in the 2026-07-29 security audit) was never exercised by any
+# of the other ~930 assertions in this suite. Use uku() for everything else;
+# this exists only for cases that must be a real terminal to reach the code
+# under test.
+uku_tty() {
+  _guard_base
+  local a
+  for a in "$@"; do
+    case "$a" in
+      http://127.0.0.1*|https://127.0.0.1*) : ;;
+      http://*|https://*)
+        printf 'Bail out! a test passed a non-loopback URL (%s)\n' "$a"; exit 99 ;;
+    esac
+  done
+  : > "$OUT_FILE"; : > "$ERR_FILE"
+  "$PYTHON_BIN" "$TESTS_DIR/lib/pty_run.py" "$OUT_FILE" "$ERR_FILE" -- "$UKU_BIN" "$@"
+  STATUS=$?
+  OUT="$(cat "$OUT_FILE")"
+  ERR="$(cat "$ERR_FILE")"
+  return 0
+}
+
 # uku_stdin — same, but feeds stdin from the given file (for --data @- / --batch @-)
 uku_stdin() {
   local infile="$1"; shift
