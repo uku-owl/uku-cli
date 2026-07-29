@@ -442,12 +442,50 @@ _pace_write() {
   return 0
 }
 
+# _audit_rotate LOG — single rollover to LOG.1, checked before every write.
+# Threshold is size (~5MB) OR line count (~10k), whichever a real firm's CLI
+# use crosses first: a size cap alone lets one write with an enormous
+# --if-match source path push a still-short-by-lines file well past 5MB; a
+# line cap alone lets a long run of ordinary short lines blow past 5MB while
+# still under 10k lines. Not a logging framework — ONE old generation,
+# overwritten each rollover, because this is a receipt someone might tail or
+# hand to support, not an archive to reconstruct a year of history from.
+# Every failure here (unwritable UKU_CONFIG_HOME, mv missing, whatever) is
+# swallowed and falls through to the write still happening — a rotation
+# problem must never stop the entry that triggered the check, same property
+# _audit itself holds end to end.
+_audit_rotate() {
+  local log="$1"
+  [ -f "$log" ] || return 0
+  local size lines
+  size="$(wc -c <"$log" 2>/dev/null | tr -d '[:space:]')" || size=0
+  lines="$(wc -l <"$log" 2>/dev/null | tr -d '[:space:]')" || lines=0
+  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+  case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+  if [ "$size" -lt 5242880 ] && [ "$lines" -lt 10000 ]; then return 0; fi
+  mv -f "$log" "${log}.1" 2>/dev/null || return 0
+  chmod 600 "${log}.1" 2>/dev/null || true
+  return 0
+}
+
 # Local ledger of every change (no bodies, no keys) — a receipt for accountants (#6).
+# The path is logged WITHOUT its query string (S9, audit 2026-07-29): a `uku
+# api` write can carry one — `POST /api/v3/tasks?q=Acme%20Ltd` — and a name a
+# firm searched for is exactly what "no bodies, no keys" was never meant to
+# cover. Measured: the query is the only place free-text like that reaches
+# this file. The path's own segments are resource ids (numeric or opaque),
+# which the receipt has to keep to say WHICH task/client/invoice changed — an
+# accountant reconciling this log against what happened needs that; nothing
+# about dropping the query costs them that lookup, so no replacement is kept.
+# Rotates before writing (_audit_rotate) so a year of daily use does not stay
+# one unbounded file — Rain's first real day alone produced 125 lines with
+# nothing ever truncating it.
 _audit() {
   mkdir -p "$UKU_CONFIG_HOME" 2>/dev/null || return 0
   local log="$UKU_CONFIG_HOME/audit.log"
+  _audit_rotate "$log"
   printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)" \
-    "${UKU_PROFILE:-?}" "$1" "$2" "$3" >> "$log" 2>/dev/null || true
+    "${UKU_PROFILE:-?}" "$1" "${2%%\?*}" "$3" >> "$log" 2>/dev/null || true
   chmod 600 "$log" 2>/dev/null || true
   return 0
 }

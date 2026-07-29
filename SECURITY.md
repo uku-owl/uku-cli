@@ -100,11 +100,13 @@ recorded in a local audit log at `~/.config/uku/audit.log` (0600).
 
 Be precise about what that log holds, because it is a file people share when
 something goes wrong: one tab-separated line per write — timestamp, account
-name, method, **the request path including its query string**, and the response
-status. No request body, no response body, no key. The query string means a
-name you searched for can appear in it (`POST /api/v3/tasks?q=Acme%20Ltd`), so
-treat it as containing client names. It is not rotated and grows without
-limit.
+name, method, **the request path with any query string stripped**, and the
+response status. No request body, no response body, no key, no query string —
+a name you searched for (`?q=Acme%20Ltd`) is never written. The path's own
+segments (a task or client id) still are, because a receipt has to say which
+record changed. It rotates: once the file crosses ~5 MB or ~10k lines, it is
+moved to `audit.log.1` (one prior generation, overwritten on the next
+rollover) and a fresh `audit.log` starts — both files kept at 0600.
 
 **Writes are re-sent automatically in exactly one case, and it is the case where
 re-sending cannot do harm.** A `428 PRECONDITION_REQUIRED` means the server
