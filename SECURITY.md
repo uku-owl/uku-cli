@@ -18,7 +18,28 @@ an accounting firm's data. We take its security posture seriously.
 - **Validated before it's saved.** `uku auth login` verifies the key against the
   API *before* writing anything to disk — bad credentials never land.
 - **Temp files are swept on any exit**, including Ctrl-C, via a trap — the 0600
-  key-config file never lingers in `$TMPDIR`.
+  key-config file never lingers in `$TMPDIR`. Every temp file of a run (the key
+  config, the request body, response buffers) is created inside one private
+  directory under `$TMPDIR`, and the EXIT/INT/TERM/HUP traps remove that
+  directory. Asserted, not assumed: `tests/cases/no-residue.sh` runs the four
+  failure paths — network error, `--dry-run`, Ctrl-C mid-request, a
+  rate-limit-refused batch — and greps the filesystem afterwards.
+
+  This claim was **false in v0.4.0 and every version before it**. The sweep kept
+  its file list in a variable that every call site updated from inside a
+  subshell, so the list stayed empty and the traps deleted nothing; the happy
+  path was clean only because the request code deleted its own files
+  explicitly. If you ran v0.4.0 or earlier, look in `$TMPDIR` (on macOS
+  `/var/folders/**/T`, which is cleared only on reboot) for stray `tmp.*` files
+  holding `header = "X-API-Key: …"`, and delete them.
+- **A credential must be a single line.** `curl`'s `-K` config grammar is
+  line-based, so a newline inside the API key or the company id would end the
+  header directive and begin a new one — `url = http://elsewhere/` there makes
+  curl perform a second transfer carrying the live key. The CLI refuses such a
+  value before anything is sent and before anything is stored, so neither the
+  environment, `--key-stdin` reading a file, nor a hand-edited profile can
+  smuggle one through. Fixed after v0.4.0; v0.4.0 and earlier escaped `\` and `"`
+  in a credential but not line breaks.
 
 ## The permission model — money has its own key
 
