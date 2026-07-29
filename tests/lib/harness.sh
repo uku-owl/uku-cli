@@ -97,6 +97,26 @@ setup_case() {
   export UKU_INSTALL_URL="http://127.0.0.1:1/never"
   unset UKU_QUIET UKU_JSON UKU_DRY UKU_YES 2>/dev/null || true
 
+  # ── no case may reach the real OS keyring ──────────────────────────
+  # `auth logout` and `account remove` sweep the OS credential store as well as
+  # the profile file (S8), so cases that never mention a keyring — accounts.sh
+  # removes four accounts — would otherwise run the developer's real
+  # `security` against their login keychain. Nothing is written by a delete
+  # that matches nothing, but "nothing is written" is not a property this suite
+  # should be relying on the developer's luck for. So both tools are stubbed
+  # for EVERY case as "there is no such item" (status 44, the code the real
+  # `security` returns), which is the answer a hermetic box should give.
+  # tests/cases/keyring.sh puts its own stub in front of this one.
+  mkdir -p "$CASE_DIR/nokeyring"
+  for _kr_tool in security secret-tool; do
+    { printf '#!/bin/sh\n'
+      printf '# hermetic stub — the real keyring is out of bounds in tests\n'
+      printf 'exit 44\n'
+    } > "$CASE_DIR/nokeyring/$_kr_tool"
+    chmod +x "$CASE_DIR/nokeyring/$_kr_tool"
+  done
+  export PATH="$CASE_DIR/nokeyring:$PATH"
+
   SERVER_SCRIPT="$CASE_DIR/script.json"
   REQ_LOG="$CASE_DIR/requests.jsonl"
   OUT_FILE="$CASE_DIR/stdout"

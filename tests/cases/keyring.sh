@@ -341,6 +341,15 @@ uku clients list
 assert_status 1 'a key with a line break in it is refused'
 assert_no_requests 'and NOTHING is sent — not one request, let alone two'
 assert_err_contains 'must be a single line' 'with the same reason as every other credential path'
+# The check has to happen where the key is READ, not only where it is sent —
+# and this is the assertion that proves it, because the send path has its own
+# guard and would otherwise make the read-side one look redundant.
+assert_err_contains 'from the OS keyring' 'and the message names the store the bad value came out of'
+# print-header is the proof that the read-side check is not redundant: it needs
+# no request at all, so nothing on the send path would ever look at this value.
+uku auth print-header --format plain
+assert_status 1 'print-header refuses it too'
+assert_out_not_contains 'exfil' 'and never puts the injected line on stdout'
 rm -f "$STUB_STORE"/* 2>/dev/null || true
 
 # ── 12 migration: an ordinary command never moves a key ──────────────
@@ -395,7 +404,14 @@ assert_equals "$(grep -c '^UKU_KEY=' "$UKU_CONFIG_HOME/profiles/legacy" | tr -d 
 guard_stub 'before hiding it'
 : > "$STUB_LOG"
 reset_requests
-hide_cmd security          # takes the stub with it; there is no secret-tool here either
+# hide_cmd caches its symlink farm under a name derived from the hidden tool,
+# so a second section hiding the same tool would inherit THIS farm's contents —
+# clear it. And both tools have to go: the harness stubs `secret-tool` too
+# (hermetically, as "no such item"), so hiding only `security` would leave a
+# backend that exists and fails, which is section 6's case, not this one.
+rm -rf "$CASE_DIR/hidebin-security" "$CASE_DIR/hidebin-secret-tool"
+hide_cmd security
+hide_cmd secret-tool
 UKU_KEYRING=1 uku_stdin "$KEYFILE" auth login --account nokr --company "$KR_CO" --key-stdin
 assert_status 0 'with no keyring on the box, login still works'
 assert_err_contains 'neither' 'and says the tools are missing'
@@ -426,7 +442,8 @@ export PATH="$STUB_PATH"
 # has no Linux machine. Said plainly here rather than implied by a green test.
 guard_stub 'before the secret-tool section'
 _write_stub "$CASE_DIR/stubbin/secret-tool"
-hide_cmd security     # leaves the secret-tool stub reachable
+rm -rf "$CASE_DIR/hidebin-security"   # a farm built before that stub existed
+hide_cmd security                     # leaves the secret-tool stub reachable
 : > "$STUB_LOG"
 reset_requests
 UKU_KEYRING=1 uku_stdin "$KEYFILE" auth login --account lin --company "$KR_CO" --key-stdin
