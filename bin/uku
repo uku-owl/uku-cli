@@ -162,10 +162,45 @@ require_curl() { have curl || die "curl is required but not installed." "$EX_USA
 #
 # Files are PARSED, never sourced — a tampered profile is data, not code.
 
-_profile_path() { printf '%s/%s' "$UKU_PROFILE_DIR" "$1"; }
+# _profile_path NAME → the profile file path for NAME, or nothing (exit 1) if
+# NAME fails validation. S3/S7: save_profile validated on WRITE, but every
+# read/remove/switch caller (`account use`, `account remove`, `auth logout`,
+# `load_creds`) built this path from an unvalidated name — the exact bug class
+# that shipped as `batch show ../profiles/default` in v0.3.0, whose fix went
+# into `_ledger_file` itself for precisely this reason: caller-side-only
+# validation is what let it in the first time. The check now lives on this
+# side too, once, so no future call site can forget it. Proven exploit before
+# this fix: `uku account remove ../../../../victim/precious.txt` deleted the
+# named file outright.
+_profile_path() { _valid_name "$1" || return 1; printf '%s/%s' "$UKU_PROFILE_DIR" "$1"; }
+# _require_valid_name NAME — dies with the CLI's usual usage error on a bad
+# name. Call this directly as its own statement (never inside a `$(...)`,
+# where `die`'s `exit` would only end the subshell and leave the caller none
+# the wiser) at every point an account name arrives fresh from the user this
+# invocation — the global `--account` flag's parse site, `account use`,
+# `account remove`. It duplicates the check `_profile_path` already makes
+# internally on purpose: this call site is what gives the user a clear
+# message and an immediate stop; `_profile_path`'s own check is the backstop
+# that still fails closed if a future call site forgets to call this first.
+# Names that instead arrive as *persisted state* (the `active` file's
+# content) go through `active_profile`, which sanitizes on read rather than
+# dying, because a poisoned file is a state to recover from, not a usage
+# mistake to reject.
+_require_valid_name() {
+  _valid_name "$1" || die "Invalid account name: '$1' (use letters, digits, . _ - — not '.' or '..')." "$EX_USAGE"
+}
 # POSIX class, not an a-z range: bracket ranges are locale/collation-dependent
 # (en_US.UTF-8 makes [a-z] skip letters), which silently rejected valid names.
-_valid_name()   { case "$1" in ""|*[![:alnum:]._-]*) return 1 ;; *) return 0 ;; esac; }
+# `.` and `..` are explicitly rejected (S10a): both consist only of allowed
+# characters, so the character-class test alone accepted them, and either one
+# resolves _profile_path to the profile directory itself or its parent.
+_valid_name() {
+  case "$1" in
+    ""|.|..) return 1 ;;
+    *[![:alnum:]._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 
 # read one KEY from a profile file (grep/sed, no sourcing)
 _profile_get() {
@@ -178,7 +213,20 @@ _profile_get() {
 }
 
 active_profile() {
-  if [ -f "$UKU_ACTIVE_FILE" ]; then head -n1 "$UKU_ACTIVE_FILE" 2>/dev/null | tr -d '[:space:]'; else printf 'default'; fi
+  local a
+  if [ -f "$UKU_ACTIVE_FILE" ]; then a="$(head -n1 "$UKU_ACTIVE_FILE" 2>/dev/null | tr -d '[:space:]')"; else a="default"; fi
+  # S7: this file is PERSISTED STATE, not a fresh argument — every command that
+  # follows load_creds trusts whatever name comes back. Before this check, one
+  # `uku account use ../../../../victim/x` call poisoned it permanently: every
+  # later command (including ones with no `--account` flag at all) then read
+  # its credentials from an attacker-chosen path. Refuse to trust a bad value
+  # silently; recover to 'default' instead of failing every command that
+  # follows a single act of tampering (or an older, unpatched CLI's mistake).
+  if ! _valid_name "$a"; then
+    warn "stored active-account name '$a' is invalid — ignoring, falling back to 'default'. Run: uku account use <name>"
+    a="default"
+  fi
+  printf '%s' "$a"
 }
 
 # Resolve credentials into UKU_BASE / UKU_COMPANY / UKU_KEY / UKU_PROFILE.
@@ -618,6 +666,33 @@ render() {
   _bc_flush
 }
 
+# _valid_field NAME — plain identifier only (letters, digits, underscore; no
+# leading digit). S4: `table()`'s TTY path used to splice --fields values
+# straight into a jq program (`.$f`); jq can't spawn processes, but it CAN
+# read `env`, so `--fields 'zzz // env.UKU_API_KEY'` printed the live key on a
+# TTY. Denylisting the dangerous characters is not enough on its own (there is
+# always one more jq builtin), so this is a strict allowlist, checked once at
+# the flag's parse site (_check_fields_arg) before any command sees the value.
+_valid_field() {
+  case "$1" in
+    "") return 1 ;;
+    [0-9]*) return 1 ;;
+    *[![:alnum:]_]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+# _check_fields_arg VALUE — dies unless every comma-separated name in VALUE
+# passes _valid_field. Called once, at --fields' global parse site, so every
+# consumer (table()'s TTY path, _project_fields' JSON/--agent path) only ever
+# sees names that were already checked — neither has to remember to re-check.
+_check_fields_arg() {
+  local raw="$1" field
+  local IFS=','; set -- $raw; unset IFS
+  for field in "$@"; do
+    _valid_field "$field" || die "--fields wants plain field names (letters, digits, underscore — e.g. id,name); got '$field'." "$EX_USAGE"
+  done
+}
+
 # _project_fields BODY — BODY with every row in .data reduced to the keys named
 # by --fields, in the order the user named them, envelope (.meta) untouched. A
 # key a row does not have comes back null rather than vanishing, so every row
@@ -654,10 +729,20 @@ table() {
     fi
     render "$body"; return
   fi
-  local hdr="" jqfields=""
-  for f in "$@"; do hdr="$hdr$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')\t"; jqfields="$jqfields (.$f // \"-\"),"; done
-  jqfields="[${jqfields%,}] | @tsv"
-  local rows; rows="$(printf '%s' "$body" | jq -r ".data[]? | $jqfields" 2>/dev/null || true)"
+  local hdr=""
+  for f in "$@"; do hdr="$hdr$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')\t"; done
+  # Field names go in as jq POSITIONAL STRING ARGUMENTS (--args / $ARGS.positional),
+  # never spliced into the program text (S4). --fields is already restricted to
+  # plain identifiers by _check_fields_arg at parse time, but that check living
+  # correctly is not the only thing standing between user text and program
+  # text — the passing mechanism itself must be structurally unable to run a
+  # field name as code, the same discipline _project_fields already used for
+  # the JSON/--agent path.
+  local rows
+  rows="$(printf '%s' "$body" | jq -r --args '
+      ($ARGS.positional) as $fields
+      | .data[]? | [ $fields[] as $k | (.[$k] // "-") ] | @tsv
+    ' -- "$@" 2>/dev/null || true)"
   if have column; then
     { printf '%b\n' "$(_bold "${hdr%\\t}")"; printf '%s\n' "$rows"; } | column -t -s "$(printf '\t')"
   else
@@ -827,13 +912,17 @@ confirm_write() {
   case "$reply" in y|Y|yes|YES) return 0 ;; *) die "Cancelled." "$EX_CONFIRM" ;; esac
 }
 
-# build_query k=v ...  → "?k=v&k2=v2" (values RFC-3986 percent-encoded)
+# build_query k=v ...  → "?k=v&k2=v2" (keys AND values RFC-3986 percent-encoded)
+# S10c: only values were encoded — `uku api ... --query 'a#=1'` let a `--query`
+# key inject a literal `#` (or `&`, splitting in another param) into the query
+# string. Harmless here (it is only ever the caller's own request), but wrong,
+# and cheap to close: encode the key with the same function used on the value.
 build_query() {
   local q=""
   for kv in "$@"; do
     local k="${kv%%=*}" v="${kv#*=}"
     [ "$k" = "$kv" ] && continue
-    q="$q&$k=$(_urlencode "$v")"
+    q="$q&$(_urlencode "$k")=$(_urlencode "$v")"
   done
   [ -n "$q" ] && printf '?%s' "${q#&}"
   return 0
@@ -1838,6 +1927,7 @@ EOF
     use|switch)
       local name="${1:-}"
       [ -n "$name" ] || die "usage: uku account use <name>" "$EX_USAGE"
+      _require_valid_name "$name"
       [ -f "$(_profile_path "$name")" ] || die "No such account: $name" "$EX_AUTH" @@account.list
       set_active "$name"; info "Now using account $(_bold "$name")."
       ;;
@@ -1850,6 +1940,7 @@ EOF
     remove|rm)
       local name="${1:-}"
       [ -n "$name" ] || die "usage: uku account remove <name>" "$EX_USAGE"
+      _require_valid_name "$name"
       local f; f="$(_profile_path "$name")"
       [ -f "$f" ] || die "No such account: $name" "$EX_AUTH" @@account.list
       rm -f "$f"; info "Removed account '$name'."
@@ -3744,8 +3835,11 @@ while [ $# -gt 0 ]; do
     --by-name) if [ "$UKU_BY" = "id" ];   then die "--by-id and --by-name are opposites; pass one." "$EX_USAGE" @@help.root; fi; UKU_BY=name; shift ;;
     --quiet|-q) UKU_QUIET=1; shift ;;
     --no-color) NO_COLOR=1; export NO_COLOR; shift ;;
-    --fields) _need_val "$@"; UKU_FIELDS="$2"; shift 2 ;;
-    --account) _need_val "$@"; UKU_ACCOUNT_CLI="$2"; shift 2 ;;
+    # Validated right here, at the single choke point every value flows
+    # through before any command sees it — see _check_fields_arg and
+    # _require_valid_name for why (S3/S4/S7).
+    --fields) _need_val "$@"; UKU_FIELDS="$2"; _check_fields_arg "$UKU_FIELDS"; shift 2 ;;
+    --account) _need_val "$@"; UKU_ACCOUNT_CLI="$2"; _require_valid_name "$UKU_ACCOUNT_CLI"; shift 2 ;;
     --base) _need_val "$@"; UKU_BASE_CLI="$2"; shift 2 ;;
     -h|--help) UKU_HELP=1; shift ;;   # routed to per-command help below
     --version|-V) printf 'uku %s\n' "$UKU_VERSION"; exit "$EX_OK" ;;
