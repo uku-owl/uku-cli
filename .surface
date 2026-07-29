@@ -243,6 +243,7 @@ note %global a base that is neither the default nor loopback prints one line on 
 note %global these are parsed ANYWHERE on the line, before the command
 note account `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list`
 note account `add` is sugar for `uku auth login --account <name>`
+note account `remove` deletes the account's key from the OS keyring as well as the profile file, and exits 3 if the keyring would not release it
 note account run `uku account current` before any write — a sandbox and the real firm look identical in the output
 note api METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks`
 note api `--client NAME` works on a GET whose path is one of the collections that carry a client_id; on a write it is a usage error
@@ -250,8 +251,12 @@ note api `uku api --describe [resource]` prints the resource map — the fastest
 note api this reaches every v3 endpoint, so prefer it over dropping to curl
 note auth `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored
 note auth `--shell` is shorthand for `--format shell`
+note auth `auth logout` removes the key from BOTH the file and the OS keyring, and exits 3 if the keyring would not release it
 note auth `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api`
+note auth every keyring call is bounded by UKU_KEYRING_TIMEOUT (5s). A timeout while READING refuses the command and says the keyring is locked — it never falls back to a file. A timeout while storing during `login` DOES fall back to the 0600 file, and says so on stderr, because the alternative is losing a credential you just typed
+note auth the key is kept in a 0600 file by default. UKU_KEYRING=1 puts it in the OS keyring instead (macOS `security`, Linux `secret-tool`) and leaves only the base and company in the file. It is READ from wherever the profile says it is, so unsetting the variable does not sign you out, and an existing file-stored key is never moved by an ordinary command — `uku auth login` is the only thing that migrates it, in either direction
 note auth the transport rule and the non-default-host line apply to `auth login` too, and there is no extra confirmation on top of them — you named the host in the same command, and a prompt asking whether you meant what you just typed is a prompt people learn to click through
+note auth what the keyring buys is exact — the key is not in a file this CLI writes, so whatever can read your files does not get it. It does NOT stop you, or anything running as you, from asking the keyring for it
 note batch `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
 note batch reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request
 note clients --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read
@@ -264,6 +269,7 @@ note contracts a contract has no name field, so `get` takes an id or a pasted UR
 note contracts read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules
 note doctor `--json` (the global flag) gives the whole report as JSON
 note doctor exits 1 only when a REQUIRED check fails, never for a warning
+note doctor it names which credential store the active account uses — the OS keyring, the 0600 file, or the environment — which is the one thing about UKU_KEYRING worth never guessing at
 note help `uku <command> --help` prints the same card
 note help a topic with no card is a usage error, not an empty page
 note invoices an invoice has no name field, so `get` takes an id or a pasted URL — never a name

@@ -202,6 +202,150 @@ _valid_name() {
   esac
 }
 
+# ── The OS keyring — opt-in, and it protects exactly one thing ────────
+# S8 (audit 2026-07-29): the key sits in a 0600 file, for ever. basecamp-cli
+# keeps its tokens in the OS credential store and falls back to a file only
+# when there is no store. Uku cannot copy the other half of their answer —
+# short-lived OAuth tokens — because the Uku API issues static keys, so what is
+# transferable is the store, not the lifetime.
+#
+# What this buys, stated exactly: with UKU_KEYRING=1 the key is not in any file
+# this CLI writes, so a process that can read your files (a backup, a synced
+# dotfiles repo, a `cat ~/.config/uku/profiles/*` in someone else's script)
+# does not get it. It does NOT stop you, or anything running as you, from
+# asking the keyring for it — `security find-generic-password -s uku-cli:<acct>
+# -a <acct> -w` prints it, and so does this CLI. That is the whole claim.
+#
+# OPT-IN, not the default, and the reason is failure modes rather than taste:
+#   • existing installs must not silently move where their credential lives;
+#   • `security` and `secret-tool` can both BLOCK — a locked keychain with no
+#     GUI and no tty leaves the child waiting for an unlock that can never be
+#     typed. basecamp hit exactly this on headless boxes. So every call here is
+#     bounded (_kr_run) and killed rather than waited on.
+# Rain can flip the default once this has mileage. Nothing else in the file
+# changes when UKU_KEYRING is unset.
+#
+# Backend choice is a lookup, not a guess: macOS → `security` (Keychain),
+# otherwise `secret-tool` (Secret Service) when it is installed. The
+# secret-tool calls are written to its documented interface; they were NOT
+# measured here (this repo's only machine is macOS), and the doc says so too.
+UKU_KEYRING_TIMEOUT="${UKU_KEYRING_TIMEOUT:-5}"   # seconds, per keyring call
+_KEYRING_BACKEND=""      # "" unprobed · "-" none · "security" · "secret-tool"
+# _keyring_backend → prints the backend name, or exit 1 when there is none.
+_keyring_backend() {
+  if [ -z "$_KEYRING_BACKEND" ]; then
+    if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ] && have security; then _KEYRING_BACKEND="security"
+    elif have secret-tool; then _KEYRING_BACKEND="secret-tool"
+    else _KEYRING_BACKEND="-"; fi
+  fi
+  [ "$_KEYRING_BACKEND" = "-" ] && return 1
+  printf '%s' "$_KEYRING_BACKEND"
+}
+# One namespace per account, so two accounts never share a secret and neither
+# collides with anything else in the user's keychain: service `uku-cli:<name>`,
+# account `<name>`. The name is already `_valid_name`-checked everywhere it
+# reaches this code, so it cannot smuggle a flag or a separator in.
+_keyring_service() { printf 'uku-cli:%s' "$1"; }
+# _kr_run STDIN_FILE OUT_FILE CMD… — run CMD bounded by UKU_KEYRING_TIMEOUT.
+# Returns the command's status, or 124 if it had to be killed. stdin is always
+# a FILE (never the terminal): a keyring tool that decides to prompt then reads
+# EOF and fails fast instead of hanging on a prompt nobody can answer.
+_kr_run() {
+  local infile="$1" outfile="$2"; shift 2
+  local limit="${UKU_KEYRING_TIMEOUT:-5}"
+  case "$limit" in ''|*[!0-9]*) limit=5 ;; esac
+  limit=$((limit * 10))   # tenths of a second
+  local pid ticks=0 rc=0
+  "$@" > "$outfile" 2>/dev/null < "$infile" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$ticks" -ge "$limit" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.2
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+# _keyring_get NAME → sets KR_VALUE. A SETTER, never `$(…)`: the same subshell
+# rule _mktemp documents applies, and a caller that captured this would also
+# lose the status that says WHY it is empty.
+#   0 found · 1 not there · 2 no backend · 124 timed out
+KR_VALUE=""
+_keyring_get() {
+  KR_VALUE=""
+  local b; b="$(_keyring_backend)" || return 2
+  local out rc=0; _mktemp out
+  case "$b" in
+    security)    _kr_run /dev/null "$out" security find-generic-password -s "$(_keyring_service "$1")" -a "$1" -w || rc=$? ;;
+    secret-tool) _kr_run /dev/null "$out" secret-tool lookup service "$(_keyring_service "$1")" account "$1" || rc=$? ;;
+  esac
+  if [ "$rc" = "124" ]; then _rmtmp "$out"; return 124; fi
+  if [ "$rc" != "0" ]; then _rmtmp "$out"; return 1; fi
+  # $(cat) strips the trailing newline `security -w` adds and leaves any
+  # INTERIOR CR/LF intact — which is the point: such a value is caught by
+  # _check_cred_line at the call site rather than silently normalised here.
+  KR_VALUE="$(cat "$out")"
+  _rmtmp "$out"
+  [ -n "$KR_VALUE" ] || return 1
+  return 0
+}
+# _keyring_set NAME KEY — store, then READ BACK and compare.
+#   0 stored and verified · 1 refused/failed · 2 no backend · 124 timed out
+# The read-back is not belt-and-braces, it is the fix for a measured lie:
+# `security add-generic-password … -w` (no argument) reads the password from
+# stdin and asks for it TWICE. Fed one line, it takes the EOF as the second
+# answer, stores an EMPTY password, and exits 0 (measured 2026-07-29). Feeding
+# the value twice is what makes it correct; verifying is what makes a future
+# change to that dance impossible to ship silently.
+# The key goes in on stdin from a file in the run directory, never in argv —
+# the same reason curl gets a -K file: argv is world-readable via `ps`.
+_keyring_set() {
+  local b; b="$(_keyring_backend)" || return 2
+  local infile out rc=0; _mktemp infile; _mktemp out
+  case "$b" in
+    security)
+      printf '%s\n%s\n' "$2" "$2" > "$infile"
+      _kr_run "$infile" "$out" security add-generic-password -U -s "$(_keyring_service "$1")" -a "$1" -D "Uku CLI API key" -w || rc=$? ;;
+    secret-tool)
+      printf '%s' "$2" > "$infile"
+      _kr_run "$infile" "$out" secret-tool store --label="Uku CLI ($1)" service "$(_keyring_service "$1")" account "$1" || rc=$? ;;
+  esac
+  _rmtmp "$infile" "$out"
+  [ "$rc" = "124" ] && return 124
+  [ "$rc" = "0" ] || return 1
+  _keyring_get "$1" || return 1
+  [ "$KR_VALUE" = "$2" ] || return 1
+  return 0
+}
+# _keyring_del NAME — 0 gone (or was never there) · 1 failed · 2 no backend ·
+# 124 timed out. Deleting something that is not there is success: the caller's
+# question is "is the key out of the keyring", not "did I remove a row".
+_keyring_del() {
+  local b; b="$(_keyring_backend)" || return 2
+  local out rc=0; _mktemp out
+  case "$b" in
+    security)    _kr_run /dev/null "$out" security delete-generic-password -s "$(_keyring_service "$1")" -a "$1" || rc=$? ;;
+    secret-tool) _kr_run /dev/null "$out" secret-tool clear service "$(_keyring_service "$1")" account "$1" || rc=$? ;;
+  esac
+  _rmtmp "$out"
+  [ "$rc" = "124" ] && return 124
+  [ "$rc" = "0" ] && return 0
+  # `security` answers 44 (SecKeychainSearchCopyNext: not found) immediately and
+  # without a prompt when there is no such item — measured 2026-07-29, which is
+  # what makes the unconditional delete on logout cheap. Any other status is a
+  # real failure and the caller has to say so out loud.
+  [ "$rc" = "44" ] && return 0
+  # secret-tool clear exits 0 whether or not it matched, so anything non-zero
+  # from it is a failure too.
+  return 1
+}
+
 # read one KEY from a profile file (grep/sed, no sourcing)
 _profile_get() {
   local file="$1" key="$2" line
@@ -229,12 +373,55 @@ active_profile() {
   printf '%s' "$a"
 }
 
+# _load_profile_key FILE NAME — put the profile's key in UKU_KEY and record
+# WHERE it came from in UKU_KEY_STORE ("file" or "keyring").
+#
+# The profile file is authoritative about the store, not the environment:
+# UKU_KEYRING says where a NEW key is written, `UKU_KEY_STORE=keyring` in the
+# file says where this one already lives. Reading has to follow the file, or
+# unsetting the variable for one command would look exactly like being signed
+# out — and the remedy for "signed out" is to type the key in again.
+#
+# A keyring read that fails does NOT die here. load_creds is called by `doctor`
+# and `auth status`, whose whole job is to REPORT a broken state; a die would
+# replace the report with one line. The reason is parked in UKU_KEY_ERROR and
+# need_auth raises it for every command that actually needs the key.
+UKU_KEY_STORE=""
+UKU_KEY_ERROR=""
+_load_profile_key() {
+  local f="$1" name="$2"
+  UKU_KEY=""; UKU_KEY_ERROR=""
+  UKU_KEY_STORE="$(_profile_get "$f" UKU_KEY_STORE)"
+  [ -n "$UKU_KEY_STORE" ] || UKU_KEY_STORE="file"
+  if [ "$UKU_KEY_STORE" != "keyring" ]; then
+    UKU_KEY_STORE="file"
+    UKU_KEY="$(_profile_get "$f" UKU_KEY)"
+    return 0
+  fi
+  local rc=0
+  _keyring_get "$name" || rc=$?
+  case "$rc" in
+    0)   UKU_KEY="$KR_VALUE"
+         # Wave 1's CR/LF guard covers a key coming out of the KEYRING too. A
+         # keyring is a store, not a validator: `security add-generic-password`
+         # accepts a value with a newline in it, and this CLI is not the only
+         # thing that can write to service uku-cli:<acct>. Same check, same
+         # reason — the -K grammar is line-based.
+         _check_cred_line "the API key (from the OS keyring)" "$UKU_KEY" ;;
+    124) UKU_KEY_ERROR="the OS keyring did not answer within ${UKU_KEYRING_TIMEOUT}s for account '$name' — a locked keychain with nothing that can prompt (ssh, cron, a headless box) looks exactly like this. Unlock it and run the command again. Nothing was read and nothing was sent." ;;
+    2)   UKU_KEY_ERROR="account '$name' stores its key in the OS keyring, but this machine has neither \`security\` nor \`secret-tool\`. The key is not in the profile file — sign in again on a machine that has one, or run: uku auth login" ;;
+    *)   UKU_KEY_ERROR="account '$name' says its key is in the OS keyring, but there is no secret under service $(_keyring_service "$name") — it was removed outside this CLI. Run: uku auth login" ;;
+  esac
+  return 0
+}
+
 # Resolve credentials into UKU_BASE / UKU_COMPANY / UKU_KEY / UKU_PROFILE.
 # Precedence: --account flag → env (both key+company) → active profile.
 load_creds() {
   # snapshot the environment BEFORE touching any file (fixes cross-account bleed)
   local env_key="${UKU_API_KEY:-}" env_company="${UKU_COMPANY:-}" env_base="${UKU_BASE_URL:-}"
   UKU_BASE="$UKU_BASE_DEFAULT"; UKU_COMPANY=""; UKU_KEY=""; UKU_PROFILE=""
+  UKU_KEY_STORE=""; UKU_KEY_ERROR=""
 
   if [ -n "$UKU_ACCOUNT_CLI" ]; then
     UKU_PROFILE="$UKU_ACCOUNT_CLI"
@@ -246,18 +433,19 @@ load_creds() {
     # ignored the env var that every other path honours.
     UKU_BASE="$(_profile_get "$f" UKU_BASE)"; UKU_BASE="${UKU_BASE:-${env_base:-$UKU_BASE_DEFAULT}}"
     UKU_COMPANY="$(_profile_get "$f" UKU_COMPANY)"
-    UKU_KEY="$(_profile_get "$f" UKU_KEY)"
+    _load_profile_key "$f" "$UKU_PROFILE"
   elif [ -n "$env_key" ] && [ -n "$env_company" ]; then
     # a complete env identity wins outright — the CI / agent path
     UKU_PROFILE="env"
     UKU_BASE="${env_base:-$UKU_BASE_DEFAULT}"; UKU_COMPANY="$env_company"; UKU_KEY="$env_key"
+    UKU_KEY_STORE="env"
   else
     UKU_PROFILE="$(active_profile)"
     local f; f="$(_profile_path "$UKU_PROFILE")"
     if [ -f "$f" ]; then
       UKU_BASE="$(_profile_get "$f" UKU_BASE)"; UKU_BASE="${UKU_BASE:-$UKU_BASE_DEFAULT}"
       UKU_COMPANY="$(_profile_get "$f" UKU_COMPANY)"
-      UKU_KEY="$(_profile_get "$f" UKU_KEY)"
+      _load_profile_key "$f" "$UKU_PROFILE"
     fi
     # A partial env identity welds an env value onto the profile's other half —
     # warn once, so an env key can't silently talk to a stored profile's company (N13).
@@ -267,16 +455,24 @@ load_creds() {
       fi
     fi
     [ -n "$env_company" ] && UKU_COMPANY="$env_company"
-    [ -n "$env_key" ] && UKU_KEY="$env_key"
+    # An env key wins over the stored one — and it also SETTLES a keyring read
+    # that failed: the command has a key, so there is nothing left to report.
+    if [ -n "$env_key" ]; then UKU_KEY="$env_key"; UKU_KEY_STORE="env"; UKU_KEY_ERROR=""; fi
     [ -n "$env_base" ] && UKU_BASE="$env_base"
   fi
   [ -n "${UKU_BASE_CLI:-}" ] && UKU_BASE="$UKU_BASE_CLI"
   return 0
 }
 
-# save_profile NAME BASE COMPANY KEY  — writes a 0600 profile file safely.
+# save_profile NAME BASE COMPANY KEY [STORE] — writes a 0600 profile file
+# safely. STORE is "file" (default) or "keyring"; with "keyring" the file
+# carries the marker and NO `UKU_KEY=` line, because the whole point is that
+# the key is not in a file this CLI writes. The caller is responsible for
+# having already put the key in the keyring — see cmd_auth login, which stores
+# and verifies FIRST and only then rewrites the profile, so there is never a
+# moment when the key is in neither place.
 save_profile() {
-  local name="$1" base="$2" company="$3" key="$4"
+  local name="$1" base="$2" company="$3" key="$4" store="${5:-file}"
   _valid_name "$name" || die "Invalid account name: '$name' (use letters, digits, . _ -)" "$EX_USAGE"
   # A profile file is line-based too, so the same break that injects a curl
   # directive also injects a bogus UKU_KEY= line here. Checked at the point of
@@ -291,9 +487,55 @@ save_profile() {
     { printf '# Uku CLI account "%s" — private (0600). Do not share.\n' "$name"
       printf 'UKU_BASE=%s\n' "$base"
       printf 'UKU_COMPANY=%s\n' "$company"
-      printf 'UKU_KEY=%s\n' "$key"
+      if [ "$store" = "keyring" ]; then
+        printf 'UKU_KEY_STORE=keyring\n'
+      else
+        printf 'UKU_KEY_STORE=file\n'
+        printf 'UKU_KEY=%s\n' "$key"
+      fi
     } > "$f" )
   chmod 600 "$f"
+}
+
+# _forget_keyring_secret NAME — the keyring half of forgetting an account; the
+# caller removes the profile file itself. Sets FORGET_KEYRING to what happened:
+# "gone" · "none" (no backend to ask) · "FAILED".
+#
+# The keyring is swept whenever a backend exists, even for a profile that says
+# `UKU_KEY_STORE=file` and even with UKU_KEYRING unset. A user who tried the
+# keyring, turned it off, and then logged out would otherwise leave a LIVE key
+# in their Keychain having been told they had signed out — the worst outcome
+# this feature can produce. It costs one bounded process: `security
+# delete-generic-password` answers 44 immediately, with no prompt, when there
+# is nothing to delete (measured 2026-07-29).
+FORGET_KEYRING=""
+_forget_keyring_secret() {
+  local name="$1" rc=0
+  FORGET_KEYRING="none"
+  _keyring_backend >/dev/null || return 0
+  _keyring_del "$name" || rc=$?
+  case "$rc" in
+    0) FORGET_KEYRING="gone" ;;
+    *) FORGET_KEYRING="FAILED" ;;
+  esac
+  return 0
+}
+# _report_forget NAME STORED — one line about the keyring after a logout or a
+# remove, and a NON-ZERO exit when a key that was in the keyring is still in
+# it. Silence would be the dangerous shape: the file is gone, the command
+# printed "signed out", and a live key stays behind where nobody will look.
+# STORED is what the profile said before it was deleted ("keyring" or "file").
+_report_forget() {
+  local name="$1" stored="$2"
+  case "$FORGET_KEYRING" in
+    gone)   if [ "$stored" = "keyring" ]; then info "Removed the key from the OS keyring (service $(_keyring_service "$name"))."; fi ;;
+    none)   if [ "$stored" = "keyring" ]; then warn "This account's key was in the OS keyring, but neither \`security\` nor \`secret-tool\` is on this machine — the secret could not be removed. Remove it from the machine you signed in on."; fi ;;
+    FAILED)
+      warn "The profile file is gone, but the OS keyring did NOT release the key for account '$name'."
+      _hint_line "remove it by hand: security delete-generic-password -s $(_keyring_service "$name") -a $name   (Linux: secret-tool clear service $(_keyring_service "$name") account $name)"
+      return "$EX_API" ;;
+  esac
+  return 0
 }
 
 set_active() { mkdir -p "$UKU_CONFIG_HOME"; printf '%s\n' "$1" > "$UKU_ACTIVE_FILE"; }
@@ -320,6 +562,10 @@ list_profiles() {
 
 need_auth() {
   [ -n "${UKU_COMPANY:-}" ] && [ -n "${UKU_KEY:-}" ] && return 0
+  # A keyring that would not answer is NOT "not signed in": the credential
+  # exists, this process could not reach it, and telling someone to type their
+  # key in again is the wrong advice — they would be fixing the wrong thing.
+  [ -n "${UKU_KEY_ERROR:-}" ] && die "$UKU_KEY_ERROR" "$EX_AUTH"
   die "Not signed in for account '$UKU_PROFILE' (or set UKU_COMPANY + UKU_API_KEY)." "$EX_AUTH" @@auth.login
 }
 
@@ -1877,12 +2123,53 @@ cmd_auth() {
         401|403) die "Those credentials were rejected (HTTP $REPLY_STATUS). Nothing saved. Check the Company UUID matches the key's company (Settings → API)." "$EX_AUTH" ;;
         *) warn "Could not verify credentials (HTTP $REPLY_STATUS) — saving anyway; run 'uku auth status' later." ;;
       esac
-      save_profile "$acct" "$base" "$company" "$key"
+      # ── where the key goes (S8) ──────────────────────────────────────
+      # `auth login` is the ONE command that moves a key between stores. An
+      # ordinary command never migrates anything: a `uku tasks list` that
+      # quietly rewrote your credential store because a variable was set in
+      # some shell profile would be a surprise, and the reverse — one command
+      # run without the variable moving the key back into a file — would be
+      # worse. So: signing in writes wherever UKU_KEYRING says, and everything
+      # else reads wherever the profile says.
+      local prev_store; prev_store="$(_profile_get "$(_profile_path "$acct")" UKU_KEY_STORE)"
+      local store="file" kr_rc=0
+      if [ "${UKU_KEYRING:-0}" = "1" ]; then
+        if _keyring_backend >/dev/null; then
+          _keyring_set "$acct" "$key" || kr_rc=$?
+          case "$kr_rc" in
+            0)   store="keyring" ;;
+            124) warn "UKU_KEYRING=1, but the OS keyring did not answer within ${UKU_KEYRING_TIMEOUT}s (a locked keychain with nothing that can prompt looks like this). FALLING BACK to the 0600 file — your key is in $UKU_PROFILE_DIR/$acct as plain text, not in the keyring." ;;
+            *)   warn "UKU_KEYRING=1, but the OS keyring refused to store (or to read back) the key. FALLING BACK to the 0600 file — your key is in $UKU_PROFILE_DIR/$acct as plain text, not in the keyring." ;;
+          esac
+        else
+          warn "UKU_KEYRING=1, but this machine has neither \`security\` (macOS) nor \`secret-tool\` (Linux, libsecret). Using the 0600 file — your key is in $UKU_PROFILE_DIR/$acct as plain text."
+        fi
+      fi
+      # The keyring is written and verified BEFORE the profile is rewritten, so
+      # a failure at any point leaves the key in exactly one readable place.
+      save_profile "$acct" "$base" "$company" "$key" "$store"
+      # Coming back the other way (keyring account, now saving to a file) the
+      # old secret must not be left behind holding a live key.
+      if [ "$store" = "file" ] && [ "$prev_store" = "keyring" ]; then
+        _forget_keyring_secret "$acct"
+        if [ "$FORGET_KEYRING" = "FAILED" ]; then
+          warn "the previous key for '$acct' is STILL in the OS keyring — remove it: security delete-generic-password -s $(_keyring_service "$acct") -a $acct"
+        fi
+      fi
       set_active "$acct"
-      info "Signed in to account $(_bold "$acct") · key $(_mask_key "$key") · stored 0600 in $UKU_PROFILE_DIR/$acct"
+      if [ "$store" = "keyring" ]; then
+        info "Signed in to account $(_bold "$acct") · key $(_mask_key "$key") · stored in the OS keyring ($(_keyring_backend), service $(_keyring_service "$acct")); $UKU_PROFILE_DIR/$acct keeps the base and company only"
+      else
+        info "Signed in to account $(_bold "$acct") · key $(_mask_key "$key") · stored 0600 in $UKU_PROFILE_DIR/$acct"
+      fi
       ;;
     status)
       load_creds
+      # A keyring that would not answer is a different state from "no key" and
+      # gets its own sentence — see need_auth.
+      if [ -z "${UKU_KEY:-}" ] && [ -n "${UKU_KEY_ERROR:-}" ]; then
+        die "$UKU_KEY_ERROR" "$EX_AUTH"
+      fi
       if [ -z "${UKU_KEY:-}" ]; then
         if [ "${UKU_AGENT:-0}" = "1" ]; then
           _agent_error "account '$UKU_PROFILE' is not signed in" "$EX_AUTH" "$(_bc_render @@auth.login)"
@@ -1942,8 +2229,13 @@ cmd_auth() {
       load_creds
       local target="${UKU_ACCOUNT_CLI:-$UKU_PROFILE}" f
       f="$(_profile_path "$target")"
+      # Read the store marker BEFORE the file goes, and sweep the keyring
+      # whichever store it names — signing out has to mean signed out in both.
+      local stored; stored="$(_profile_get "$f" UKU_KEY_STORE)"; [ -n "$stored" ] || stored="file"
+      _forget_keyring_secret "$target"
       if [ -f "$f" ]; then rm -f "$f"; info "Signed out of account '$target' (removed profile)."; else warn "No stored credentials for account '$target'."; fi
       _reassign_active "$target"
+      _report_forget "$target" "$stored" || exit $?
       ;;
     *) die "Unknown: uku auth $sub  (login|status|logout)" "$EX_USAGE" @@help.topic auth ;;
   esac
@@ -2030,8 +2322,11 @@ EOF
       _require_valid_name "$name"
       local f; f="$(_profile_path "$name")"
       [ -f "$f" ] || die "No such account: $name" "$EX_AUTH" @@account.list
+      local stored; stored="$(_profile_get "$f" UKU_KEY_STORE)"; [ -n "$stored" ] || stored="file"
+      _forget_keyring_secret "$name"
       rm -f "$f"; info "Removed account '$name'."
       _reassign_active "$name"
+      _report_forget "$name" "$stored" || exit $?
       ;;
     *) die "usage: uku account <list|add|use|current|remove>" "$EX_USAGE" @@help.topic account ;;
   esac
@@ -2930,7 +3225,28 @@ cmd_doctor() {
     case "$perm" in drwx------) _doc ok "config dir 0700" ;; *) _doc warn "config dir perms $perm (want 0700): $UKU_PROFILE_DIR" ;; esac
   fi
   load_creds
-  if [ -z "${UKU_KEY:-}" ]; then
+  # WHICH store this account's key is in — the one question the keyring makes
+  # answerable-by-guessing, and guessing wrong is the whole risk (someone who
+  # believes the keyring is on while the key is in a file).
+  # Nothing stored and nothing in the environment: there is no store to report,
+  # and the "no credentials" warning below says the useful thing instead.
+  [ -n "${UKU_KEY_STORE:-}" ] || UKU_KEY_STORE="none"
+  case "$UKU_KEY_STORE" in
+    none)    : ;;
+    env)     _doc ok "credential store: the environment (UKU_API_KEY + UKU_COMPANY) — nothing on disk" ;;
+    keyring) _doc ok "credential store: the OS keyring ($(_keyring_backend || printf 'unavailable'), service $(_keyring_service "${UKU_PROFILE:-default}")) — the profile file holds base + company only" ;;
+    *)
+      if [ "${UKU_KEYRING:-0}" = "1" ]; then
+        _doc warn "credential store: the 0600 file $UKU_PROFILE_DIR/${UKU_PROFILE:-default} — UKU_KEYRING=1 is set, but an existing key is never moved by an ordinary command. Run \`uku auth login\` to move it into the OS keyring."
+        _bc_add @@auth.login
+      else
+        _doc ok "credential store: the 0600 file $UKU_PROFILE_DIR/${UKU_PROFILE:-default} (UKU_KEYRING=1 stores the key in the OS keyring instead, from the next \`uku auth login\`)"
+      fi ;;
+  esac
+  if [ -n "${UKU_KEY_ERROR:-}" ]; then
+    _doc fail "$UKU_KEY_ERROR"
+    _bc_add @@auth.login
+  elif [ -z "${UKU_KEY:-}" ]; then
     _doc warn "no credentials for account '${UKU_PROFILE:-default}' — run: uku auth login"
     _bc_add @@auth.login
   else
@@ -3044,8 +3360,8 @@ cmd_update() {
 _surface_table() {
   cat <<'TABLE'
 # name    | cmd-aliases  | subcommands             | sub-aliases    | flags                                                   | args                                            | notes
-auth        |              | login status logout print-header | print-headers | --account --company --base --key-stdin --format --shell |                                                 | `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api` :: `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored :: the transport rule and the non-default-host line apply to `auth login` too, and there is no extra confirmation on top of them — you named the host in the same command, and a prompt asking whether you meant what you just typed is a prompt people learn to click through :: `--shell` is shorthand for `--format shell`
-account     | accounts     | list add use current remove | ls switch who rm | --company --key-stdin                               | use <name> :: add <name> :: remove <name>       | `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list` :: `add` is sugar for `uku auth login --account <name>` :: run `uku account current` before any write — a sandbox and the real firm look identical in the output
+auth        |              | login status logout print-header | print-headers | --account --company --base --key-stdin --format --shell |                                                 | `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api` :: `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored :: the transport rule and the non-default-host line apply to `auth login` too, and there is no extra confirmation on top of them — you named the host in the same command, and a prompt asking whether you meant what you just typed is a prompt people learn to click through :: `--shell` is shorthand for `--format shell` :: the key is kept in a 0600 file by default. UKU_KEYRING=1 puts it in the OS keyring instead (macOS `security`, Linux `secret-tool`) and leaves only the base and company in the file. It is READ from wherever the profile says it is, so unsetting the variable does not sign you out, and an existing file-stored key is never moved by an ordinary command — `uku auth login` is the only thing that migrates it, in either direction :: what the keyring buys is exact — the key is not in a file this CLI writes, so whatever can read your files does not get it. It does NOT stop you, or anything running as you, from asking the keyring for it :: every keyring call is bounded by UKU_KEYRING_TIMEOUT (5s). A timeout while READING refuses the command and says the keyring is locked — it never falls back to a file. A timeout while storing during `login` DOES fall back to the 0600 file, and says so on stderr, because the alternative is losing a credential you just typed :: `auth logout` removes the key from BOTH the file and the OS keyring, and exits 3 if the keyring would not release it
+account     | accounts     | list add use current remove | ls switch who rm | --company --key-stdin                               | use <name> :: add <name> :: remove <name>       | `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list` :: `add` is sugar for `uku auth login --account <name>` :: run `uku account current` before any write — a sandbox and the real firm look identical in the output :: `remove` deletes the account's key from the OS keyring as well as the profile file, and exits 3 if the keyring would not release it
 setup       | setup-agents | agents                  |                |                                                         |                                                 | UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
 clients     | client       | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id> :: get/patch also take a client NAME or a pasted URL | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read :: `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks` :: on `patch`, an id-shaped argument costs one extra GET: it is checked against client NAMES too, because `12345678` and `CAFE-1` are both — `--by-id` skips the check :: `--client` is not a filter here (you are already listing clients) — use `--q`
 tasks       | task         | list get !create !patch |                | @list --client @data @bulk                              | get <task_id> :: patch <task_id> :: get/patch also take a task TITLE or a pasted URL | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from :: an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates :: `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand :: that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs :: NAME resolution never happens in a `--batch`, and never for an argument that already looks like an id — but on a WRITE an id-shaped argument is still PROBED for a record whose name is that exact string (one extra GET), and a collision is refused until `--by-id` or `--by-name` says which was meant; on a read the id-shaped argument passes straight through with no request :: a name lookup reads at most 100 records and compares `meta.total` against them: when more could exist than were examined it refuses, because a match it cannot see the alternatives to is not a unique one
@@ -3059,7 +3375,7 @@ me          |              |                         |                |         
 search      |              |                         |                | --limit                                                 | <query>                                         | NOT a server-side global search — the API offers none this CLI can verify. It is ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), one request each :: a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did :: `--limit` is per endpoint
 api         |              |                         |                | !--describe @list --client @data @bulk                  | <METHOD> :: </api/v3/...>                       | METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks` :: `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient :: this reaches every v3 endpoint, so prefer it over dropping to curl :: `--client NAME` works on a GET whose path is one of the collections that carry a client_id; on a write it is a usage error
 batch       |              | list show               | ls             |                                                         | show <run-id>                                   | reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request :: `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
-doctor      |              |                         |                |                                                         |                                                 | `--json` (the global flag) gives the whole report as JSON :: exits 1 only when a REQUIRED check fails, never for a warning
+doctor      |              |                         |                |                                                         |                                                 | `--json` (the global flag) gives the whole report as JSON :: exits 1 only when a REQUIRED check fails, never for a warning :: it names which credential store the active account uses — the OS keyring, the 0600 file, or the environment — which is the one thing about UKU_KEYRING worth never guessing at
 update      |              |                         |                |                                                         |                                                 | re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
@@ -3508,6 +3824,7 @@ description: Operate a firm's Uku (accounting practice management) from the term
 - **Money has its own key.** Financial actions need an *All*-scope key. A `HTTP 403 … scope` error is the system working as designed — surface it to the user, do **not** retry or try to work around it.
 - **Accounts.** A user may have several: a real firm and a **sandbox**. Run `uku account current` before any write, and confirm you are on the intended account. `--account <name>` targets one command — it is a profile NAME (letters, digits, `.` `_` `-`), never a path.
 - **Where the credentials go is not yours to change.** Do not set `--base` or `UKU_BASE_URL` to anything the user did not give you, and do not "fix" a connection problem by pointing the CLI somewhere else — that is how a live API key ends up at the wrong host. An `http://` base to any host but this machine is refused outright (the key would travel in cleartext), and any base that is neither the default nor loopback prints one line on stderr naming the host. **If you see `→ sending Uku credentials to <host>` and the user did not ask for that host, stop and tell them** — do not silence it, and note that `--quiet` cannot.
+- **Where the credential is kept is the user's setting, not yours.** By default the key is in a 0600 file; if the user sets `UKU_KEYRING=1`, the next `uku auth login` puts it in the OS keyring instead. Do not set or unset `UKU_KEYRING` to work around anything — reading follows what the profile already says, so toggling it fixes nothing and only changes where a future key would land. If a command fails saying the OS keyring did not answer, that is a **locked keychain**, not a missing login: tell the user to unlock it and retry. Do not re-run `uku auth login`, and do not ask them for their key. And do not describe the keyring to the user as making the key unreadable — anything running as them, including this CLI, can still read it.
 - **Never set `UKU_INSTALL_URL`, `UKU_UPDATE_URL` or `UKU_DEV`.** They select code the CLI fetches and runs by itself. They are ignored unless `UKU_DEV=1` is set too, and setting `UKU_DEV` to get past that is not a workaround — it is the exact thing the lock exists to stop.
 
 ## Output & exit codes (this is your API)
@@ -3903,6 +4220,12 @@ $(_bold "RETRY DOCTRINE")
 
 $(_bold "ENVIRONMENT")  (override stored creds; ideal for CI / agents)
   UKU_API_KEY, UKU_COMPANY, UKU_BASE_URL
+  UKU_KEYRING=1   store the key in the OS keyring (macOS Keychain, Linux
+                  Secret Service) instead of the 0600 file, from the next
+                  'uku auth login'. Off by default. It keeps the key out of
+                  the files this CLI writes; it does not stop anything running
+                  as you from asking the keyring for it.
+                  UKU_KEYRING_TIMEOUT=5  seconds allowed per keyring call.
 
 Docs: https://app.getuku.com/api/v3/docs   ·   https://getuku.com/agents/
 EOF

@@ -5,9 +5,41 @@ an accounting firm's data. We take its security posture seriously.
 
 ## How the CLI protects your credentials
 
-- **Stored 0600, parsed not sourced.** Credentials live in
+- **Stored 0600, parsed not sourced.** By default the credential lives in
   `~/.config/uku/profiles/<account>` with mode `0600`. The files are *parsed*
   (grep/sed), never `source`d as shell — a tampered profile is data, not code.
+  That stays true whichever store is in use: with `UKU_KEYRING=1` the profile
+  file holds only the base URL, the company id and a `UKU_KEY_STORE=keyring`
+  marker, and it is still parsed, never sourced.
+- **Optionally in the OS keyring — and here is exactly what that buys.** Set
+  `UKU_KEYRING=1` and the next `uku auth login` stores the key in the OS
+  credential store (macOS Keychain via `security`, Linux Secret Service via
+  `secret-tool`) instead of the file. The key is then not in any file this CLI
+  writes, so a backup, a synced dotfiles repo, or someone else's script reading
+  `~/.config/uku/profiles/*` does not get it.
+
+  It does **not** protect the key from you, or from anything running as you:
+  `security find-generic-password -s uku-cli:<account> -a <account> -w` prints
+  it, and so does `uku auth print-header`. Anyone claiming a keyring makes a
+  CLI credential unreadable on its own machine is overselling it.
+
+  It is **off by default**, on purpose. Existing installs must not silently
+  move where their credential lives; and `security`/`secret-tool` can block on
+  a locked store with nothing that can prompt (ssh, cron, a headless box),
+  which would be a worse failure than the one this fixes. Every keyring call is
+  therefore bounded by `UKU_KEYRING_TIMEOUT` (5s) and killed rather than waited
+  on. A timeout while *reading* refuses the command and says the keyring is
+  locked — it never quietly falls back to a file. A timeout while *storing*
+  during `uku auth login` **does** fall back to the 0600 file, because the
+  alternative is discarding a key you just typed and verified — and it says so
+  on stderr, in those words, so nobody believes they are on the keyring when
+  they are not.
+
+  Migration is explicit: an existing file-stored key is never moved by an
+  ordinary command, in either direction. `uku auth login` is the only thing
+  that moves it. `uku auth logout` and `uku account remove` delete the key from
+  **both** stores and exit 3, naming the exact `security delete-generic-password`
+  command, if the keyring would not release it.
 - **Never on the process list.** Auth headers (`X-API-Key`, `X-Uku-Company`) are
   passed to `curl` via a 0600 config file (`-K`), not on the command line, so the
   key can't be read from `ps` on a multi-user host. Request bodies are handled the
