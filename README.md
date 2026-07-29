@@ -81,7 +81,17 @@ uku auth logout
 
 Credentials are stored per account at `~/.config/uku/profiles/<name>`, mode `0600`;
 the key is never printed except by `uku auth print-header`, which exists to
-print it and warns every time. An account is a *name* — letters, digits,
+print it and warns every time.
+
+Set `UKU_KEYRING=1` and the next `uku auth login` puts the key in the OS
+credential store instead (macOS Keychain, or Linux Secret Service if
+`secret-tool` is installed), leaving only the base URL and company id in the
+profile file. It is off by default, and it buys one specific thing: the key is
+not in a file this CLI writes. It does not stop anything running as you from
+asking the keyring for it. An existing key is only ever moved by
+`uku auth login`, never by an ordinary command; signing out removes it from
+both stores.
+See [SECURITY.md](SECURITY.md) for the timeout and fallback rules. An account is a *name* — letters, digits,
 `.` `_` `-`, and neither `.` nor `..` — never a path. In CI or an agent sandbox, skip `login` and pass
 credentials as environment variables (they override the stored account):
 
