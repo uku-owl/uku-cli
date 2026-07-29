@@ -62,6 +62,12 @@ come from the same repo. Signing is the next step and is not implemented —
 `uku update` and the once-a-day auto-update follow the release channel: they
 notice a bump in `VERSION` and install the tag behind it, verified.
 
+**The auto-update installs by itself.** It is on by default, and it does not
+just notify: once a day, on an ordinary command, it fetches the installer and
+pipes it into `sh` — no prompt, no TTY needed. That is deliberate (a fix reaches
+every machine within a day) and it is a real trade, spelled out in
+[`SECURITY.md`](SECURITY.md). Turn it off with `UKU_NO_AUTO_UPDATE=1`.
+
 On a terminal the installer offers to sign you in and connect your coding agents
 right away. Or run it yourself:
 
@@ -74,7 +80,9 @@ uku auth logout
 ```
 
 Credentials are stored per account at `~/.config/uku/profiles/<name>`, mode `0600`;
-the key is never printed. In CI or an agent sandbox, skip `login` and pass
+the key is never printed except by `uku auth print-header`, which exists to
+print it and warns every time. An account is a *name* — letters, digits,
+`.` `_` `-`, and neither `.` nor `..` — never a path. In CI or an agent sandbox, skip `login` and pass
 credentials as environment variables (they override the stored account):
 
 ```sh
@@ -337,6 +345,8 @@ without ever being able to move money.
   `--fields` reduces each row in `.data` to the keys you named and re-serialises
   the result through `jq` (which also pretty-prints it). Ask for `--fields` and you
   are asking for a reshaped `.data`; leave it off and the body is the API's.
+  Field names must be plain identifiers — letters, digits, underscore — because
+  they are handed to `jq`; anything else is a usage error rather than a program.
 - `--agent` is the second channel — one envelope, for a program that wants the
   CLI's own reading of what just happened. See below. **A `--batch` run is the one
   exception**: it stays JSONL, one object per input line, under `--agent` too.
@@ -525,7 +535,9 @@ This prints a **live credential** on stdout — it warns you on stderr. Add
 | var | purpose |
 |-----|---------|
 | `UKU_API_KEY`, `UKU_COMPANY` | credentials (override the stored file — ideal for CI/agents) |
-| `UKU_BASE_URL` | override the API base (default `https://app.getuku.com`) |
+| `UKU_BASE_URL` | override the API base (default `https://app.getuku.com`). `https://` unless the host is loopback — an `http://` base to any other host is refused before anything is sent, because the key would go out in cleartext. A base that is neither the default nor loopback prints one line on stderr naming the host; `--quiet` does not silence it |
+| `UKU_NO_AUTO_UPDATE` | `1` stops the once-a-day check (which otherwise **installs**, unattended) |
+| `UKU_DEV` | `1` lets `UKU_INSTALL_URL` / `UKU_UPDATE_URL` take effect. Without it those two are ignored with a message: they name code the unattended update would fetch and run, so an environment variable alone must not choose them. For this project's own test suite |
 | `UKU_BIN_DIR` | install location (installer) |
 | `UKU_VERSION` | installer: pin a release tag (`0.2.0`), or `main` for the unverified rolling edge |
 | `UKU_CHANNEL` | installer: `release` (default) or `main` (rolling, unverified) |

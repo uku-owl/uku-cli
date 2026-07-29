@@ -86,7 +86,14 @@ setup_case() {
   export NO_COLOR=1
   export UKU_NO_AUTO_UPDATE=1
   export TMPDIR="$CASE_DIR/work"
-  # keep the CLI away from anything that resolves to the internet
+  # keep the CLI away from anything that resolves to the internet.
+  # UKU_DEV=1 is what makes UKU_INSTALL_URL/UKU_UPDATE_URL take effect at all:
+  # since the S6.1 fix those two are honoured ONLY under UKU_DEV, because the
+  # URL they name is fetched and piped into a shell by the unattended
+  # once-a-day update. Without this the suite would still pass while quietly
+  # exercising the built-in production URLs instead of the fixture — and a case
+  # that means to prove the lock (tests/cases/update-trust.sh) unsets it.
+  export UKU_DEV=1
   export UKU_INSTALL_URL="http://127.0.0.1:1/never"
   unset UKU_QUIET UKU_JSON UKU_DRY UKU_YES 2>/dev/null || true
 

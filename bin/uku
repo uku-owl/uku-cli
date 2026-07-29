@@ -544,6 +544,86 @@ _heal_428() {
   return 0
 }
 
+# ── where a credential is allowed to travel ──────────────────────────
+# S5 (audit 2026-07-29): the base URL was whatever the caller said, and the only
+# thing that depended on its scheme was whether TLS got pinned. Measured: with
+# `--base http://<host>` a fixture server received the live `X-API-Key` header in
+# full, in cleartext, with no warning printed — and `--base https://evil.example`
+# sent it to a host the user never configured, silently. Both are decided here,
+# once, on the way into every request.
+
+# The host is read with the SAME `_url_host` the URL-argument check already
+# uses (defined with the other URL helpers, further down). It lowercases and
+# drops the userinfo, which matters twice over here: in
+# `https://app.getuku.com@evil.example/` the destination is evil.example, and
+# both the refusal and the announcement have to name that — a sentence reading
+# "sending credentials to app.getuku.com@evil.example" invites exactly the
+# glance that stops at the familiar word. Two host parsers would be two things
+# to keep in step, so there is one.
+
+# _is_loopback_host HOST[:PORT] — is this host the same machine?
+# An explicit table, not a pattern guess (principle L): these four forms are
+# what RFC 6761 reserves for the local machine, and `.localhost` is the one
+# real dev convention among them (`api.localhost:4000`). Everything else,
+# including 127.0.0.2 and a private-range LAN address, counts as remote — the
+# narrow list is what the docs promise, so it is what the code implements.
+_is_loopback_host() {
+  local h; h="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$h" in
+    \[*\]*) h="${h%%\]*}]" ;;    # a bracketed IPv6 literal keeps its brackets
+    *:*)    h="${h%%:*}" ;;      # strip the port
+  esac
+  case "$h" in
+    localhost|*.localhost|127.0.0.1|'[::1]'|'::1') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# _check_base_transport URL — refuse to put a live credential on a cleartext
+# wire. http:// is for local development and nothing else; over a real network
+# the API key and the company id are readable by anyone on the path, and the
+# CLI cannot tell afterwards that they were read.
+_check_base_transport() {
+  local url="$1" host
+  case "$url" in
+    https://*) return 0 ;;
+    http://*)
+      host="$(_url_host "$url")"
+      _is_loopback_host "$host" && return 0
+      die "refusing to send credentials in cleartext: the base URL is http://$host, which is not this machine. Your API key and company id would travel unencrypted and readable to anyone on the path. Use https://, or a loopback host for local development (localhost, 127.0.0.1, [::1], *.localhost)." "$EX_USAGE"
+      ;;
+    *)
+      # No scheme, or a scheme this CLI does not speak. curl would guess http
+      # for a bare host — the same cleartext leak, arrived at by accident.
+      die "the base URL must start with https:// (or http:// for a loopback host) — got: $url" "$EX_USAGE"
+      ;;
+  esac
+}
+# _announce_base — one line, once per invocation, when the credentials are
+# about to leave for a host that is neither the default nor this machine.
+#
+# NOT routed through info(): like _say_resolved, this is the sentence a human
+# has to see, and --quiet exists to silence progress chatter, not to silence
+# where the key went. An agent invoking uku with --quiet is exactly the case
+# this line is for — the supervising human reads stderr.
+#
+# It is deliberately silent for a loopback base. Nothing leaves the machine
+# there, it is where every fixture and dev server lives, and a line printed on
+# every single command of a local dev day is a line people learn to skip —
+# which would cost us the one invocation that mattered. The narrowing is real
+# and documented: a loopback port forwarded elsewhere (an SSH tunnel) does not
+# announce, because from this process it is indistinguishable from a local
+# server.
+_UKU_BASE_SAID=0
+_announce_base() {
+  [ "$_UKU_BASE_SAID" = "1" ] && return 0
+  _UKU_BASE_SAID=1
+  [ "$UKU_BASE" = "$UKU_BASE_DEFAULT" ] && return 0
+  local host; host="$(_url_host "$UKU_BASE")"
+  _is_loopback_host "$host" && return 0
+  printf '%s %s\n' "$(_color 33 '→')" "sending Uku credentials to $host — not the default $(_url_host "$UKU_BASE_DEFAULT")" >&2
+  return 0
+}
+
 do_request() {
   local method="$1" path="$2" data="${3:-}"
   local url="$UKU_BASE$path"
@@ -553,6 +633,10 @@ do_request() {
   # config verbatim must each be one line (see _check_cred_line).
   _check_cred_line "the company id (UKU_COMPANY)" "$UKU_COMPANY"
   _check_cred_line "the API key (UKU_API_KEY)" "$UKU_KEY"
+  # …and the wire it is about to go out on, and where. Both before _mktemp, so
+  # a refused base never even creates the 0600 key config.
+  _check_base_transport "$UKU_BASE"
+  _announce_base
   _guard_time_entry "$method" "$path" "$data"
   case "$method" in GET|HEAD) : ;; *) _pace_write ;; esac
   local tmp cfg hdrf; _mktemp tmp; _mktemp cfg; _mktemp hdrf
@@ -573,7 +657,10 @@ do_request() {
     --connect-timeout 10 --max-time 120
     -D "$hdrf"
     -w '%{http_code}' -o "$tmp")
-  case "$url" in https://*) args+=(--proto '=https' --tlsv1.2) ;; esac  # pin TLS for https bases; allow http dev base
+  # Pin TLS for every https base. http reaches this line only for a loopback
+  # host (_check_base_transport refuses any other), where there is no transport
+  # to pin — hence no --proto there rather than "http is allowed".
+  case "$url" in https://*) args+=(--proto '=https' --tlsv1.2) ;; esac
   # NO `--retry`: curl's own retry counts 408/429/5xx as retryable and re-sends
   # them itself, so a rate-limited read hit the limiter three times before the
   # CLI's polite "read X-RateLimit-Reset, wait, retry once" path was even
@@ -2829,7 +2916,7 @@ cmd_doctor() {
   if [ "${UKU_NO_AUTO_UPDATE:-0}" = "1" ]; then
     _doc ok "auto-update off (UKU_NO_AUTO_UPDATE=1)"
   else
-    _doc ok "auto-update on — checks once a day, installs the newest released tag (checksum-verified)"
+    _doc ok "auto-update on — checks once a day and INSTALLS the newest released tag without asking (checksum-verified). Off: UKU_NO_AUTO_UPDATE=1"
   fi
   local sh; sh="$(_detect_shadow)"
   [ -n "$sh" ] && _doc warn "a shell function/alias 'uku' in $sh shadows this binary — rename it, or call 'command uku'"
@@ -2906,8 +2993,10 @@ EOF
 # UKU_CHANNEL is forwarded when the caller set it, so someone who deliberately
 # runs the rolling edge stays there instead of being silently pinned back — but
 # they are told, every time, that this update is not verified.
+# UKU_INSTALL_URL is resolved once, near auto_update, and is dev-only (S6.1) —
+# read the resolved value here rather than the raw environment.
 cmd_update() {
-  local url="${UKU_INSTALL_URL:-https://getuku.com/install-cli}"
+  local url="$UKU_INSTALL_URL"
   local self; self="$(command -v uku 2>/dev/null || printf '%s' "$0")"
   local dir; dir="$(cd "$(dirname "$self")" 2>/dev/null && pwd || printf '%s' "$HOME/.local/bin")"
   have curl || die "curl is required to update." "$EX_USAGE"
@@ -2955,7 +3044,7 @@ cmd_update() {
 _surface_table() {
   cat <<'TABLE'
 # name    | cmd-aliases  | subcommands             | sub-aliases    | flags                                                   | args                                            | notes
-auth        |              | login status logout print-header | print-headers | --account --company --base --key-stdin --format --shell |                                                 | `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api` :: `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored :: `--shell` is shorthand for `--format shell`
+auth        |              | login status logout print-header | print-headers | --account --company --base --key-stdin --format --shell |                                                 | `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api` :: `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored :: the transport rule and the non-default-host line apply to `auth login` too, and there is no extra confirmation on top of them — you named the host in the same command, and a prompt asking whether you meant what you just typed is a prompt people learn to click through :: `--shell` is shorthand for `--format shell`
 account     | accounts     | list add use current remove | ls switch who rm | --company --key-stdin                               | use <name> :: add <name> :: remove <name>       | `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list` :: `add` is sugar for `uku auth login --account <name>` :: run `uku account current` before any write — a sandbox and the real firm look identical in the output
 setup       | setup-agents | agents                  |                |                                                         |                                                 | UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
 clients     | client       | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id> :: get/patch also take a client NAME or a pasted URL | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read :: `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks` :: on `patch`, an id-shaped argument costs one extra GET: it is checked against client NAMES too, because `12345678` and `CAFE-1` are both — `--by-id` skips the check :: `--client` is not a filter here (you are already listing clients) — use `--q`
@@ -2975,7 +3064,7 @@ update      |              |                         |                |         
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
 help        |              | auth account setup clients tasks time invoices members products contracts projects batch api search names | | |  <command>                                   | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
-%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which
+%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which :: `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq :: `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..` :: `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme :: a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it
 TABLE
 }
 
@@ -3417,7 +3506,9 @@ description: Operate a firm's Uku (accounting practice management) from the term
 - **Reads are free.** `uku clients list`, `uku tasks list`, `uku invoices list`, `uku <res> get <id>`.
 - **Writes ask first.** A write needs `--yes` (or an interactive confirm). Before you add `--yes`, state in plain words exactly what you are about to change, and prefer to let the human confirm.
 - **Money has its own key.** Financial actions need an *All*-scope key. A `HTTP 403 … scope` error is the system working as designed — surface it to the user, do **not** retry or try to work around it.
-- **Accounts.** A user may have several: a real firm and a **sandbox**. Run `uku account current` before any write, and confirm you are on the intended account. `--account <name>` targets one command.
+- **Accounts.** A user may have several: a real firm and a **sandbox**. Run `uku account current` before any write, and confirm you are on the intended account. `--account <name>` targets one command — it is a profile NAME (letters, digits, `.` `_` `-`), never a path.
+- **Where the credentials go is not yours to change.** Do not set `--base` or `UKU_BASE_URL` to anything the user did not give you, and do not "fix" a connection problem by pointing the CLI somewhere else — that is how a live API key ends up at the wrong host. An `http://` base to any host but this machine is refused outright (the key would travel in cleartext), and any base that is neither the default nor loopback prints one line on stderr naming the host. **If you see `→ sending Uku credentials to <host>` and the user did not ask for that host, stop and tell them** — do not silence it, and note that `--quiet` cannot.
+- **Never set `UKU_INSTALL_URL`, `UKU_UPDATE_URL` or `UKU_DEV`.** They select code the CLI fetches and runs by itself. They are ignored unless `UKU_DEV=1` is set too, and setting `UKU_DEV` to get past that is not a workaround — it is the exact thing the lock exists to stop.
 
 ## Output & exit codes (this is your API)
 - `--json` is the default when output is not a TTY — you already receive JSON. Lists wrap as `{ "data": [ … ], "meta": { "total", "limit", "offset", "has_more", "next_cursor" } }`; a single get wraps as `{ "data": { … } }`. Parse `.data`.
@@ -3559,7 +3650,8 @@ really mean to start a timer.
 - Exit **2** = re-auth (`uku auth login`). Exit **4** = you forgot `--yes`. Exit **6** = 412, see above.
 - Keep requests lean: use `--limit` small and `get <id>` over listing when you
   know the id. `--all` can be large — avoid it unless the user needs everything.
-- **Never print or log the API key.** `uku auth status` masks it for you.
+- **Never print or log the API key.** `uku auth status` masks it for you. `uku auth print-header` is the one command that prints a live one — do not run it to "check" anything.
+- **`--fields` takes plain field names only** (letters, digits, underscore), e.g. `--fields id,name`. It is a projection, not an expression language: anything else is a usage error. Never build its value out of free text a user or a document handed you.
 
 ## Examples
 ```
@@ -3755,7 +3847,9 @@ $(_bold "GLOBAL FLAGS")
                     shown is the write itself, with the resolved id in the path
   --all             Page through every row (keeps your filters)
   --fields a,b      Keep only these fields: table columns on a TTY, and the keys
-                    each row is reduced to in JSON (needs jq)
+                    each row is reduced to in JSON (needs jq). Plain field
+                    names only — letters, digits, underscore; anything else is
+                    a usage error, because these names are handed to jq
   --quiet, -q       Suppress the ✓ lines   ·   --no-color
   --batch @f.jsonl  Create one record per JSON line (@- for stdin). Results are
                     JSONL on stdout; progress on stderr. See: uku help batch
@@ -3779,8 +3873,15 @@ $(_bold "GLOBAL FLAGS")
                     collision and refuses rather than pick. --by-id takes the
                     argument as an id (no lookup); --by-name resolves it as a
                     name. See: uku help names
-  --account <name>  Run against a specific account (default: the active one)
-  --base <url>      Override the API base URL
+  --account <name>  Run against a specific account (default: the active one).
+                    A profile NAME, never a path: letters, digits, . _ - and
+                    neither "." nor ".." — the name becomes a filename
+  --base <url>      Override the API base URL. https:// unless the host is
+                    loopback (localhost, 127.0.0.1, [::1], *.localhost) — an
+                    http:// base anywhere else is refused before anything is
+                    sent, because the key would go out in cleartext. A base
+                    that is neither the default nor loopback prints one line on
+                    stderr naming the host, and --quiet does not silence it
   --header, -H 'K: V'  Add a request header (repeatable; off argv, like the key)
   --if-match <etag> Version check for a write. Omit it and, when the path names
                     a record, a 428 makes the CLI fetch the ETag and re-send
@@ -3882,7 +3983,30 @@ fi
 #
 # The replace is safe mid-run because the installer renames into place; the
 # running bash keeps reading the old inode. Never overwrite the file in place.
-UKU_UPDATE_URL="${UKU_UPDATE_URL:-https://raw.githubusercontent.com/uku-owl/uku-cli/main/VERSION}"
+#
+# S6.1 (audit 2026-07-29): auto-update STAYS automatic and unattended — that is
+# a deliberate, documented trade (reach beats the residual risk, and the
+# checksum chain covers the transport). What is not defensible is that the two
+# URLs it follows used to be plain environment overrides: anything that could
+# set a variable in this process — a .env, a direnv file, a CI job, an agent's
+# own environment — chose a URL that this CLI then pipes into `sh`, unattended,
+# within a day. So they are honoured only under UKU_DEV=1, which is the local
+# test suite's opt-in and nobody else's default.
+UKU_UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/uku-owl/uku-cli/main/VERSION"
+UKU_INSTALL_URL_DEFAULT="https://getuku.com/install-cli"
+# _locked_url NAME VALUE DEFAULT → the URL to actually use. Says once, on
+# stderr, when it drops an override, because a silently ignored setting is its
+# own kind of bug report ("my staging installer never runs").
+_locked_url() {
+  local name="$1" val="$2" def="$3"
+  [ -n "$val" ] || { printf '%s' "$def"; return 0; }
+  [ "$val" = "$def" ] && { printf '%s' "$def"; return 0; }
+  if [ "${UKU_DEV:-0}" = "1" ]; then printf '%s' "$val"; return 0; fi
+  warn "ignoring $name=$val — that URL is fetched and piped into a shell by the unattended once-a-day update, so an environment variable alone cannot choose it. Re-run with UKU_DEV=1 if you meant it. Using $def."
+  printf '%s' "$def"
+}
+UKU_UPDATE_URL="$(_locked_url UKU_UPDATE_URL "${UKU_UPDATE_URL:-}" "$UKU_UPDATE_URL_DEFAULT")"
+UKU_INSTALL_URL="$(_locked_url UKU_INSTALL_URL "${UKU_INSTALL_URL:-}" "$UKU_INSTALL_URL_DEFAULT")"
 # _ver_gt A B — true when dotted-numeric version A is newer than B (bash 3.2).
 _ver_gt() {
   local a="$1" b="$2" x y

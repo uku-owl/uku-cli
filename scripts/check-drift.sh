@@ -147,6 +147,7 @@ probe() { # NAME
   UKU_BASE_URL="http://127.0.0.1:9" \
   UKU_UPDATE_URL="http://127.0.0.1:9/VERSION" \
   UKU_INSTALL_URL="http://127.0.0.1:9/never" \
+  UKU_DEV=1 \
   UKU_SETUP_AGENT=none \
   UKU_NO_AUTO_UPDATE=1 NO_COLOR=1 \
     "$UKU" "$1" __surface_probe__ </dev/null >/dev/null 2>"$TMP/probe.err" || true

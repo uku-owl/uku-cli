@@ -13,8 +13,51 @@ an accounting firm's data. We take its security posture seriously.
   key can't be read from `ps` on a multi-user host. Request bodies are handled the
   same way, so client PII isn't on the process list either.
 - **Never printed.** `uku auth status` and every message mask the key
-  (`uku_live_…d5e2`). The CLI does not log request or response bodies.
+  (`uku_live_…d5e2`). The CLI does not log request or response bodies. The one
+  exception is `uku auth print-header`, which exists to print a live credential
+  and warns on stderr every time it does.
+
+  `--fields` used to be a way around that: its value was spliced into a `jq`
+  program as text, so `--fields 'x // env.UKU_API_KEY'` printed the real key on
+  a terminal. Field names are now required to be plain identifiers (letters,
+  digits, underscore) and are passed to `jq` as data, not as program text —
+  both, because either alone is one mistake away from the same hole.
+- **An account name is a name, not a path.** `--account`, `account use`,
+  `account remove` and `auth logout` all take a profile name matching
+  `[[:alnum:]._-]`, excluding `.` and `..`. Before this,
+  `uku account remove ../../../../victim/precious.txt` deleted the named file
+  and reported success, and `--account ../../../victim/prof` read an arbitrary
+  file as a profile — which meant an attacker who could write a file anywhere
+  could choose the host your key was sent to. The `active` file is re-checked
+  on read, so a profile poisoned by an older CLI cannot keep redirecting you.
 - **TLS pinned.** HTTPS requests use `--proto '=https' --tlsv1.2`.
+- **`http://` is for this machine only.** The base URL must be `https://`
+  unless the host is this machine — `localhost`, `*.localhost`, `127.0.0.1`,
+  `[::1]`. An `http://` base to any other host is **refused before anything is
+  sent**, and so is a base with no scheme at all (`curl` would have guessed
+  `http`). This applies wherever the base comes from: `--base`, `UKU_BASE_URL`,
+  or a stored profile. Asserted in `tests/cases/base-trust.sh`, whose refusal
+  assertions are "`curl` was never executed".
+
+  Before this, `http://` was allowed anywhere with a code comment reading
+  "allow http dev base" and no warning of any kind; a plaintext fixture server
+  was measured receiving the full live `X-API-Key` header. The exemption is
+  exactly the four loopback spellings above and nothing wider: `127.0.0.2`, a
+  LAN address and a private hostname all count as remote. **The narrow part:** a
+  loopback port that has been forwarded somewhere else (an SSH tunnel) is
+  indistinguishable from a local server here, and is treated as local.
+- **A non-default host announces itself.** When the base is neither
+  `https://app.getuku.com` nor loopback, one line goes to stderr naming the
+  host the credentials are about to go to — once per invocation, however the
+  base was chosen, including a base that was stored in a profile weeks ago and
+  is not mentioned on the command line. `--quiet` does **not** silence it: quiet
+  drops progress chatter, and where your key went is not chatter. This is the
+  one line a person supervising an agent has to be able to see.
+
+  It is *not* a confirmation prompt and does not stop anything. It also stays
+  silent for a loopback base, deliberately: a line on every command of a local
+  development day is a line people learn to skip, which would cost us the one
+  invocation that mattered.
 - **Validated before it's saved.** `uku auth login` verifies the key against the
   API *before* writing anything to disk — bad credentials never land.
 - **Temp files are swept on any exit**, including Ctrl-C, via a trap — the 0600
@@ -53,7 +96,15 @@ run the firm without ever being able to move money it was never meant to touch.
 Writes (`POST`/`PATCH`/`DELETE`) are never accidental: a non-interactive write
 requires an explicit `--yes`, and an interactive one prompts for confirmation.
 `DELETE` restates the target and is labelled as permanent. Every non-GET is
-recorded in a local, keyless audit log at `~/.config/uku/audit.log` (0600).
+recorded in a local audit log at `~/.config/uku/audit.log` (0600).
+
+Be precise about what that log holds, because it is a file people share when
+something goes wrong: one tab-separated line per write — timestamp, account
+name, method, **the request path including its query string**, and the response
+status. No request body, no response body, no key. The query string means a
+name you searched for can appear in it (`POST /api/v3/tasks?q=Acme%20Ltd`), so
+treat it as containing client names. It is not rotated and grows without
+limit.
 
 **Writes are re-sent automatically in exactly one case, and it is the case where
 re-sending cannot do harm.** A `428 PRECONDITION_REQUIRED` means the server
@@ -113,6 +164,34 @@ The script is small and readable — review it before running if you prefer:
 `uku update`, and the once-a-day auto-update, both go through this same
 installer and therefore through the same default channel: the newest released
 tag, checksum-verified.
+
+### The auto-update installs by itself — read this before you deploy the CLI
+
+Auto-update is **on by default** and it does not merely notify. At most once a
+day, on an ordinary command, `uku` fetches the release pointer and — if the
+number moved — fetches the installer and **pipes it into `sh`**, with no prompt,
+no TTY requirement and no confirmation in that moment. The new binary is renamed
+into place, so the running command finishes on the old file and the change
+applies from your next one. Turn it off with `UKU_NO_AUTO_UPDATE=1`; `uku update`
+by hand keeps working either way.
+
+This is a deliberate trade, not an oversight: a fix reaches every machine within
+a day, and we would rather that than a long tail of old clients writing to a
+firm's books. What you are accepting in exchange is stated plainly above — **a
+compromise of this repository becomes a compromise of every client that runs the
+CLI, automatically, within 24 hours.** The checksum chain covers the transport
+and the moving-target problem; it is not a defence against a compromised source,
+and signing is still not implemented. On a machine where that is not an
+acceptable trade, set `UKU_NO_AUTO_UPDATE=1`.
+
+**The two URLs it follows cannot be chosen by the environment.**
+`UKU_INSTALL_URL` and `UKU_UPDATE_URL` are honoured **only** when `UKU_DEV=1` is
+also set; otherwise the override is ignored, the built-in URL is used, and the
+CLI says on stderr that it dropped it and why. They exist for the project's own
+test suite. Without that lock, anything that can set an environment variable in
+the process — a `.env`, a `direnv` file, a CI job definition, an agent's own
+environment — chooses code that this CLI then runs unattended within a day.
+Asserted in `tests/cases/update-trust.sh`.
 
 ## Reporting a vulnerability
 

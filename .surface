@@ -230,12 +230,16 @@ gflag -V
 gflag -h
 gflag -q
 gflag -y
+note %global `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..`
 note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq
+note %global `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme
 note %global `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which
 note %global `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature
+note %global `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq
 note %global `--json` and `--agent` are alternatives — passing both is a usage error
 note %global `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
 note %global `uku <command> --help --agent` emits this table as JSON, including these notes
+note %global a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it
 note %global these are parsed ANYWHERE on the line, before the command
 note account `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list`
 note account `add` is sugar for `uku auth login --account <name>`
@@ -247,6 +251,7 @@ note api this reaches every v3 endpoint, so prefer it over dropping to curl
 note auth `--base` on `auth login` beats UKU_BASE_URL and the key is validated against THAT base before anything is stored
 note auth `--shell` is shorthand for `--format shell`
 note auth `print-header` prints a LIVE credential on stdout — never echo it back, never commit it; prefer `uku api`
+note auth the transport rule and the non-default-host line apply to `auth login` too, and there is no extra confirmation on top of them — you named the host in the same command, and a prompt asking whether you meant what you just typed is a prompt people learn to click through
 note batch `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
 note batch reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request
 note clients --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read
