@@ -206,10 +206,10 @@ command that installs it. That is all it does. No script is fetched, nothing is
 piped into a shell, and no binary changes until you run `uku update` yourself.
 `UKU_NO_AUTO_UPDATE=1` silences the notice and skips the check.
 
-**This is a change from 0.6.x, and the reasoning is worth stating plainly**,
+**This is a change in behaviour, and the reasoning is worth stating plainly**,
 because the previous behaviour was a documented, deliberate trade rather than an
-oversight. Until 0.7.0 the same daily check went on to fetch the installer and
-**pipe it into `sh`** — no prompt, no TTY needed. The argument for it was reach:
+oversight. Older versions had the same daily check go on to fetch the installer
+and **pipe it into `sh`** — no prompt, no TTY needed. The argument for it was reach:
 a fix lands on every machine within a day, rather than leaving a long tail of old
 clients writing to a firm's books.
 

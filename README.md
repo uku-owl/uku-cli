@@ -68,10 +68,9 @@ telling you so. It stops there. Installing is `uku update`, and only ever
 happens because you asked. Silence the notice, and skip the check entirely, with
 `UKU_NO_AUTO_UPDATE=1`.
 
-This changed in 0.7.0. Older versions installed the new release themselves,
-unattended, by piping a fetched script into `sh` — see
-[`SECURITY.md`](SECURITY.md) for why that is no longer something we are willing
-to leave switched on by default.
+Older versions installed the new release themselves, unattended, by piping a
+fetched script into `sh` — see [`SECURITY.md`](SECURITY.md) for why that is no
+longer something we are willing to leave switched on by default.
 
 On a terminal the installer offers to sign you in and connect your coding agents
 right away. Or run it yourself:
