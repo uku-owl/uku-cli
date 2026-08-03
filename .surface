@@ -232,7 +232,7 @@ gflag -h
 gflag -q
 gflag -y
 note %global `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..`
-note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq
+note %global `--agent` wraps the response in {ok,data,meta,warnings,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq
 note %global `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme
 note %global `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which
 note %global `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature

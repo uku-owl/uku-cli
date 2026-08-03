@@ -1133,8 +1133,41 @@ do_request() {
 }
 
 # render BODY  — pretty JSON when jq is present and TTY; raw otherwise.
+# _emit_warnings BODY — C5. A 2xx response can carry warnings[]: the write
+# SUCCEEDED, and there is something about it the caller should know.
+# TIME_ENTRY_OVERLAP, MONITOR_OVERLAP and AGREEMENT_OVERLAP all mean "this was
+# accepted and it overlaps something you already have" — which is a thing a
+# person books time against a task wants to hear about, and which this CLI has
+# been silently discarding.
+#
+# stderr, not stdout: stdout is the caller's JSON and a warning must never
+# become part of a parsed document. That also means --json callers still see
+# them, which is right — a script's operator reads stderr.
+_emit_warnings() {
+  local body="$1" w
+  [ -n "$body" ] || return 0
+  w="$(printf '%s' "$body" | _json_scan field warnings 2>/dev/null)" || return 0
+  case "$w" in ''|null|'[]'|'[ ]') return 0 ;; esac
+  if have jq; then
+    # Order matters: >&2 must come FIRST. Written 2>/dev/null >&2, fd2 is
+    # already /dev/null by the time stdout is pointed at it, so every warning
+    # is silently discarded — which is the exact bug C5 is about, reintroduced
+    # one layer down.
+    local rendered
+    rendered="$(printf '%s' "$body" | jq -r '.warnings[]? | "  ! \(.code // "WARNING"): \(.message // "")"' 2>/dev/null)" || rendered=""
+    if [ -n "$rendered" ]; then printf '%s\n' "$rendered" >&2; else printf '  ! %s\n' "$w" >&2; fi
+  else
+    # No jq is a supported configuration, so this degrades to the raw array
+    # rather than staying silent — the point is that the user learns of it.
+    printf '  ! %s\n' "$w" >&2
+  fi
+  return 0
+}
+
 render() {
   local body="$1"
+  # --agent carries warnings inside the envelope instead, so they stay one
+  # parseable document; every other mode gets them on stderr.
   if [ "${UKU_AGENT:-0}" = "1" ]; then _agent_ok "$body" "$UKU_SUMMARY"; return; fi
   if [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then
     printf '%s\n' "$body"; _bc_flush; return
@@ -1298,7 +1331,17 @@ _api_fail() {
 check_status() {
   local body="$1" s="$REPLY_STATUS"
   case "$s" in
-    2*) return 0 ;;
+    # C5 — warnings ride on a SUCCESS, so this is the only place they can be
+    # emitted once for every caller. render() is not enough: table()'s TTY
+    # branch renders columns and returns without ever calling it, and the TTY
+    # is exactly where a person most needs to be told their time entry
+    # overlaps one they already have.
+    #
+    # --agent puts them in the envelope instead, and UKU_SOFT marks the CLI's
+    # own internal probes (the ETag fetch behind a 428, the search fan-out) —
+    # a warning about a request the user never made is noise.
+    2*) if [ "${UKU_AGENT:-0}" != "1" ] && [ "${UKU_SOFT:-0}" != "1" ]; then _emit_warnings "$body"; fi
+        return 0 ;;
     401|403)
       # Exit codes are the agent's API: auth/permission failures are EX_AUTH (2),
       # distinct from a generic API error (3), so an agent knows to re-auth.
@@ -1714,17 +1757,22 @@ _exit_name() {
 }
 
 _agent_ok() { # BODY SUMMARY
-  local body="$1" summary="$2" data="" meta=""
+  local body="$1" summary="$2" data="" meta="" warns=""
   if [ -n "$body" ]; then
     data="$(printf '%s' "$body" | _json_scan field data)"
     meta="$(printf '%s' "$body" | _json_scan field meta)"
+    # C5 — carried through instead of dropped. An agent that cannot see
+    # TIME_ENTRY_OVERLAP has no way to tell a clean write from one the server
+    # accepted with a caveat.
+    warns="$(printf '%s' "$body" | _json_scan field warnings)"
   fi
   # A body with no top-level `data` IS the data (uku doctor, uku auth status).
   [ -n "$data" ] || data="$body"
   [ -n "$data" ] || data="null"
   [ -n "$meta" ] || meta="null"
-  printf '{"ok":true,"data":%s,"meta":%s,"summary":%s,"breadcrumbs":%s}\n' \
-    "$data" "$meta" "$(_json_str "$summary")" "$(_bc_json)"
+  [ -n "$warns" ] || warns="null"
+  printf '{"ok":true,"data":%s,"meta":%s,"warnings":%s,"summary":%s,"breadcrumbs":%s}\n' \
+    "$data" "$meta" "$warns" "$(_json_str "$summary")" "$(_bc_json)"
   UKU_BC=""
   return 0
 }
@@ -3555,7 +3603,7 @@ update      |              |                         |                |         
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
 help        |              | auth account setup clients tasks time invoices members products contracts projects batch api search names | | |  <command>                                   | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
-%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --idempotency-key --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which :: `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq :: `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..` :: `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme :: a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it :: `--idempotency-key` makes a WRITE safe to repeat: the API replays the original response for 24h instead of acting twice. Each run mints its own key, so re-running a command is still two writes — pass the SAME key on the retry to make it one
+%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --idempotency-key --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,warnings,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which :: `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq :: `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..` :: `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme :: a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it :: `--idempotency-key` makes a WRITE safe to repeat: the API replays the original response for 24h instead of acting twice. Each run mints its own key, so re-running a command is still two writes — pass the SAME key on the retry to make it one
 TABLE
 }
 
@@ -4468,7 +4516,7 @@ set -- ${ARGS[@]+"${ARGS[@]}"}
 # body vs. an envelope around it. Silently picking one would make the other a
 # lie, so say so instead.
 if [ "$UKU_AGENT" = "1" ] && [ "$UKU_JSON" = "1" ]; then
-  die "--json and --agent are alternatives: --json is the raw API body, --agent wraps it in {ok,data,meta,summary,breadcrumbs}. Pick one." "$EX_USAGE" @@help.root
+  die "--json and --agent are alternatives: --json is the raw API body, --agent wraps it in {ok,data,meta,warnings,summary,breadcrumbs}. Pick one." "$EX_USAGE" @@help.root
 fi
 
 # ── update check ──────────────────────────────────────────────────────

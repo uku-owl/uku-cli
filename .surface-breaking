@@ -63,3 +63,19 @@ note tasks neither resolution happens on a write, in a `--batch`, or for an argu
 #     compared, never executed, and pinning it would end update detection.
 #
 # Pinned by tests/cases/update-trust.sh §0, §6 and §7.
+
+# 2026-08-03 — the --agent envelope gained a "warnings" key (C5), so the note
+# enumerating its shape is REPLACED, not withdrawn. The restated line is in
+# .surface with warnings named between meta and summary.
+#
+# The API returns a non-fatal warnings[] on a 2xx — TIME_ENTRY_OVERLAP,
+# MONITOR_OVERLAP, AGREEMENT_OVERLAP — meaning "this was accepted, and there is
+# something about it you should know". The CLI read .data and .meta and dropped
+# warnings on the floor, so a person booking time against a task was never told
+# it overlapped one they already had.
+#
+# Adding a key to a JSON object does not break a consumer that indexes by name,
+# which is every sane consumer. It is recorded here because the note PROMISED
+# an exact shape, and a promise about shape is the kind of thing someone writes
+# a schema against.
+note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq
