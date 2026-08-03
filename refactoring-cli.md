@@ -152,7 +152,35 @@ uku CLI test suite — 1306 passed, 0 failed  (1306 total, 374s)
 Budget ~6 minutes for the suite. Note `bin/ci` runs all five stages without
 short-circuiting (`bin/ci:26-96`), so one failure does not mask the rest.
 
-### 3.1 getuku-astro — goes FIRST, and here is why
+### 3.1 getuku-astro — ✅ SHIPPED 2026-08-03, with one deviation
+
+**Measured live after the deploy:**
+
+| Route | Live result | vs. plan |
+|---|---|---|
+| `/install-cli` | → `…/v0.6.0/scripts/install.sh`, 200, sha256 `60cacc51…` | ✅ exactly as specified, bytes unchanged |
+| `/uku` | **404 — deleted** | ⚠ deleted rather than repointed |
+| `/uku.sha256` | 404 — not added | moot; see below |
+| `/uku-partner-program/` | 200 | ✅ untouched |
+
+**On the deviation.** The plan said repoint, keep it alive, measure, then remove.
+What shipped is the removal. The failure mode is milder than the caution assumed:
+a vendored pre-`15933bd` installer now gets a hard `download failed from
+https://getuku.com/uku` naming the URL, rather than a silent wrong install. It
+also closes the vector completely, including the silently-unverified-binary
+problem — nothing installs at all, so `/uku.sha256` no longer has a purpose.
+
+**One thing still to check, and it is retroactive:** Vercel request counts for
+`/uku` over the preceding 30 days. Zero → this is finished and strictly better
+than the plan. Non-zero → restore as a repoint to `v0.6.0/bin/uku`, because those
+are real machines that just lost their install path.
+
+**What this does NOT change:** the installed base still carries the old
+`UKU_INSTALL_URL_DEFAULT` and the old opt-out auto-update, so it keeps resolving
+through Vercel until each machine updates once. That hop now lands on immutable,
+verified bytes — which was the whole point of doing this side first.
+
+### 3.1.1 Original brief (kept for the record)
 
 `UKU_INSTALL_URL_DEFAULT="https://getuku.com/install-cli"` (`bin/uku:4357`) is
 baked into every `bin/uku` already on a customer's machine. Editing that line
