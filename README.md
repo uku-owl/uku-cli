@@ -512,6 +512,30 @@ where the server refused it and nothing happened.
 No other failed write is ever retried for you, because in no other case can the
 CLI know whether it landed.
 
+### Making a write safe to repeat — `--idempotency-key`
+
+Every write carries an `Idempotency-Key`. The API stores the response to a keyed
+write for 24h and replays it rather than acting twice, so the same key can never
+create two records.
+
+**Each run mints its own key**, which covers the CLI's internal 428 re-send. It
+does *not* make re-running a command safe: two runs are two keys and therefore
+two writes — correctly, because those really are two requests to create
+something.
+
+To make a retry safe across invocations, pass the **same** key you used the
+first time:
+
+```sh
+uku --idempotency-key "invoice-run-2026-08-04" invoices create --data @inv.json --yes
+# ...times out, outcome unknown. Re-run it verbatim:
+uku --idempotency-key "invoice-run-2026-08-04" invoices create --data @inv.json --yes
+# -> the original response, replayed. One invoice, not two.
+```
+
+Any string up to 200 characters. Reusing a key with a *different* body is a
+`409 IDEMPOTENCY_KEY_REUSED` — the key identifies one request, not one command.
+
 ## Rate limits
 
 Every response carries `X-RateLimit-Limit / Remaining / Reset / Tier`; reads and
@@ -564,6 +588,7 @@ This prints a **live credential** on stdout — it warns you on stderr. Add
 ## Troubleshooting
 
 ```sh
+uku health    # is the API up? needs no credential, so it works before you sign in
 uku doctor    # checks PATH, shadowing, curl/jq/bash, config perms, key validity, skill
 ```
 

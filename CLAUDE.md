@@ -47,6 +47,37 @@ Backend repo: `../uku_service`. Ask it directly rather than guessing.
 
 ## Bug ledger
 
+> ### ⚠ STATUS AS OF 2026-08-04 — most of this is FIXED. Read this box first.
+>
+> The ledger below is preserved as written on 2026-08-03, because *why* each bug
+> existed is worth keeping. **It does not describe the current code.** Work is on
+> branch `sec/phase0-install-chain` (unpushed; `main` is still v0.6.0).
+>
+> | | Status |
+> |---|---|
+> | C1 unattended auto-update | ✅ fixed — notifies, installs nothing; install URL pinned to a tag off the marketing site |
+> | C2 deprecated completion path | ⏳ **blocked** — `/complete` and `/reopen` are built but 404 in production |
+> | C3 no `Idempotency-Key` | ✅ fixed — **but not for the reason the entry below gives; see the correction** |
+> | C4 `--help` lies about `/search` | ⏳ **blocked** — `/search` 404s in production. **And the entry below is wrong; see the correction** |
+> | C5 `warnings[]` dropped | ✅ fixed |
+> | C6 collapsed exit codes | ⏳ **needs a CTO ruling** — it is a deliberate surface break |
+> | C7 unannounced loopback cleartext | ❌ **deliberately NOT fixed** — implemented, measured, reverted |
+> | C8 credentials for endpoints needing none | ◐ half — `uku health` ships; `uku capabilities` 404s in production |
+> | C9 `..` path traversal | ✅ fixed — **worst vector was `--by-id`, not `uku api`** |
+> | C10 unquoted `--fields` split | ✅ fixed |
+> | C11 unprompted agent setup | ✅ fixed |
+> | C12 agent help larger than human | ✅ fixed — 1.44× → 0.69× |
+> | C13 hand-maintained `--describe` | ⏳ **blocked** — needs `/capabilities`, which 404s in production |
+> | C14 curl stderr leak | ✅ fixed |
+>
+> **Three entries below are WRONG and would produce a wrong implementation.**
+> Each is corrected in place, marked `⚠ CORRECTION`. The full reasoning, with
+> measurements, is in [`refactoring-cli.md`](refactoring-cli.md) § 1.
+>
+> **Also fixed, and not in this ledger:** the API-anchored drift gate that would
+> have caught C4 in the first place (`scripts/check-api.sh`, 27 `op` facts, a
+> daily job), CI that actually gates, shellcheck, and HTTP 400/409 test coverage.
+
 Severity-ordered. `✅ verified` = reproduced first-hand; otherwise reported by audit and worth re-confirming before you act.
 
 ### Critical — blocks any customer release
@@ -70,7 +101,11 @@ This is a *product decision* honestly disclosed in `SECURITY.md`, not an oversig
 
 **C3 — No `Idempotency-Key` on any write, ever.** ✅ verified: no occurrence in `bin/uku`. The API's middleware covers ~20 top-level creators plus action sub-paths (`invoices/{id}/mark-paid|mark-unpaid|send`, `tasks/{id}/complete|reopen`, `tasks/bulk-action`, `workflow-templates/{id}/apply|push`, `clients/{id}/documents-folder`, `members/{id}/agreements`). The CLI reasoned correctly *from* this gap — it refuses to retry a 429'd write because the request may or may not have landed — but the constraint is self-imposed. Send a key, stable across retries, and safe write retries become available.
 
-**C4 — `--help` asserts a falsehood about the API.** ✅ verified, `bin/uku:3068`: *"Not a server-side search: the API has none."* `GET /api/v3/search` exists (cross-entity: invoices, contacts, suppliers, contracts, tasks, notes). The CLI instead fans out 5 requests, misses four of those entity types, and burns 5× the rate-limit budget. Note `bin/uku:3413` hedges — *"none this CLI can verify"* — which is the more honest phrasing and points straight at the missing capability: **it had no way to check.** That is what § Drift control fixes.
+> **⚠ CORRECTION (2026-08-04).** The last sentence is wrong twice over. (a) A key minted per process protects only the CLI's internal 428 re-send — the one path that repeats a write. Two runs of a command are two processes, two keys and two writes, correctly so. Cross-invocation safety has to be *asked for*, which is why `--idempotency-key` now exists. (b) Write auto-retry is still **off**, and deliberately: retrying is only safe on a path the middleware covers, and coverage is absent from the OpenAPI spec, so it cannot be drift-checked. Hand-copying the covered-path list into the CLI is the exact 'client asserts facts about the server' failure this repo has been bitten by twice. An API-side ticket to declare coverage in the spec is the fix.
+
+**C4 — `--help` asserts a falsehood about the API.** ✅ verified, `bin/uku:3068`: *"Not a server-side search: the API has none."* `GET /api/v3/search` exists (cross-entity: invoices, contacts, suppliers, contracts, tasks, notes). The CLI instead fans out 5 requests, misses four of those entity types, and burns 5× the rate-limit budget.
+
+> **⚠ CORRECTION (2026-08-04).** This reads as *replace the fan-out with `/search`*, and doing that would lose data. Measured from `uku_service/backend/api_v3/routers/search.py:20`: `/search` covers **invoice, contact, supplier, contract, task, note**; the CLI's fan-out covers **clients, tasks, members, products, projects**. The overlap is **`tasks` alone**. Swapping would silently drop clients — which is what someone searching "Acme" almost always means. The fix is a **union**, not a substitution. Also: `/search` 404s in production today, so this is Phase 4 work regardless. Note `bin/uku:3413` hedges — *"none this CLI can verify"* — which is the more honest phrasing and points straight at the missing capability: **it had no way to check.** That is what § Drift control fixes.
 
 ### Medium
 
@@ -82,6 +117,8 @@ This is a *product decision* honestly disclosed in `SECURITY.md`, not an oversig
 ### Low
 
 **C9** — `..` in an `api` path escapes the `/api/v3` prefix (`uku api GET /../../oauth/token` reached `/oauth/token` with the credential attached). Note: enforce at the request layer, not just the `api` command — curated commands interpolate paths too.
+
+> **⚠ SHARPENED (2026-08-04).** The closing note was right and understated. The *worst* vector was not `uku api` at all: `_resolve_ref` took the argument **verbatim** when `--by-id` was passed and interpolated it into `/api/v3/clients/$id`, so `uku clients get '../../oauth/token' --by-id` was the same escape through a curated command. A guard in `cmd_api` alone would have missed it. Fixed at the `do_request` chokepoint, which covers all 17 call sites and any added later.
 **C10** — unquoted `local IFS=','; set -- $raw` → pathname expansion on `--fields`.
 **C11** — non-interactive install runs `setup agents`, appending to `./AGENTS.md` in the cwd and writing `~/.claude/skills/` unprompted.
 **C12** — `--help --agent` (14 KB) is *larger* than human `--help` (9.8 KB). Backwards; the machine variant is the one that should be lean.
@@ -115,6 +152,8 @@ Also note the API now issues **refresh tokens** (24h access, 90d rotating refres
 `.surface` (359 facts) + `check-surface.sh` + `check-drift.sh` are genuinely well-engineered. `check-surface.sh` is an asymmetric backward-compatibility ratchet: additions need a deliberate `--update`, removals fail until acknowledged in `.surface-breaking`. `check-drift.sh` cross-checks README, the generated skill, `--help`, the dispatcher's case labels and the remedy table — and check 3 *executes* every declared command against the real dispatcher rather than trusting a parse.
 
 **But not one of those 359 facts references the Uku API.** The gate checks the CLI against itself. That is precisely why `--help` can assert the API has no search endpoint and stay green.
+
+> **✅ DONE (2026-08-04).** Built as described, and the prediction below held — `check-surface.sh` needed no changes at all, because its emitter was already fact-kind-agnostic. There are now 27 `op METHOD /path` facts, plus `scripts/check-api.sh` gating them against a committed snapshot of the 182 operations production serves, plus an executed check in `tests/run.sh` comparing declared ops to what the suite actually puts on the wire. CI runs the gate on every push and PR; a second workflow re-fetches the live spec daily. Verified by injecting `op GET /api/v3/search` — which exists in the repo and 404s in production — and watching it fail.
 
 **The fix is cheap because the machinery exists.** Add an API-derived fact type — `op GET /api/v3/tasks` — generated from the published spec. The existing ratchet then gives API-coverage drift control for free: a new operation shows up as NEW SURFACE, a removed one fails until acknowledged. No new tooling, no code generator, no unreviewable diffs.
 
@@ -167,15 +206,19 @@ Note this repo already converged independently on breadcrumbs, `doctor`, profile
 
 ## Definition of done
 
-- [ ] C1 resolved; nothing pipes an unverified remote artifact into a shell
-- [ ] C2–C4 fixed: correct completion endpoint, idempotency keys, real `/search`
-- [ ] `check-drift.sh` anchored to the API spec, distinguishing released from built, running in CI
-- [ ] CI exists and gates every PR
-- [ ] Test suite covers HTTP 400 and 422
-- [ ] `--help`/skill restructured for progressive disclosure; machine variant smaller than the human one
-- [ ] Existing command surface unchanged, or every deviation recorded in `.surface-breaking`
-- [ ] Auth decision made and implemented
-- [ ] SOC 2: repo added to asset inventory, subprocessor list, access-control matrix (same gap exists for `infra` and `mailbox` — close together)
+- [x] C1 resolved; nothing pipes an unverified remote artifact into a shell
+- [ ] C2–C4 fixed: **C3 done**; C2 and C4 blocked — both 404 in production
+- [x] `check-drift.sh` anchored to the API spec, distinguishing released from built, running in CI
+- [x] CI exists and gates every PR
+- [x] Test suite covers HTTP 400 and 422 *(and 409, which idempotency made load-bearing)*
+- [x] `--help`/skill restructured for progressive disclosure; machine variant smaller than the human one
+- [x] Existing command surface unchanged, or every deviation recorded in `.surface-breaking`
+- [ ] Auth decision made and implemented — **needs the bash-vs-rewrite call first**
+- [ ] SOC 2: repo added to asset inventory, subprocessor list, access-control matrix (same gap exists for `infra` and `mailbox` — close together; **add getuku-astro deploy access**, which is now a production trust root)
+
+**Open, and needing a decision rather than an implementation:** C6 (exit-code
+break), signing key custody + branch protection, bash-vs-rewrite, licence.
+Full status per phase: [`refactoring-cli.md`](refactoring-cli.md).
 
 ## Release context — you are ahead of production
 
@@ -187,6 +230,7 @@ A large batch of API v3 / MCP work is **committed but not deployed** (branch `st
 
 ## Reference
 
+- **`reference/python-client/` — working implementations of four things this CLI lacks.** A second CLI was written in Python, audited alongside this one, and retired the same day (two CLIs is the worst state). Preserved as a parts bin, not a blueprint: OAuth 2.1 + PKCE with RFC 8414 issuer validation (C-auth), idempotency keys stable across retries (C3), a 9-code exit taxonomy (C6), and cross-origin credential refusal. Read its README first — it says what to take and what to ignore.
 - Backend, API v3 and MCP: `../uku_service` — start at `CLAUDE/api/CLAUDE_API_V3.md`
 - Platform-wide conventions and the three-surface propagation rule: `../CLAUDE.md`
 - OAuth server: `../uku_service/backend/handlers/oauth_handlers.py`

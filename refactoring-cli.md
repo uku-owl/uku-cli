@@ -954,6 +954,29 @@ passed through today but never followed). Scope these individually once released
 
 ## 8. Phase 5 — progressive disclosure
 
+> ### ✅ SHIPPED 2026-08-04
+>
+> `uku --help --agent` **14,621 → 7,217 bytes; 1.44× the human help → 0.69×.**
+> 7,622 of the removed bytes were per-command notes describing twenty commands
+> the agent was not about to run. Nothing was deleted — the top level became an
+> index carrying a `more` field, and `uku <cmd> --help --agent` still returns one
+> command's full card with its notes.
+>
+> **The skill was measured and deliberately left alone** at ~4.6 K tokens. The
+> Basecamp reference spends ~11–12 K covering 155 endpoints; ours is under half
+> that, and its content is the safety contract, retry doctrine and naming rules.
+> Cutting it would optimise the wrong number and remove the guidance that stops
+> an agent doing damage. It *did* contain two claims this change falsified —
+> corrected, along with a stale endpoint count and the missing `uku health`.
+>
+> **Guarded, because nothing else could see it.** Putting the notes back changes
+> no `.surface` fact, so `check-surface` passes and the regression ships silently.
+> `tests/cases/agent.sh` now asserts the size relationship directly; verified by
+> re-injecting it, which returns the ratio to 1.46.
+
+### The original plan
+
+
 C12, measured: human `--help` 9,767 B, `--help --agent` 14,045 B (1.44×), skill
 blob 18,337 B (`bin/uku:3847-4024`). The machine variant must become the lean one.
 
@@ -1172,7 +1195,7 @@ every phase.
 - [x] CI exists and gates every PR
 - [x] Test suite covers HTTP 400 and 409 (422 already covered; 412 and 428 heavily)
 - [x] shellcheck in `bin/ci`
-- [ ] `--help`/skill restructured; machine variant smaller than the human one (Phase 5)
+- [x] `--help`/skill restructured; machine variant smaller than the human one
 - [x] Existing command surface unchanged, or every deviation in `.surface-breaking`
 - [ ] Auth decision made and implemented (Phase 6 — needs the bash-vs-rewrite call)
 - [ ] SOC 2: `uku-cli`, `infra`, `mailbox` + getuku-astro deploy access recorded
