@@ -702,6 +702,34 @@ HTTP coverage is now 200 201 400 401 403 404 409 412 422 428 429 500 503.
 **Goal:** make "never ship ahead of production" mechanical.
 **Effort:** ~1-2 days. **Must precede Phase 4.**
 
+> ### ✅ SHIPPED 2026-08-04
+>
+> Three parts, each checking something the others cannot:
+>
+> | | |
+> |---|---|
+> | **27 `op` facts** in the surface table | Ratcheted by the existing `check-surface.sh` with no changes to it — the emitter was already fact-kind-agnostic, as § 6.1 predicted |
+> | **`scripts/check-api.sh`** + `.api-released` (182 ops) | The ship gate. Offline on PRs, `--live` for drift |
+> | **`tests/run.sh` op coverage** | Every operation observed on the wire must be declared. Currently *20 observed, all declared* |
+>
+> `bin/ci` is now **seven** stages and runs in GitHub Actions on every push and
+> PR; a second workflow fetches the live spec daily.
+>
+> **Two things measurement changed:**
+>
+> - **Parameter names had to be normalised on both sides.** The spec writes
+>   `/tasks/{task_id}`, the CLI declares `/tasks/{id}`. Without this the gate
+>   reported **14 false "ahead of production" failures on its first run** and
+>   would have blocked everything. Verified no two distinct operations collapse:
+>   182 raw → 182 normalised, zero collisions.
+> - **Path normalisation is by position, not shape.** Shape-matching has to guess
+>   whether a segment "looks like" an id, and it guessed wrong on `a..b` — the
+>   C9 control asserting dots inside a segment are *not* a traversal.
+>
+> Proven by mutation: declaring `GET /api/v3/search` (built, 404s in production)
+> fails the ship gate naming it; an operation vanishing from production fails the
+> drift check.
+
 ### 6.1 What the existing machinery actually supports
 
 Better than the handover assumed, with one real constraint it missed.
@@ -1127,14 +1155,18 @@ every phase.
 
 ## 13. Definition of done
 
-- [ ] C1 resolved; nothing pipes an unverified remote artifact into a shell
-- [ ] C2-C4 fixed: correct completion endpoint, idempotency keys, `/search` as a union
-- [ ] `check-api.sh` anchored to the API spec, distinguishing released from built,
+- [x] C1 resolved; nothing pipes an unverified remote artifact into a shell
+- [ ] C2-C4 fixed: **C3 done**; C2 and C4 blocked on the API deploy (Phase 4)
+- [x] `check-api.sh` anchored to the API spec, distinguishing released from built,
       running in CI and on a daily schedule
-- [ ] CI exists and gates every PR
-- [ ] Test suite covers HTTP 400 and 409 (422 already covered; 412 and 428 heavily)
-- [ ] shellcheck in `bin/ci`
-- [ ] `--help`/skill restructured; machine variant smaller than the human one
-- [ ] Existing command surface unchanged, or every deviation in `.surface-breaking`
-- [ ] Auth decision made and implemented
+- [x] CI exists and gates every PR
+- [x] Test suite covers HTTP 400 and 409 (422 already covered; 412 and 428 heavily)
+- [x] shellcheck in `bin/ci`
+- [ ] `--help`/skill restructured; machine variant smaller than the human one (Phase 5)
+- [x] Existing command surface unchanged, or every deviation in `.surface-breaking`
+- [ ] Auth decision made and implemented (Phase 6 — needs the bash-vs-rewrite call)
 - [ ] SOC 2: `uku-cli`, `infra`, `mailbox` + getuku-astro deploy access recorded
+
+**Also done, beyond the original list:** C5, C7 (decided *not* to do, with
+reasons), C9, C10, C11, C14, and `uku health`. **Outstanding and needing a
+ruling rather than an implementation:** C6 (§ 5.3).
