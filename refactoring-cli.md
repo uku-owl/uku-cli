@@ -417,6 +417,17 @@ not per attempt. It must survive the 428 auto-heal resend (`_heal_428`,
 `bin/uku:807-829`), which currently re-sends the write. Bash 3.2, no
 dependencies: read from `/dev/urandom` via `od`/`hexdump`.
 
+**This exact mistake has already shipped once on this platform.** Per
+`reference/python-client/README.md:32`, a fresh key per attempt "is precisely the
+bug the Uku MCP server shipped with until it was found by live testing." A
+per-attempt key defeats the entire mechanism while looking correct in review and
+passing any mocked test. Assert key *stability* across a retry, not merely key
+presence — and note that only a live or fixture-server test can catch it, which
+is another instance of Lesson 4.
+
+**Working implementation to read first:** `reference/python-client/src/client.py`
+(mint-once, reuse-across-retries, plus the ETag-from-header rule below).
+
 **The honest limit — do not skip this.** The ledger implies keys unlock write
 retries. They do not, not safely:
 
@@ -490,6 +501,13 @@ Two specific defects worth the break:
   `test_auth_and_scopes.py:44`) and therefore lands on code 3 = "api/validation".
   An agent reading "validation" retries with different data and loops forever.
   It is an auth-configuration failure.
+
+**There is a worked taxonomy to start from**, not a blank page:
+`reference/python-client/src/errors.py` implements nine distinct codes over the
+same API, and independently arrived at the `MISSING_COMPANY` → *auth* mapping for
+the same reason (`reference/python-client/README.md:48-52`). Read it before
+designing a new one; converging on the sibling client's taxonomy also stops the
+two from disagreeing about what a given failure means.
 
 **Recommendation:** batch **all** exit-code changes into a single release with a
 minor-version bump, every one recorded in `.surface-breaking` with its rationale,
@@ -609,6 +627,21 @@ Ratcheted by the existing `check-surface.sh` for free.
 no network, no flakiness. A **daily scheduled job** fetches production, refreshes
 the snapshot, and opens a PR when production has moved. API-side changes surface
 within a day instead of at the next release.
+
+> **⚠ A committed spec snapshot has already gone stale in this repo's own
+> history — do not repeat it.** The retired Python client built exactly this
+> machinery (`reference/python-client/src/refresh_spec.py`) and its verdict is
+> recorded in `reference/python-client/README.md:58`: the generated models "were
+> never wired into response parsing, and the committed snapshot went **34
+> operations stale** — spec machinery that exists but is not gated is
+> decoration."
+>
+> That is the failure mode of the design above, stated by the last person who
+> built it here. The daily refresh job is not a nice-to-have that can slip to a
+> later phase; **it is the thing that makes `.api-released` a fact rather than a
+> souvenir.** If the schedule cannot be stood up, do not ship the snapshot —
+> have `check-api.sh` fetch live and accept the flakiness instead, because a
+> stale snapshot that reports "clean" is worse than no gate at all.
 
 ### 6.2.1 The hole this design has, and how to close it
 
@@ -801,6 +834,28 @@ its access token).
 Consider **device flow** over auth-code redirect, per the Basecamp reference: it
 works over SSH, headless, and when the browser is on another machine — all normal
 for this audience.
+
+**Read `reference/python-client/src/oauth.py` before writing a line of this.** The
+audit called it "the best code in either repo", and it encodes one Uku-specific
+trap that is not obvious from the RFCs:
+
+> The Uku server builds its discovery metadata from `[api_v3] app_base_url`,
+> which **defaults to `https://app.getuku.com` and is set in no dev ini**. So
+> `--base http://127.0.0.1:8885` against a local server sends the browser to
+> **production's** consent page and POSTs the code to production.
+
+The defence is RFC 8414 §3.3 issuer validation with **`follow_redirects=False`**
+on the well-known fetch, anchored to the URL *the user asked for* rather than the
+response URL — because a 302 to production returns a document that legitimately
+names production, so the issuer check passes while every endpoint points away.
+This is Lesson 11 with a concrete local reproduction.
+
+Also from that client, and cheap to get wrong: the ETag must be lifted from the
+response **header**, never rebuilt from the body (`format_etag` emits `…+00:00`
+while the JSON body serialises `…Z`, so reconstruction guarantees a 412), and the
+single-use refresh token must be claimed under a lock *in the same critical
+section that marks it used* — Uku's server revokes the whole token family on
+reuse, so a double-send is a hard logout for the user.
 
 **This phase is the strongest argument for the rewrite decision.** Resolve
 § 11.1 before starting it, not during.
