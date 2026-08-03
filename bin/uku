@@ -824,7 +824,8 @@ _heal_428() {
   # stdout belongs to the caller's JSON — the heal is a stderr/audit-log event only.
   _audit "HEAL428" "$path" "if-match-from=$src"
   if _is_tty; then printf '  %s\n' "$(_dim "428 → re-sent once with If-Match from $src")" >&2; fi
-  _UKU_NO_HEAL=1 _UKU_IF_MATCH_SEND="$etag" do_request "$method" "$path" "$data"
+  # Same logical write, second attempt — reuse the key the first one carried.
+  _UKU_NO_HEAL=1 _UKU_IDEM_REUSE=1 _UKU_IF_MATCH_SEND="$etag" do_request "$method" "$path" "$data"
   return 0
 }
 
@@ -908,6 +909,58 @@ _announce_base() {
   return 0
 }
 
+# ── idempotency (C3) ─────────────────────────────────────────────────
+# The API's middleware stores the response to a keyed POST for 24h and replays
+# it verbatim on a repeat, so a write that may or may not have landed can be
+# repeated without creating a second row. Uncovered paths ignore the header
+# entirely, and so does a server whose Redis is down — it is never an error to
+# send one.
+#
+# BE PRECISE ABOUT WHAT THIS BUYS, because the obvious reading is wrong. A key
+# minted per process protects exactly one thing: the 428 re-send in _heal_428,
+# which is the only path in this CLI that repeats a write. It does NOT make a
+# re-run safe — `uku tasks create ...` run twice is two processes, two keys and
+# two tasks, which is correct, because those really are two requests to create
+# something.
+#
+# Cross-invocation safety is therefore something the caller has to ask for, and
+# --idempotency-key is how. An agent that retries a write it is unsure about
+# passes the same key it used the first time and gets the original response
+# back instead of a duplicate. That is the case this header exists for, and it
+# cannot be inferred — deriving the key from the request would make two
+# deliberate identical creates collide, silently returning the first one.
+_idem_key() {
+  local k=""
+  if [ -r /dev/urandom ]; then
+    k="$(LC_ALL=C od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  fi
+  # A weak key still gives a unique one per operation, which is all that is
+  # asked of it — the server namespaces keys per API key and per path.
+  if [ "${#k}" -lt 32 ]; then
+    k="$$-$(date +%s 2>/dev/null)-${RANDOM:-0}${RANDOM:-0}"
+  fi
+  printf 'uku-%s' "$k"
+}
+
+# _check_idem_key VALUE — validated at the flag's parse site, like --fields.
+# Two independent reasons, and both are load-bearing:
+#   * the value is written into the curl -K config as a header line, so a
+#     newline in it would forge additional headers (the same class of problem
+#     _check_cred_line exists for on the company id and key);
+#   * the server rejects anything over 200 characters with a 400, and a client
+#     that lets the user discover that from the wire has wasted a round trip on
+#     a write whose outcome then has to be reasoned about.
+_check_idem_key() {
+  local k="$1"
+  [ -n "$k" ] || die "--idempotency-key needs a value. Nothing was sent." "$EX_USAGE"
+  case "$k" in
+    *$'\n'*|*$'\r'*) die "--idempotency-key must be a single line — a line break in it would inject a directive into the curl config the headers are passed through. Nothing was sent." "$EX_USAGE" ;;
+  esac
+  if [ "${#k}" -gt 200 ]; then
+    die "--idempotency-key is ${#k} characters; the API's limit is 200 and it answers 400 above that. Nothing was sent." "$EX_USAGE"
+  fi
+}
+
 # _check_path PATH — C9. A request path must stay inside the namespace the
 # base URL names. `uku api GET /../../oauth/token` used to reach /oauth/token
 # with the API key attached: curl normalises the `..` before sending, so the
@@ -966,8 +1019,24 @@ do_request() {
   # API key can't be read from `ps` on a multi-user host. --header values get the
   # same treatment: a user-supplied header may itself be a credential.
   local im="${_UKU_IF_MATCH_SEND:-${UKU_IF_MATCH:-}}"
+  # One key per logical write. _heal_428 re-sends the SAME write with an
+  # If-Match it just fetched, and sets _UKU_IDEM_REUSE so that re-send carries
+  # the key the first attempt used — a fresh key there would defeat the whole
+  # header and let the retry create a second row.
+  local idem=""
+  case "$method" in
+    GET|HEAD) : ;;
+    *) if [ -n "${UKU_IDEM_KEY:-}" ]; then
+         idem="$UKU_IDEM_KEY"
+       else
+         [ "${_UKU_IDEM_REUSE:-0}" = "1" ] && [ -n "${_UKU_IDEM_MINTED:-}" ] \
+           || _UKU_IDEM_MINTED="$(_idem_key)"
+         idem="$_UKU_IDEM_MINTED"
+       fi ;;
+  esac
   { printf 'header = "X-Uku-Company: %s"\n' "$(_cfg_esc "$UKU_COMPANY")"
     printf 'header = "X-API-Key: %s"\n' "$(_cfg_esc "$UKU_KEY")"
+    if [ -n "$idem" ]; then printf 'header = "Idempotency-Key: %s"\n' "$(_cfg_esc "$idem")"; fi
     local h
     for h in ${UKU_HEADERS[@]+"${UKU_HEADERS[@]}"}; do printf 'header = "%s"\n' "$(_cfg_esc "$h")"; done
     if [ -n "$im" ]; then printf 'header = "If-Match: %s"\n' "$(_cfg_esc "$im")"; fi
@@ -3486,7 +3555,7 @@ update      |              |                         |                |         
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
 help        |              | auth account setup clients tasks time invoices members products contracts projects batch api search names | | |  <command>                                   | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
-%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which :: `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq :: `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..` :: `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme :: a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it
+%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --idempotency-key --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which :: `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq :: `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..` :: `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme :: a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it :: `--idempotency-key` makes a WRITE safe to repeat: the API replays the original response for 24h instead of acting twice. Each run mints its own key, so re-running a command is still two writes — pass the SAME key on the retry to make it one
 TABLE
 }
 
@@ -4311,6 +4380,14 @@ $(_bold "GLOBAL FLAGS")
                     once. A collection POST (e.g. POST /api/v3/tasks) has no
                     record to read one from, so pass --if-match yourself there.
                     On 412 it stops — see exit 6.
+  --idempotency-key <key>
+                    Make a write safe to repeat. The API stores the response for
+                    24h and replays it instead of acting twice, so a retry that
+                    carries the SAME key cannot create a second row. Every run
+                    already mints its own key, which covers the CLI's internal
+                    428 re-send — but two runs are two keys and therefore two
+                    writes. Pass the same key yourself on a retry you are unsure
+                    about. Max 200 characters.
   -h, --help        This help   ·   --version, -V   The version
 
 $(_bold "EXIT CODES")  0 ok · 1 usage · 2 auth · 3 API error · 4 write refused · 5 network · 6 conflict (412)
@@ -4340,7 +4417,7 @@ EOF
 # ── Global pre-parse (pull out global flags anywhere) ────────────────
 UKU_JSON=0; UKU_YES=0; UKU_ALL=0; UKU_HELP=0; UKU_DRY=0; UKU_QUIET=0; UKU_FIELDS=""; UKU_QUERY=(); UKU_DATA=""
 UKU_AGENT=0; UKU_NO_HINTS=0
-UKU_HEADERS=(); UKU_IF_MATCH=""
+UKU_HEADERS=(); UKU_IF_MATCH=""; UKU_IDEM_KEY=""
 # A header value goes verbatim into the curl -K config file, whose grammar is
 # line-based — so a newline in one would inject a second directive. Reject it.
 _check_header_arg() {
@@ -4370,6 +4447,7 @@ while [ $# -gt 0 ]; do
     # _require_valid_name for why (S3/S4/S7).
     --fields) _need_val "$@"; UKU_FIELDS="$2"; _check_fields_arg "$UKU_FIELDS"; shift 2 ;;
     --account) _need_val "$@"; UKU_ACCOUNT_CLI="$2"; _require_valid_name "$UKU_ACCOUNT_CLI"; shift 2 ;;
+    --idempotency-key) _need_val "$@"; UKU_IDEM_KEY="$2"; _check_idem_key "$UKU_IDEM_KEY"; shift 2 ;;
     --base) _need_val "$@"; UKU_BASE_CLI="$2"; shift 2 ;;
     -h|--help) UKU_HELP=1; shift ;;   # routed to per-command help below
     --version|-V) printf 'uku %s\n' "$UKU_VERSION"; exit "$EX_OK" ;;

@@ -79,4 +79,59 @@ uku time create --data '{"task_id":1,"person_id":1,"start":"2026-01-01T09:00:00Z
 assert_status 0 'start+end is accepted'
 assert_request_count 1 'the valid time entry was sent'
 
+# ── C3 — Idempotency-Key ─────────────────────────────────────────────────
+# The API stores a keyed POST's response for 24h and replays it rather than
+# acting twice. Uncovered paths ignore the header, so sending one is never an
+# error; the cost of NOT sending one is a write whose outcome is unknowable
+# after a timeout.
+note 'C3 — writes carry an idempotency key, reads do not'
+
+reset_requests
+uku tasks create --data '{"title":"one"}' --yes
+assert_status 0 'a create goes through'
+_ik="$(request_field 1 Idempotency-Key)"
+assert_true 'the write carried an Idempotency-Key' sh -c "[ -n '$_ik' ]"
+assert_true 'and it is within the 200-character limit the API enforces' \
+  sh -c "[ ${#_ik} -le 200 ]"
+
+reset_requests
+uku tasks list
+assert_request_empty 1 Idempotency-Key 'a read carries none — there is nothing to replay'
+
+# The honest limitation, pinned so nobody later assumes otherwise: a key is
+# minted PER PROCESS. Two runs of the same command are two writes, and that is
+# correct — they really are two requests to create something.
+note 'C3 — two runs mint different keys; sameness must be asked for'
+reset_requests
+uku tasks create --data '{"title":"a"}' --yes
+_k_run1="$(request_field 1 Idempotency-Key)"
+reset_requests
+uku tasks create --data '{"title":"a"}' --yes
+_k_run2="$(request_field 1 Idempotency-Key)"
+assert_true 'two separate runs mint DIFFERENT keys' \
+  sh -c "[ '$_k_run1' != '$_k_run2' ]"
+
+# ...which is why --idempotency-key exists: it is how a caller says "this is
+# the same write I already tried", which cannot be inferred from the request.
+reset_requests
+uku --idempotency-key 'agent-retry-42' tasks create --data '{"title":"a"}' --yes
+assert_request 1 Idempotency-Key 'agent-retry-42' '--idempotency-key is sent verbatim'
+reset_requests
+uku --idempotency-key 'agent-retry-42' tasks create --data '{"title":"a"}' --yes
+assert_request 1 Idempotency-Key 'agent-retry-42' 'and is stable across runs, which is the whole point'
+
+note 'C3 — the key is validated before anything is sent'
+reset_requests
+uku --idempotency-key "$(printf 'a%.0s' $(seq 1 201))" tasks create --data '{"title":"a"}' --yes
+assert_status 1 'a key over the API 200-char limit is a usage error here, not a 400 from the wire'
+assert_err_contains '200' 'and the limit is named'
+assert_no_requests 'nothing sent — the write outcome is never left ambiguous by our own bad input'
+
+reset_requests
+uku --idempotency-key 'a
+b' tasks create --data '{"title":"a"}' --yes
+assert_status 1 'a newline in the key is refused'
+assert_err_contains 'single line' 'because it would forge a header in the curl config'
+assert_no_requests 'nothing sent'
+
 finish

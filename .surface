@@ -218,6 +218,7 @@ gflag --dump-surface
 gflag --fields
 gflag --header
 gflag --help
+gflag --idempotency-key
 gflag --if-match
 gflag --json
 gflag --no-color
@@ -236,6 +237,7 @@ note %global `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is
 note %global `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which
 note %global `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature
 note %global `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq
+note %global `--idempotency-key` makes a WRITE safe to repeat: the API replays the original response for 24h instead of acting twice. Each run mints its own key, so re-running a command is still two writes — pass the SAME key on the retry to make it one
 note %global `--json` and `--agent` are alternatives — passing both is a usage error
 note %global `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
 note %global `uku <command> --help --agent` emits this table as JSON, including these notes

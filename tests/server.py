@@ -50,10 +50,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Headers that are recorded for every request. Lower-cased on the wire, but
 # written to the log under these canonical names so assertions read naturally.
+# An ALLOWLIST, which means a header the CLI genuinely sends is invisible to
+# every assertion until it is named here — and an assertion comparing two
+# absent headers passes. Add the header here first, then assert on it.
 RECORDED_HEADERS = [
     "X-API-Key",
     "X-Uku-Company",
     "If-Match",
+    "Idempotency-Key",
     "Content-Type",
     "User-Agent",
     "Accept",

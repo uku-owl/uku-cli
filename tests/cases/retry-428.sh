@@ -40,6 +40,20 @@ assert_request 2 path /api/v3/contracts/41219 'from the resource itself'
 assert_request 3 method PATCH 'request 3 is the resend'
 assert_request 3 If-Match 'W/"2026-07-27T09:23:28.783836+00:00"' 'the resend carries the ETag as If-Match'
 assert_request 3 body '{"status":"sent"}' 'the resend carries the ORIGINAL body'
+
+# C3 — this heal is the ONLY place the CLI repeats a write, and therefore the
+# only place an idempotency key does any work without the caller asking for it.
+# The key must be the SAME on both attempts: a fresh key on the resend would
+# make the server treat it as a new request, which is exactly the duplicate the
+# header exists to prevent. This is the bug the Uku MCP server shipped with.
+_k1="$(request_field 1 Idempotency-Key)"
+_k3="$(request_field 3 Idempotency-Key)"
+assert_true 'the original write carried an Idempotency-Key at all' \
+  sh -c "[ -n '$_k1' ]"
+assert_equals "$_k1" "$_k3" \
+  'THE POINT: the 428 resend reuses the first attempt key, so the server sees one write'
+assert_request_empty 2 Idempotency-Key \
+  'the ETag GET carries none — reads are not writes'
 teardown_case
 
 # ── 2. it heals exactly ONCE — a second 428 is not healed again ──────
