@@ -17,7 +17,13 @@ server_script <<'JSON'
     { "method": "GET", "path": "/api/v3/products",
       "response": {"status": 404, "body": {"error": {"code": "NOT_FOUND"}}} },
     { "method": "PATCH", "path": "/api/v3/tasks/99",
-      "response": {"status": 412, "body": {"error": {"code": "STALE_WRITE"}}} }
+      "response": {"status": 412, "body": {"error": {"code": "STALE_WRITE"}}} },
+    { "method": "GET", "path": "/api/v3/contracts",
+      "response": {"status": 400, "body": {"error": {"code": "MISSING_COMPANY", "message": "X-Uku-Company header is required"}}} },
+    { "method": "GET", "path": "/api/v3/projects",
+      "response": {"status": 400, "body": {"error": {"code": "VALIDATION_ERROR", "message": "q must be at least 2 characters"}}} },
+    { "method": "POST", "path": "/api/v3/time-entries",
+      "response": {"status": 409, "body": {"error": {"code": "IDEMPOTENCY_KEY_REUSED", "message": "That Idempotency-Key was used with a different body."}}} }
   ]
 }
 JSON
@@ -91,5 +97,37 @@ assert_status 6 'exit 6 — HTTP 412 is its own exit code'
 assert_err_contains 'HTTP 412' '412 is named'
 assert_err_contains 'Nothing was written' 'the user is told nothing was written'
 assert_request_count 1 '412 is never retried'
+
+# ── 400 — the commonest real failure, and the suite had never scripted one ──
+# The whole 400 class was untested: the only match for it anywhere in
+# tests/cases was `head -c 400`, a byte count. 400 is what the API actually
+# returns for the most common misconfiguration there is.
+reset_requests
+uku contracts list
+assert_status 3 'exit 3 — HTTP 400 is an API error'
+assert_err_contains 'HTTP 400' '400 is named in the message'
+assert_err_contains 'MISSING_COMPANY' 'and so is the error code the API sent'
+
+# MISSING_COMPANY is an AUTH-configuration failure wearing a 400. It maps to
+# exit 3 (api) today, which tells an agent "your data was wrong" — so it retries
+# with different data and loops forever. The fix is exit 2, and it is a
+# deliberate break of the documented code meanings, so it is deferred to the
+# batched exit-code change (refactoring-cli.md § 5.3) rather than smuggled in
+# here. This assertion pins TODAY's behaviour so that change is visible when it
+# lands, not so it is endorsed.
+assert_status 3 'MISSING_COMPANY is exit 3 today — see refactoring-cli.md 5.3'
+
+reset_requests
+uku projects list
+assert_status 3 'a validation 400 is also exit 3'
+assert_err_contains 'at least 2 characters' 'the API message reaches the user verbatim'
+
+# ── 409 — arrived with idempotency keys (C3) and was likewise untested ──
+reset_requests
+uku time create --data '{"task_id":1,"person_id":1,"start":"2026-01-01T09:00:00Z","end":"2026-01-01T10:00:00Z"}' --yes
+assert_status 3 'exit 3 — HTTP 409 is an API error'
+assert_err_contains 'HTTP 409' '409 is named'
+assert_err_contains 'IDEMPOTENCY_KEY_REUSED' 'and the code says WHICH conflict it was'
+assert_request_count 1 'a 409 is never retried — the first attempt may have landed'
 
 finish

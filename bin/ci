@@ -3,27 +3,28 @@
 #
 #   bin/ci
 #
-# Five stages, in the order in which a failure is cheapest to understand:
+# Six stages, in the order in which a failure is cheapest to understand:
 #
 #   1  bash -n            the file parses at all
 #   2  bash 3.2           no construct macOS's shipped bash cannot run
-#   3  check-surface.sh   the committed .surface matches the declared one
-#   4  check-drift.sh     docs, code and help all agree with the table
-#   5  tests/run.sh       the behaviour itself
+#   3  shellcheck         static analysis, at severity warning
+#   4  check-surface.sh   the committed .surface matches the declared one
+#   5  check-drift.sh     docs, code and help all agree with the table
+#   6  tests/run.sh       the behaviour itself
 #
-# Stages 3 and 4 come BEFORE the tests on purpose: they are seconds, they need
-# no fixture server, and a surface or doc break is the kind of thing a green
+# Stages 3-5 come BEFORE the tests on purpose: they are seconds, they need no
+# fixture server, and a lint, surface or doc break is the kind of thing a green
 # test suite happily hides.
 #
 # Exit: 0 only if every stage passed.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || { printf '  cannot cd to %s\n' "$ROOT" >&2; exit 1; }
 
 FAILED=""
 STAGE=0
-_stage() { STAGE=$((STAGE + 1)); printf '\n\033[1m[%d/5] %s\033[0m\n' "$STAGE" "$1"; }
+_stage() { STAGE=$((STAGE + 1)); printf '\n\033[1m[%d/6] %s\033[0m\n' "$STAGE" "$1"; }
 _verdict() { # NAME RC
   if [ "$2" = "0" ]; then printf '  \033[32m✓\033[0m %s\n' "$1"
   else printf '  \033[31m✗\033[0m %s (exit %s)\n' "$1" "$2"; FAILED="$FAILED $1"; fi
@@ -66,19 +67,54 @@ scan 'mapfile/readarray'   '\b(mapfile|readarray)\b' $BASH_FILES
 scan 'append both streams' '&>>' $BASH_FILES
 _verdict 'bash 3.2 constructs' "$rc"
 
-# ── 3 surface ────────────────────────────────────────────────────────
+# ── 3 shellcheck ─────────────────────────────────────────────────────
+# The repo is clean at severity `warning`, so that is the gate — anything at
+# warning or error level is a regression, not a backlog item.
+#
+# (Note: no comment line here may BEGIN with the word shellcheck after the #,
+# because that is the directive syntax and the parser will try to read the
+# sentence as one. It fails the whole file when it cannot.)
+#
+# Notes are left ungated on purpose: SC2015 (A && B || C) and SC2012 (ls) are
+# idioms used deliberately throughout, and gating them would mean either
+# rewriting working code or scattering disables to silence a linter.
+#
+# Two SC2086 sites carry a disable WITH a reason: `set -- $raw` after IFS=','
+# must word-split, and quoting it would break --fields outright. That is the
+# kind of thing a future reader "fixes" — hence the note in the source.
+#
+# Not installed is a WARNING, not a pass. This stage cannot gate what it cannot
+# run, and a silent skip would read as green. CI must install shellcheck.
+_stage 'shellcheck — static analysis at severity warning'
+rc=0
+if command -v shellcheck >/dev/null 2>&1; then
+  # Shipped code is gated with nothing excluded.
+  shellcheck -S warning -f gcc bin/uku bin/ci scripts/*.sh || rc=$?
+  # Test cases exclude two checks that are false positives against this
+  # harness, and only these two:
+  #   SC2034 unused variable — OUT/ERR/STATUS are set by uku() in harness.sh
+  #     and read by the assertions; shellcheck cannot see across the source.
+  #   SC1112 unicode quote — a test NAME in single quotes cannot contain a
+  #     plain apostrophe, so ’ is the deliberate spelling, not an autocorrect.
+  shellcheck -S warning -e SC2034,SC1112 -f gcc tests/run.sh tests/lib/harness.sh tests/cases/*.sh || rc=$?
+  _verdict 'shellcheck' "$rc"
+else
+  printf '  %s\n' "! shellcheck not installed — stage SKIPPED, not passed (brew install shellcheck)" >&2
+fi
+
+# ── 4 surface ────────────────────────────────────────────────────────
 _stage 'surface — the committed .surface matches bin/uku'
 rc=0
 scripts/check-surface.sh || rc=$?
 _verdict 'surface' "$rc"
 
-# ── 4 drift ──────────────────────────────────────────────────────────
+# ── 5 drift ──────────────────────────────────────────────────────────
 _stage 'drift — docs, code and help agree with the table'
 rc=0
 scripts/check-drift.sh || rc=$?
 _verdict 'drift' "$rc"
 
-# ── 5 tests ──────────────────────────────────────────────────────────
+# ── 6 tests ──────────────────────────────────────────────────────────
 _stage 'tests — tests/run.sh'
 rc=0
 tests/run.sh || rc=$?
@@ -91,6 +127,6 @@ if [ -n "$FAILED" ]; then
   printf '════════════════════════════════════════════════\n'
   exit 1
 fi
-printf '\033[32mCI PASSED\033[0m — syntax · bash 3.2 · surface · drift · tests\n'
+printf '\033[32mCI PASSED\033[0m — syntax · bash 3.2 · shellcheck · surface · drift · tests\n'
 printf '════════════════════════════════════════════════\n'
 exit 0

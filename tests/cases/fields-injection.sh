@@ -95,7 +95,7 @@ assert_true 'the bait directory really does contain glob-able field names' \
 # below reading the PREVIOUS test's values — passing without ever running this
 # one. That mistake was made here first and caught by this very comment.
 _glob_cwd="$PWD"
-cd "$CASE_DIR/globbait"
+cd "$CASE_DIR/globbait" || exit 1
 
 reset_requests
 uku clients list --fields '*'
@@ -109,6 +109,6 @@ assert_status 1 "'?' does not expand either"
 assert_err_contains "got '?ame'" 'and that value is reported literally too'
 assert_no_requests 'still nothing sent'
 
-cd "$_glob_cwd"
+cd "$_glob_cwd" || exit 1
 
 finish

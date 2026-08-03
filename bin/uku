@@ -1248,6 +1248,9 @@ _check_fields_arg() {
   # surrounding state is restored either way.
   local _reset_f=''; case "$-" in *f*) : ;; *) _reset_f=1 ;; esac
   set -f
+  # shellcheck disable=SC2086  # the split is the point: $raw must word-split
+  # on IFS=','. Quoting it makes 'id,name' a single field name and --fields
+  # stops working entirely. Globbing is handled by set -f above, not quotes.
   local IFS=','; set -- $raw; unset IFS
   [ -z "$_reset_f" ] || set +f
   for field in "$@"; do
@@ -1279,6 +1282,7 @@ table() {
   if [ -n "${UKU_FIELDS:-}" ]; then
     local _reset_f=''; case "$-" in *f*) : ;; *) _reset_f=1 ;; esac
     set -f
+    # shellcheck disable=SC2086  # deliberate word-split, as above.
     local IFS=','; set -- $UKU_FIELDS; unset IFS
     [ -z "$_reset_f" ] || set +f
   fi
@@ -2710,10 +2714,10 @@ _batch_dir() { printf '%s/batches' "$UKU_CONFIG_HOME"; }
 UKU_HASH_TOOL=""
 _hash_tool() {
   if [ -z "$UKU_HASH_TOOL" ]; then
-    if have shasum; then UKU_HASH_TOOL=shasum
-    elif have sha256sum; then UKU_HASH_TOOL=sha256sum
-    elif have cksum; then UKU_HASH_TOOL=cksum
-    else UKU_HASH_TOOL=none; fi
+    if have shasum; then UKU_HASH_TOOL='shasum'
+    elif have sha256sum; then UKU_HASH_TOOL='sha256sum'
+    elif have cksum; then UKU_HASH_TOOL='cksum'
+    else UKU_HASH_TOOL='none'; fi
   fi
   printf '%s' "$UKU_HASH_TOOL"
 }
@@ -3279,7 +3283,9 @@ EOF
   done
   json="{\"query\":$(_json_str "$q"),\"kind\":\"fanout\",\"resources\":[$json]}"
 
-  local summary="$hits match(es) for '$q' across $(printf '%s' "$UKU_SEARCH_RESOURCES" | wc -w | tr -d '[:space:]') list endpoints"
+  local nres summary
+  nres="$(printf '%s' "$UKU_SEARCH_RESOURCES" | wc -w | tr -d '[:space:]')"
+  summary="$hits match(es) for '$q' across $nres list endpoints"
   [ "$failed" -gt 0 ] && summary="$summary · $failed endpoint(s) FAILED and were not searched"
   if _wants_extras; then
     UKU_SUMMARY="$summary"

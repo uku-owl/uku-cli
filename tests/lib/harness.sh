@@ -151,7 +151,9 @@ start_server() {
     cat "$CASE_DIR/server.err" >&2 2>/dev/null
     exit 1
   fi
-  SERVER_PORT="$port"
+  # Exported rather than deleted: cases legitimately want the fixture port
+  # (health.sh asserts the summary names it), and an exported name says so.
+  export SERVER_PORT="$port"
   export UKU_BASE_URL="http://127.0.0.1:$port"
   export UKU_UPDATE_URL="http://127.0.0.1:$port/VERSION"
   # default identity: the env path (a complete key+company wins outright)
@@ -274,7 +276,6 @@ _guard_base() {
 # makes the "no --yes, no TTY" refusal testable.
 uku() {
   _guard_base
-  local extra_base=""
   # A --base on the command line is allowed only if it is also loopback.
   local a
   for a in "$@"; do
