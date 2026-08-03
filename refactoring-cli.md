@@ -1,9 +1,19 @@
 # refactoring-cli.md — the implementation plan
 
-**Status:** proposed, 2026-08-03. Not started.
+**Status:** written 2026-08-03. **Phases 0, 2 and 3 shipped** on branch
+`sec/phase0-install-chain` (unpushed, `main` untouched). Phase 1 and Phase 6 need
+CTO decisions; Phase 4 is blocked on the API deploy. Per-phase status is in each
+section header.
+
 **Companion to:** `CLAUDE.md` (the handover + bug ledger). Where this file and the
 ledger disagree, **this file wins** — every claim below was measured, and § 1
 lists the ledger claims that measurement corrected.
+
+**Where this file and the CODE disagree, the code wins** — three things in here
+were tried, measured and reversed or corrected during implementation (C3's
+rationale in § 5.1, C5's emit point in § 5.2, C7 entirely in § 5.5). Each is
+marked in place rather than quietly rewritten, because *why* an approach was
+abandoned is the part that stops it being re-attempted.
 
 **Two rules in force for every phase:**
 
