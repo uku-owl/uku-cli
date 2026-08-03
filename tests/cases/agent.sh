@@ -360,4 +360,48 @@ assert_status 1 'describing a command that does not exist is a usage error'
 assert_equals "$(jqx code)" 'usage' 'reported in the same failure envelope'
 teardown_case
 
+# ── C12 — the machine variant must stay smaller than the human one ───────
+# `uku --help --agent` was 14621 bytes against a 9767-byte human --help: the
+# variant meant for a machine, which pays for it on every session, was 1.44x
+# the one meant for a person, who reads it once. 52% of it was per-command
+# notes describing twenty commands the agent was not about to run.
+#
+# This is a SIZE property, and nothing else in the gate can see it: putting the
+# notes back changes no .surface fact, so check-surface passes and the
+# regression ships. Hence an explicit assertion — verified by re-injecting it,
+# which takes the ratio straight back to 1.46.
+setup_case
+start_server
+note 'C12 — the agent index is an index'
+
+_h_bytes="$(uku --help >/dev/null 2>&1; printf '%s' "$OUT" | wc -c | tr -d ' ')"
+_a_bytes="$(uku --help --agent >/dev/null 2>&1; printf '%s' "$OUT" | wc -c | tr -d ' ')"
+assert_true "the human --help is not empty (guards the two below from passing on nothing)" \
+  sh -c "[ '$_h_bytes' -gt 2000 ]"
+assert_true "the agent index ($_a_bytes B) is SMALLER than the human --help ($_h_bytes B)" \
+  sh -c "[ '$_a_bytes' -lt '$_h_bytes' ]"
+
+# Written to a file, never interpolated into `sh -c "... '$OUT' ..."`: the
+# payload contains backticks (the `more` field quotes a command), and inside a
+# double-quoted string a shell would COMMAND-SUBSTITUTE them. That silently
+# mangles the JSON and the assertion fails for a reason that has nothing to do
+# with what it is testing.
+uku --help --agent
+printf '%s' "$OUT" > "$CASE_DIR/index.json"
+assert_true 'the index omits per-command notes — that is what makes it an index' \
+  jq -e '[.commands[] | has("notes")] | any | not' "$CASE_DIR/index.json"
+assert_true 'and it says so, in a field an agent reads before the payload' \
+  jq -e '.more | test("--help --agent")' "$CASE_DIR/index.json"
+assert_true 'the global notes are still there — those are the ones needed up front' \
+  jq -e '(.notes | length) > 5' "$CASE_DIR/index.json"
+
+# Nothing was deleted: the notes must still be reachable, in full, one call away.
+uku tasks --help --agent
+printf '%s' "$OUT" > "$CASE_DIR/tasks.json"
+assert_true 'a single command card DOES carry its notes' \
+  jq -e '(.notes | length) > 0' "$CASE_DIR/tasks.json"
+assert_true 'and names the command it describes' \
+  jq -e '.command == "tasks"' "$CASE_DIR/tasks.json"
+teardown_case
+
 finish

@@ -241,6 +241,7 @@ note %global `--fields` takes PLAIN field names (letters, digits, underscore); a
 note %global `--idempotency-key` makes a WRITE safe to repeat: the API replays the original response for 24h instead of acting twice. Each run mints its own key, so re-running a command is still two writes — pass the SAME key on the retry to make it one
 note %global `--json` and `--agent` are alternatives — passing both is a usage error
 note %global `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`)
+note %global `uku --help --agent` is an INDEX: it lists every command with its flags and args, but NOT their notes, and carries a `more` field saying so. `uku <command> --help --agent` returns one command's full card INCLUDING its notes — run that before using a command you have not used before
 note %global `uku <command> --help --agent` emits this table as JSON, including these notes
 note %global a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it
 note %global these are parsed ANYWHERE on the line, before the command

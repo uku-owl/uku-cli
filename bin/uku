@@ -3691,7 +3691,7 @@ update      |              |                         |                |         
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
 version     |              |                         |                |                                                         |                                                 | identical to `uku --version`
 help        |              | auth account setup clients tasks time invoices members products contracts projects batch api search names | | |  <command>                                   | `uku <command> --help` prints the same card :: a topic with no card is a usage error, not an empty page
-%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --idempotency-key --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,warnings,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which :: `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq :: `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..` :: `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme :: a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it :: `--idempotency-key` makes a WRITE safe to repeat: the API replays the original response for 24h instead of acting twice. Each run mints its own key, so re-running a command is still two writes — pass the SAME key on the retry to make it one
+%global     |              |                         |                | --json !--agent --no-hints --yes -y --dry-run --quiet -q --no-color --fields !--by-id !--by-name --account --base --header -H --if-match --idempotency-key --all --help -h --version -V --dump-surface --dump-remedies | | these are parsed ANYWHERE on the line, before the command :: `--dump-surface` prints this table one fact per line — it is the build gate's hook, not a user feature :: `--agent` wraps the response in {ok,data,meta,warnings,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq :: `--json` and `--agent` are alternatives — passing both is a usage error :: `uku <command> --help --agent` emits this table as JSON, including these notes :: `--no-hints` drops the breadcrumb footer (so do `--quiet` and `--json`) :: `--by-id` / `--by-name` say how to read an argument that could be either; on a WRITE an id-shaped argument that is ALSO an exact name is refused until you say which :: `--fields` takes PLAIN field names (letters, digits, underscore); anything else is a usage error, because those names are handed to jq :: `--account` takes a profile NAME, never a path — letters, digits, `.` `_` `-`, and neither `.` nor `..` :: `--base` (and `UKU_BASE_URL`) must be `https://` unless the host is loopback — `localhost`, `127.0.0.1`, `[::1]`, `*.localhost`. An `http://` base to any other host is REFUSED before anything is sent, because the API key would go out in cleartext; so is a base with no scheme :: a base that is neither the default nor loopback prints one line on stderr naming the host the credentials are going to, once per invocation, and `--quiet` does not silence it :: `uku --help --agent` is an INDEX: it lists every command with its flags and args, but NOT their notes, and carries a `more` field saying so. `uku <command> --help --agent` returns one command's full card INCLUDING its notes — run that before using a command you have not used before :: `--idempotency-key` makes a WRITE safe to repeat: the API replays the original response for 24h instead of acting twice. Each run mints its own key, so re-running a command is still two writes — pass the SAME key on the retry to make it one
 TABLE
 }
 
@@ -3876,15 +3876,28 @@ $1
 EOF
   printf ']'
 }
-_help_agent_cmd() { # NAME
-  local n="$1"
+# _help_agent_cmd NAME [WITH_NOTES]
+#
+# WITH_NOTES defaults to 1 — a single command's card carries everything.
+# The top-level index passes 0, and that one argument is the whole of C12.
+#
+# Measured before changing anything: `uku --help --agent` was 14,621 bytes, of
+# which the per-command notes were 7,622 — 52% of what an agent reads on every
+# session, to describe twenty commands it is not about to run. The notes are
+# genuinely good (they are the hard-won API archaeology), which is exactly why
+# they belong one call away rather than deleted: `uku <cmd> --help --agent`
+# still returns them in full, and the index says so.
+_help_agent_cmd() { # NAME [WITH_NOTES]
+  local n="$1" with_notes="${2:-1}"
   printf '{"command":%s' "$(_json_str "$n")"
   printf ',"aliases":%s' "$(_json_arr_words "$(_surface_field cmdalias "$n")")"
   printf ',"subcommands":%s' "$(_json_arr_words "$(_surface_field sub "$n")")"
   printf ',"subcommand_aliases":%s' "$(_json_arr_words "$(_surface_field subalias "$n")")"
   printf ',"flags":%s' "$(_json_arr_words "$(_surface_field flag "$n")")"
   printf ',"args":%s' "$(_json_arr_lines "$(_surface_rest arg "$n")")"
-  printf ',"notes":%s' "$(_json_arr_lines "$(_surface_rest note "$n")")"
+  if [ "$with_notes" = "1" ]; then
+    printf ',"notes":%s' "$(_json_arr_lines "$(_surface_rest note "$n")")"
+  fi
   printf '}'
   return 0
 }
@@ -3908,10 +3921,14 @@ EOF
     _help_agent_cmd "$real"; printf '\n'
     return 0
   fi
-  printf '{"cli":"uku","version":%s,"commands":[' "$(_json_str "$UKU_VERSION")"
+  printf '{"cli":"uku","version":%s' "$(_json_str "$UKU_VERSION")"
+  # Named before the payload so a model that reads top-to-bottom knows there is
+  # more, and how to get it, before it starts consuming twenty command cards.
+  printf ',"more":"Per-command notes are omitted here. `uku <command> --help --agent` returns the full card for one command, including its notes. Run that before using a command you have not used before."'
+  printf ',"commands":['
   for c in $(_surface_facts | awk '$1=="cmd" { print $2 }' | LC_ALL=C sort -u); do
     [ "$first" = "1" ] || printf ','; first=0
-    _help_agent_cmd "$c"
+    _help_agent_cmd "$c" 0
   done
   printf '],"global_flags":%s' "$(_json_arr_words "$(_surface_facts | awk '$1=="gflag" { printf "%s ", $2 }')")"
   printf ',"notes":%s' "$(_json_arr_lines "$(_surface_rest note '%global')")"
@@ -4216,12 +4233,17 @@ uku clients list --limit 2 --agent
 
 ### `uku --help --agent` — discover the CLI instead of guessing
 ```
-uku --help --agent          # the whole tree: commands, flags, args, notes, exit codes
-uku time --help --agent     # one command
+uku --help --agent          # INDEX: every command, its flags and args. No notes.
+uku time --help --agent     # ONE command, in full — including its notes
 ```
-The `notes` are the gotchas — above all the negative kind (which subcommand does *not* exist, which flag belongs elsewhere). Read them before inventing a command; it costs one cheap local call and no network.
+Two calls on purpose. The index is what you read once to see what exists; the
+per-command card is what you read before using a command you have not used
+before. The `notes` live only on the card, and they are the gotchas — above all
+the negative kind (which subcommand does *not* exist, which flag belongs
+elsewhere). Both calls are local and cost no network.
 
 ## Commands
+- `uku health` — is the API up? Needs no credential, so it answers before sign-in. Exit 0 up, 3 answered-but-unwell, 5 unreachable.
 - `uku auth status [--json]` — who/which account you're acting as.
 - `uku account list | current | use <name>` — accounts.
 - `uku clients list [--q X] [--status S] [--limit N]` · `uku clients get <id>`
@@ -4230,7 +4252,7 @@ The `notes` are the gotchas — above all the negative kind (which subcommand do
 - **Invoices have no `patch`, no `send` and no `mark-paid` subcommand.** The API has all three; reach them through `uku api`, and do not invent a subcommand for a money action:
   `uku api PATCH /api/v3/invoices/<id> --data @f.json --yes` · `uku api POST /api/v3/invoices/<id>/send --yes` · `uku api POST /api/v3/invoices/<id>/mark-paid --yes`
 - `uku search <query>` — one `--q` fanned out over the list endpoints that have a name field. See below; it is **not** a global search endpoint.
-- `uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]` — every one of the 80+ v3 endpoints. Use this for anything without a first-class command.
+- `uku api <GET|POST|PATCH|DELETE> </api/v3/...> [--data @f|@-] [--query k=v] [--yes]` — any v3 endpoint (production serves ~180). Use this for anything without a first-class command.
 - Singular aliases work everywhere: `uku client get 41` = `uku clients get 41` (also `task`, `invoice`, `member`, `product`, `project`, `contract`).
 - Global: `--header 'K: V'` (repeatable) · `--if-match '<etag>'` · `--dry-run` (prints the request, sends nothing — a name/id lookup still runs, so the request you are shown is the write itself, with the resolved id in the path) · `--agent` (the envelope above) · `--no-hints` · `--by-id` / `--by-name` (see below).
 - `uku auth print-header` — the raw auth headers, for the rare case `uku api` can't express something. It prints a **live credential**: never echo it back to the user, never put it in a file you commit, and prefer `uku api`.

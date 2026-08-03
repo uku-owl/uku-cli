@@ -79,3 +79,23 @@ note tasks neither resolution happens on a write, in a `--batch`, or for an argu
 # an exact shape, and a promise about shape is the kind of thing someone writes
 # a schema against.
 note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} — EXCEPT a `--batch` run, which stays JSONL one object per input line under `--agent`, and whose failures are those lines, so a failed run exits 3 with no {"ok":false} envelope at all; `--json` stays the RAW API body, except that `--fields` projects each row and re-serialises it through jq
+
+# 2026-08-04 — OUTPUT SHAPE CHANGED, no fact removed. Recorded anyway (C12).
+#
+# `uku --help --agent` no longer carries per-command `notes`. Nothing was
+# withdrawn: `uku <command> --help --agent` returns the same notes it always
+# did, in full, for one command. The top level became an index.
+#
+#   was:  14621 bytes, 1.44x the size of the human --help
+#   now:   7217 bytes, 0.69x — and 7622 of the bytes removed were notes
+#
+# Why it counts as a break even though no .surface line moved: the PRIME
+# DIRECTIVE names OUTPUT SHAPES as contract, and a consumer doing
+# `uku --help --agent | jq '.commands[] | select(.command=="tasks") | .notes'`
+# now gets null. The fix for such a consumer is one call:
+# `uku tasks --help --agent | jq .notes`.
+#
+# The new arrangement is itself declared as a %global note, so it is ratcheted
+# rather than merely true today, and the payload names it in a `more` field so
+# an agent reading top-to-bottom learns there is more before it consumes
+# twenty command cards.
