@@ -30,3 +30,36 @@
 #     collision (--by-id / --by-name decide).
 note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs}; `--json` stays the RAW API body and never changes
 note tasks neither resolution happens on a write, in a `--batch`, or for an argument that already looks like an id
+
+# 2026-08-03 — BEHAVIOUR REMOVED, no fact removed. Recorded here anyway.
+#
+# No `.surface` line changed, so check-surface.sh is silent about this and
+# always would be: the surface table describes commands and flags, and what
+# changed is what the CLI DOES when nobody asked it to do anything. That is a
+# blind spot in the ratchet, not an absence of breakage — hence this note.
+#
+# uku no longer installs updates by itself (C1).
+#
+#   was:  once a day, on almost any command, a newer VERSION triggered
+#         cmd_update → `curl -fsSL <url> | sh`, unattended.
+#   now:  the same daily check prints one line naming the new version and
+#         `uku update`, and installs nothing.
+#
+# UKU_NO_AUTO_UPDATE=1 keeps its meaning — it now silences the notice and skips
+# the check, so anyone who already set it sees no change at all.
+#
+# Who this can break: a machine that relied on picking up releases with no
+# human in the loop (CI images, agent sandboxes) now stays on its installed
+# version until something runs `uku update`. That is the intended cost. The
+# unattended path fetched a remote script and piped it into `sh` on a machine
+# holding a live API key, with every integrity control living inside the
+# artefact being fetched — which cannot protect the choice of artefact.
+#
+# Also changed, same release, same reason:
+#   * UKU_INSTALL_URL_DEFAULT no longer resolves through getuku.com; it is
+#     pinned to an immutable tag on the repo. A third-party deploy is no longer
+#     in the path of code this CLI executes.
+#   * UKU_UPDATE_URL_DEFAULT deliberately still tracks main. It is read and
+#     compared, never executed, and pinning it would end update detection.
+#
+# Pinned by tests/cases/update-trust.sh §0, §6 and §7.

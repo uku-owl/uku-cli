@@ -114,12 +114,30 @@ if command -v sha256sum >/dev/null 2>&1; then SHA_CMD="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then SHA_CMD="shasum -a 256"
 else err "neither sha256sum nor shasum found — a release without a checksum cannot be installed by the default channel."; fi
 
-# ── the one line in bin/uku that carries the version ──────────────────
+# ── the two lines in bin/uku that carry the version ───────────────────
 grep -q '^UKU_VERSION="[0-9.]*"$' bin/uku \
   || err "cannot find the UKU_VERSION line in bin/uku (expected: UKU_VERSION=\"x.y.z\" at the start of a line). Fix bin/uku or this script — do not release blind."
 BINV="$(sed -n 's/^UKU_VERSION="\([0-9.]*\)"$/\1/p' bin/uku)"
 
+# The installer URL is pinned to an immutable tag (C1), which means it is a
+# SECOND thing that goes stale at release time. A forgotten pin is silent: every
+# new install would run the previous release's installer, which works — until
+# the day that installer is the thing being fixed. So it is stamped here, in the
+# same pass, and verified after writing.
+grep -q '^UKU_INSTALL_URL_DEFAULT=".*/v[0-9.]*/scripts/install\.sh"$' bin/uku \
+  || err "cannot find the pinned UKU_INSTALL_URL_DEFAULT line in bin/uku (expected: .../v<x.y.z>/scripts/install.sh). If the install URL stopped being tag-pinned, that is a security regression — fix bin/uku, or update this script deliberately."
+BINU="$(sed -n 's|^UKU_INSTALL_URL_DEFAULT=".*/v\([0-9.]*\)/scripts/install\.sh"$|\1|p' bin/uku)"
+
+# One stamping function, used by BOTH the dry run and the real write, so the
+# preview can never describe a different artefact than the one that ships.
+_stamp() {
+  sed -e "s/^UKU_VERSION=\"[0-9.]*\"\$/UKU_VERSION=\"$VERSION\"/" \
+      -e "s|^\(UKU_INSTALL_URL_DEFAULT=\".*\)/v[0-9.]*/scripts/install\.sh\"\$|\1/v$VERSION/scripts/install.sh\"|" \
+      bin/uku
+}
+
 step "bin/uku      UKU_VERSION $(dim "$BINV") → $(bold "$VERSION")"
+step "bin/uku      installer pin $(dim "v$BINU") → $(bold "v$VERSION")"
 step "VERSION      $(dim "$CUR") → $(bold "$VERSION")"
 step "bin/uku.sha256   sha256 of the released bin/uku, as '<hash>  bin/uku'"
 step "commit + annotated tag $(bold "v$VERSION")"
@@ -129,7 +147,7 @@ if [ "$DRY" = "1" ]; then
   # Show the real checksum the release would carry, computed on a copy, so a
   # dry run answers "what would ship" without writing anything.
   TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
-  sed "s/^UKU_VERSION=\"[0-9.]*\"$/UKU_VERSION=\"$VERSION\"/" bin/uku > "$TMP"
+  _stamp > "$TMP"
   info "would publish sha256 $(bold "$($SHA_CMD < "$TMP" | cut -d' ' -f1)")  bin/uku"
   printf '\n'
   info "$(bold 'Dry run complete — nothing was changed.')"
@@ -139,7 +157,7 @@ fi
 
 # ── write ─────────────────────────────────────────────────────────────
 TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
-sed "s/^UKU_VERSION=\"[0-9.]*\"$/UKU_VERSION=\"$VERSION\"/" bin/uku > "$TMP"
+_stamp > "$TMP"
 cat "$TMP" > bin/uku          # keep the original inode + mode (0755)
 rm -f "$TMP"; trap - EXIT
 printf '%s\n' "$VERSION" > VERSION
@@ -155,8 +173,11 @@ if command -v bash >/dev/null 2>&1; then
 fi
 [ "$(sed -n 's/^UKU_VERSION="\([0-9.]*\)"$/\1/p' bin/uku)" = "$VERSION" ] \
   || err "the UKU_VERSION edit did not take — nothing has been committed."
+[ "$(sed -n 's|^UKU_INSTALL_URL_DEFAULT=".*/v\([0-9.]*\)/scripts/install\.sh"$|\1|p' bin/uku)" = "$VERSION" ] \
+  || err "the installer pin edit did not take — nothing has been committed. Shipping with a stale pin means every new install runs the previous release's installer."
 
 info "bin/uku, VERSION → $VERSION"
+info "installer pin → $(dim "v$VERSION")"
 info "bin/uku.sha256 → $(dim "$HASH")"
 
 # ── commit + tag ──────────────────────────────────────────────────────
@@ -181,11 +202,21 @@ cat <<EOF
 
   That order is not cosmetic. The installer reads main/VERSION and then fetches
   the matching tag. Push the branch first and, for the seconds or minutes until
-  the tag lands, every install and every auto-update resolves $VERSION and gets
+  the tag lands, every install and every update check resolves $VERSION and gets
   a 404. Push the tag first and the pointer only moves once the artefact exists.
 
-  Verify once it is up:
+  Verify once it is up — into a scratch dir, not over your own binary:
     curl -fsS https://raw.githubusercontent.com/uku-owl/uku-cli/v$VERSION/bin/uku.sha256
-    curl -fsSL https://getuku.com/install-cli | sh
+    curl -fsSL https://raw.githubusercontent.com/uku-owl/uku-cli/v$VERSION/scripts/install.sh \\
+      | UKU_BIN_DIR=/tmp/uku-release-check UKU_SKIP_SETUP=1 sh
+    /tmp/uku-release-check/uku --version      # must print $VERSION
+    rm -rf /tmp/uku-release-check
+
+  It must say "Checksum verified". If it does not, the release is not good.
+
+  Then check the published one-liner separately, since it is the path customers
+  take and it resolves through a redirect this repo does not control:
+    curl -fsSL https://getuku.com/install-cli | shasum -a 256
+    shasum -a 256 scripts/install.sh          # the two must match
 
 EOF

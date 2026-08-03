@@ -59,14 +59,19 @@ A checksum anchored to a tag catches a swapped or truncated download and stops
 come from the same repo. Signing is the next step and is not implemented —
 [`SECURITY.md`](SECURITY.md) spells out exactly where the line is.
 
-`uku update` and the once-a-day auto-update follow the release channel: they
-notice a bump in `VERSION` and install the tag behind it, verified.
+`uku update` follows the release channel: it notices a bump in `VERSION` and
+installs the tag behind it, verified.
 
-**The auto-update installs by itself.** It is on by default, and it does not
-just notify: once a day, on an ordinary command, it fetches the installer and
-pipes it into `sh` — no prompt, no TTY needed. That is deliberate (a fix reaches
-every machine within a day) and it is a real trade, spelled out in
-[`SECURITY.md`](SECURITY.md). Turn it off with `UKU_NO_AUTO_UPDATE=1`.
+**Nothing installs by itself.** At most once a day, on an ordinary command, the
+CLI reads the release pointer and — if a newer release exists — prints one line
+telling you so. It stops there. Installing is `uku update`, and only ever
+happens because you asked. Silence the notice, and skip the check entirely, with
+`UKU_NO_AUTO_UPDATE=1`.
+
+This changed in 0.7.0. Older versions installed the new release themselves,
+unattended, by piping a fetched script into `sh` — see
+[`SECURITY.md`](SECURITY.md) for why that is no longer something we are willing
+to leave switched on by default.
 
 On a terminal the installer offers to sign you in and connect your coding agents
 right away. Or run it yourself:

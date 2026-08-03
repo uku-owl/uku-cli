@@ -3243,13 +3243,13 @@ cmd_doctor() {
     elif _ver_gt "$UKU_VERSION" "$fv"; then
       _doc ok "version lock: bin/uku $UKU_VERSION is ahead of release $fv — normal on main; release.sh will align them"
     else
-      _doc fail "version lock broken: $vfile says '$fv', bin/uku says '$UKU_VERSION' — the shipped file is BEHIND the release pointer, so every client sees an update that never arrives and re-installs daily. Run scripts/release.sh, or fix UKU_VERSION."
+      _doc fail "version lock broken: $vfile says '$fv', bin/uku says '$UKU_VERSION' — the shipped file is BEHIND the release pointer, so every client is told daily about an update that never arrives. Run scripts/release.sh, or fix UKU_VERSION."
     fi
   fi
   if [ "${UKU_NO_AUTO_UPDATE:-0}" = "1" ]; then
-    _doc ok "auto-update off (UKU_NO_AUTO_UPDATE=1)"
+    _doc ok "update check off (UKU_NO_AUTO_UPDATE=1)"
   else
-    _doc ok "auto-update on — checks once a day and INSTALLS the newest released tag without asking (checksum-verified). Off: UKU_NO_AUTO_UPDATE=1"
+    _doc ok "update check on — says once a day when a newer release exists, and installs nothing by itself. Update with 'uku update'. Off: UKU_NO_AUTO_UPDATE=1"
   fi
   local sh; sh="$(_detect_shadow)"
   [ -n "$sh" ] && _doc warn "a shell function/alias 'uku' in $sh shadows this binary — rename it, or call 'command uku'"
@@ -3339,10 +3339,14 @@ EOF
 
 # uku update — re-run the installer, into THIS binary's directory, no re-prompt.
 #
-# The installer is always fetched from main (getuku.com/install-cli redirects
-# there) — it is the delivery mechanism, not the artefact. What it INSTALLS is
-# the release channel's default: the newest published tag, checksum-verified.
-# We pass no UKU_VERSION, so the installer resolves the release pointer itself.
+# The installer is fetched from an immutable tag on the repo (C1) — it is the
+# delivery mechanism, not the artefact. What it INSTALLS is the release
+# channel's default: the newest published tag, checksum-verified. We pass no
+# UKU_VERSION, so the installer resolves the release pointer itself, which is
+# why pinning the installer does not pin what you end up running.
+#
+# This is reached only when a human types `uku update`. auto_update() notifies
+# and stops; it no longer calls in here by itself.
 #
 # UKU_CHANNEL is forwarded when the caller set it, so someone who deliberately
 # runs the rolling edge stays there instead of being silently pinned back — but
@@ -4325,18 +4329,20 @@ if [ "$UKU_AGENT" = "1" ] && [ "$UKU_JSON" = "1" ]; then
   die "--json and --agent are alternatives: --json is the raw API body, --agent wraps it in {ok,data,meta,summary,breadcrumbs}. Pick one." "$EX_USAGE" @@help.root
 fi
 
-# ── auto-update ───────────────────────────────────────────────────────
-# Updates should reach people without them thinking about it, but not by
-# following main HEAD: that would put every push, including work in progress,
+# ── update check ──────────────────────────────────────────────────────
+# News of a release should reach people without them thinking about it, but not
+# by following main HEAD: that would put every push, including work in progress,
 # on every machine within a day. So the gate is the VERSION file in the repo —
-# we push freely and clients only move when we deliberately bump the number.
+# we push freely and clients only hear about it when we deliberately bump the
+# number.
 #
 # VERSION on main is the RELEASE POINTER: the number of the newest tag we have
-# published. Polling it is still right, but what a bump triggers is no longer a
-# download of main — cmd_update runs the installer, which resolves that same
-# pointer to the immutable tag v<version> and refuses to install it without a
-# matching checksum. The number we poll and the artefact we install are the
-# same release, and the release cannot change after the fact.
+# published. What a bump triggers is a one-line notice on stderr (C1). It used
+# to trigger the install itself; it no longer does, because an unattended
+# `curl | sh` on a machine holding a live API key is not a channel we are
+# willing to leave standing. `uku update` still does the install, and still
+# resolves this same pointer to the immutable tag v<version>, refusing to
+# install without a matching checksum.
 #
 # Checked at most once a day (a timestamp under UKU_CONFIG_HOME), with a hard
 # 3s timeout, and every failure is silent: a CLI must not break because a
@@ -4345,16 +4351,39 @@ fi
 # The replace is safe mid-run because the installer renames into place; the
 # running bash keeps reading the old inode. Never overwrite the file in place.
 #
-# S6.1 (audit 2026-07-29): auto-update STAYS automatic and unattended — that is
-# a deliberate, documented trade (reach beats the residual risk, and the
-# checksum chain covers the transport). What is not defensible is that the two
-# URLs it follows used to be plain environment overrides: anything that could
-# set a variable in this process — a .env, a direnv file, a CI job, an agent's
-# own environment — chose a URL that this CLI then pipes into `sh`, unattended,
-# within a day. So they are honoured only under UKU_DEV=1, which is the local
-# test suite's opt-in and nobody else's default.
+# S6.1 (audit 2026-07-29) fenced the two URLs below behind UKU_DEV=1, because
+# anything that could set a variable in this process — a .env, a direnv file, a
+# CI job, an agent's own environment — chose a URL that this CLI then piped into
+# `sh`, unattended, within a day. That fence stands.
+#
+# C1 (2026-08-03) reverses the other half of that trade. S6.1 concluded that
+# auto-update should STAY automatic and unattended, reach beating the residual
+# risk. Three things measured since say otherwise:
+#
+#   - the install URL resolved through the marketing site, so whoever could
+#     deploy getuku.com chose what every installation executed;
+#   - every integrity control lived INSIDE install.sh, and a control inside the
+#     artefact cannot protect the CHOICE of artefact;
+#   - the same path owns _setup_claude, so a compromise rewrites what our
+#     customers' coding agents read.
+#
+# So the check stays daily and silent, and the INSTALL no longer happens by
+# itself: we say a release exists, and `uku update` remains one command away.
+# Reach is preserved; the standing unattended-execution channel is not.
+#
+# ⚠ THE NEXT TWO CONSTANTS NEED OPPOSITE TREATMENT. Read before editing either.
+#
+# UKU_UPDATE_URL_DEFAULT is the release POINTER — "the newest tag we published".
+# It is mutable ON PURPOSE and must track main. Pin it to a tag and update
+# detection dies silently: the CLI would compare its own version against itself
+# forever and never see a release again. scripts/install.sh:86 depends on this
+# same file for the same reason.
 UKU_UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/uku-owl/uku-cli/main/VERSION"
-UKU_INSTALL_URL_DEFAULT="https://getuku.com/install-cli"
+# UKU_INSTALL_URL_DEFAULT is the PAYLOAD — the script that gets executed. It is
+# pinned to an immutable tag, and it points at the repo directly so that no
+# third-party deploy sits in the chain. scripts/release.sh rewrites the tag here
+# in the same pass that rewrites UKU_VERSION, so it cannot drift behind.
+UKU_INSTALL_URL_DEFAULT="https://raw.githubusercontent.com/uku-owl/uku-cli/v0.6.0/scripts/install.sh"
 # _locked_url NAME VALUE DEFAULT → the URL to actually use. Says once, on
 # stderr, when it drops an override, because a silently ignored setting is its
 # own kind of bug report ("my staging installer never runs").
@@ -4363,7 +4392,7 @@ _locked_url() {
   [ -n "$val" ] || { printf '%s' "$def"; return 0; }
   [ "$val" = "$def" ] && { printf '%s' "$def"; return 0; }
   if [ "${UKU_DEV:-0}" = "1" ]; then printf '%s' "$val"; return 0; fi
-  warn "ignoring $name=$val — that URL is fetched and piped into a shell by the unattended once-a-day update, so an environment variable alone cannot choose it. Re-run with UKU_DEV=1 if you meant it. Using $def."
+  warn "ignoring $name=$val — that URL is fetched and piped into a shell by \`uku update\`, so an environment variable alone cannot choose it. Re-run with UKU_DEV=1 if you meant it. Using $def."
   printf '%s' "$def"
 }
 UKU_UPDATE_URL="$(_locked_url UKU_UPDATE_URL "${UKU_UPDATE_URL:-}" "$UKU_UPDATE_URL_DEFAULT")"
@@ -4405,8 +4434,11 @@ auto_update() {
   # binary is ahead of main (anyone running a release branch) straight back down
   # — and then do it again tomorrow, forever.
   _ver_gt "$remote" "$UKU_VERSION" || return 0
-  warn "uku $remote is available (you have $UKU_VERSION) — updating…"
-  cmd_update >&2 2>/dev/null && warn "updated to $remote; it applies to your next command." || true
+  # NOTIFY, do not install (C1). Installing from here means fetching a remote
+  # script and piping it into `sh` with nobody watching, on a machine that holds
+  # a live API key. One line on stderr costs the reader nothing and leaves the
+  # decision with them; `uku update` is still one command away.
+  warn "uku $remote is available (you have $UKU_VERSION) — run \`uku update\`. Silence this with UKU_NO_AUTO_UPDATE=1."
   return 0
 }
 

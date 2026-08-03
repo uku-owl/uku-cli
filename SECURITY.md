@@ -195,28 +195,47 @@ verification; anything deliberately malicious would pass them.
 The script is small and readable — review it before running if you prefer:
 `curl -fsSL https://getuku.com/install-cli` (without `| sh`).
 
-`uku update`, and the once-a-day auto-update, both go through this same
-installer and therefore through the same default channel: the newest released
-tag, checksum-verified.
+`uku update` goes through this same installer and therefore through the same
+default channel: the newest released tag, checksum-verified.
 
-### The auto-update installs by itself — read this before you deploy the CLI
+### The update check tells you; it does not install
 
-Auto-update is **on by default** and it does not merely notify. At most once a
-day, on an ordinary command, `uku` fetches the release pointer and — if the
-number moved — fetches the installer and **pipes it into `sh`**, with no prompt,
-no TTY requirement and no confirmation in that moment. The new binary is renamed
-into place, so the running command finishes on the old file and the change
-applies from your next one. Turn it off with `UKU_NO_AUTO_UPDATE=1`; `uku update`
-by hand keeps working either way.
+At most once a day, on an ordinary command, `uku` fetches the release pointer
+and — if the number moved — prints a single line naming the new version and the
+command that installs it. That is all it does. No script is fetched, nothing is
+piped into a shell, and no binary changes until you run `uku update` yourself.
+`UKU_NO_AUTO_UPDATE=1` silences the notice and skips the check.
 
-This is a deliberate trade, not an oversight: a fix reaches every machine within
-a day, and we would rather that than a long tail of old clients writing to a
-firm's books. What you are accepting in exchange is stated plainly above — **a
-compromise of this repository becomes a compromise of every client that runs the
-CLI, automatically, within 24 hours.** The checksum chain covers the transport
-and the moving-target problem; it is not a defence against a compromised source,
-and signing is still not implemented. On a machine where that is not an
-acceptable trade, set `UKU_NO_AUTO_UPDATE=1`.
+**This is a change from 0.6.x, and the reasoning is worth stating plainly**,
+because the previous behaviour was a documented, deliberate trade rather than an
+oversight. Until 0.7.0 the same daily check went on to fetch the installer and
+**pipe it into `sh`** — no prompt, no TTY needed. The argument for it was reach:
+a fix lands on every machine within a day, rather than leaving a long tail of old
+clients writing to a firm's books.
+
+Three things outweighed that:
+
+- **The payload URL resolved through our marketing site.** Whoever could deploy
+  that site chose where the redirect landed, and so chose what every
+  installation executed. A lower-trust deploy path was in the execution path of
+  a tool that holds a live API key. It now points at an immutable tag on this
+  repository, with no third party in between.
+- **Every integrity control lived inside the artefact being fetched.** A checksum
+  verified inside `install.sh` cannot tell you that `install.sh` is the right
+  file. Controls inside the artefact cannot protect the *choice* of artefact.
+- **The same path writes agent instructions.** It owns the step that installs
+  `~/.claude/skills/uku/SKILL.md`, so a compromise would rewrite what our
+  customers' coding agents read, not just what their terminals run.
+
+The honest summary of the old behaviour was already in this file: *a compromise
+of this repository becomes a compromise of every client that runs the CLI,
+automatically, within 24 hours.* That sentence was true, and it is the reason the
+default changed. Signing is still not implemented; until it is, the shortest
+description of our position is that we are unwilling to run an unattended
+execution channel we cannot authenticate.
+
+Reach was the point of the old default, and it is not abandoned — the daily
+check still runs, and you are still told. What changed is that a human decides.
 
 **The two URLs it follows cannot be chosen by the environment.**
 `UKU_INSTALL_URL` and `UKU_UPDATE_URL` are honoured **only** when `UKU_DEV=1` is

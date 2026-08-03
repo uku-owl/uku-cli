@@ -29,8 +29,27 @@ server_script <<'JSON'
 JSON
 start_server
 
-BUILTIN_INSTALL='https://getuku.com/install-cli'
+# The installer URL is tag-pinned (C1) and scripts/release.sh rewrites that tag
+# on every release, so hardcoding it here would break the suite at every bump.
+# Read it from the source instead — but do NOT let that make this vacuous: the
+# two assertions below pin the SECURITY properties of whatever it reads, so a
+# regression to a mutable ref or back to a third-party domain fails here.
+BUILTIN_INSTALL="$(sed -n 's/^UKU_INSTALL_URL_DEFAULT="\(.*\)"$/\1/p' "$REPO_ROOT/bin/uku")"
 BUILTIN_UPDATE='https://raw.githubusercontent.com/uku-owl/uku-cli/main/VERSION'
+
+note '0 — the built-in URLs have the properties the whole fence depends on'
+# The payload is executed, so it must be immutable and must come from the repo
+# itself: a mutable ref means whoever can push chooses what runs, and a
+# third-party host means whoever can deploy that host does.
+assert_true 'the built-in installer URL is pinned to an immutable tag' \
+  sh -c "case '$BUILTIN_INSTALL' in https://raw.githubusercontent.com/uku-owl/uku-cli/v[0-9]*/scripts/install.sh) exit 0 ;; *) exit 1 ;; esac"
+assert_true 'and is not served through any third-party domain' \
+  sh -c "case '$BUILTIN_INSTALL' in *getuku.com*|*vercel*) exit 1 ;; *) exit 0 ;; esac"
+# The pointer is only ever READ and compared, never executed, and it must track
+# main — pinning it to a tag kills update detection permanently.
+assert_equals "$BUILTIN_UPDATE" \
+  "$(sed -n 's/^UKU_UPDATE_URL_DEFAULT="\(.*\)"$/\1/p' "$REPO_ROOT/bin/uku")" \
+  'the release pointer still tracks main — pinning it would end update detection'
 # harness.sh sets these two (and UKU_DEV=1, which is what makes them work)
 FIXTURE_INSTALL="$UKU_INSTALL_URL"
 FIXTURE_UPDATE="$UKU_UPDATE_URL"
@@ -116,5 +135,44 @@ assert_err_contains 'ignoring UKU_UPDATE_URL' 'saying so before it runs'
 UKU_DEV='' UKU_INSTALL_URL="$BUILTIN_INSTALL" uku update
 assert_err_not_contains 'ignoring UKU_INSTALL_URL' 'setting the built-in value changes nothing and warns about nothing'
 assert_curl_saw "$BUILTIN_INSTALL" 'and the built-in URL is what runs'
+
+# ── 6 C1 — a newer release NOTIFIES; it must never install by itself ──
+# This is the property the whole C1 fix exists for, and the only way to test it
+# is to make the check succeed: every section above stubs curl to fail, so the
+# version comparison is never even reached and an installing auto_update would
+# sail through them all.
+#
+# The assertion that matters is the NEGATIVE one. "It printed a notice" would
+# still pass if it printed the notice AND installed; only "the installer URL was
+# never fetched" can tell those two apart.
+note '6 — a newer release is announced, not installed'
+cat > "$CASE_DIR/stubbin/curl" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> $STUB_LOG
+# the release pointer answers with a version far ahead of this build
+for a in "\$@"; do case "\$a" in *VERSION*) printf '9.9.9\n'; exit 0 ;; esac; done
+exit 1
+STUB
+chmod +x "$CASE_DIR/stubbin/curl"
+
+: > "$STUB_LOG"
+rm -f "$UKU_CONFIG_HOME/last-update-check"
+UKU_DEV='' UKU_NO_AUTO_UPDATE=0 uku clients list
+assert_curl_saw "$BUILTIN_UPDATE" 'the daily check still runs and reads the release pointer'
+assert_err_contains '9.9.9 is available' 'a newer release is announced'
+assert_err_contains 'uku update' 'and names the command that installs it'
+assert_curl_never_saw "$BUILTIN_INSTALL" 'THE POINT: the installer is never fetched — nothing is piped into a shell'
+# The stub answers only the release pointer and fails everything else, so the
+# list itself dies of a network error. That is the stub's doing, not the
+# notice's — and pinning it here is still worth it: the notice must ride along
+# with whatever the command was going to do, never replace its outcome.
+assert_status 5 'the notice does not change what the command itself reports'
+
+note '7 — the announcement can still be switched off entirely'
+: > "$STUB_LOG"
+rm -f "$UKU_CONFIG_HOME/last-update-check"
+UKU_DEV='' UKU_NO_AUTO_UPDATE=1 uku clients list
+assert_err_not_contains '9.9.9 is available' 'UKU_NO_AUTO_UPDATE=1 silences the notice'
+assert_curl_never_saw "$BUILTIN_UPDATE" 'and skips the check altogether — no daily network call'
 
 finish
