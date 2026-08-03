@@ -33,6 +33,7 @@ cmd clients
 cmd completions
 cmd contracts
 cmd doctor
+cmd health
 cmd help
 cmd invoices
 cmd me
@@ -272,6 +273,9 @@ note contracts read-only in the CLI; contract rows are ETag-guarded — see `uku
 note doctor `--json` (the global flag) gives the whole report as JSON
 note doctor exits 1 only when a REQUIRED check fails, never for a warning
 note doctor it names which credential store the active account uses — the OS keyring, the 0600 file, or the environment — which is the one thing about UKU_KEYRING worth never guessing at
+note health asks the API if it is up — NEEDS NO CREDENTIAL, so it answers before `uku auth login` has ever run
+note health exits 0 up, 3 the API answered but is unwell, 5 could not be reached at all
+note health this is the "is it me or is it them" check; `uku doctor` is the "is it my setup" one
 note help `uku <command> --help` prints the same card
 note help a topic with no card is a usage error, not an empty page
 note invoices an invoice has no name field, so `get` takes an id or a pasted URL — never a name

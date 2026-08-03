@@ -1053,8 +1053,15 @@ do_request() {
          idem="$_UKU_IDEM_MINTED"
        fi ;;
   esac
-  { printf 'header = "X-Uku-Company: %s"\n' "$(_cfg_esc "$UKU_COMPANY")"
-    printf 'header = "X-API-Key: %s"\n' "$(_cfg_esc "$UKU_KEY")"
+  # _UKU_NO_AUTH marks the handful of endpoints the API serves to anyone
+  # (/health today). Sending an empty X-API-Key there is worse than sending
+  # nothing: it looks like a failed credential rather than a deliberate
+  # anonymous call, and it means `uku health` cannot answer "is the API up"
+  # until you have signed in — which is precisely when you want to ask.
+  { if [ "${_UKU_NO_AUTH:-0}" != "1" ]; then
+      printf 'header = "X-Uku-Company: %s"\n' "$(_cfg_esc "$UKU_COMPANY")"
+      printf 'header = "X-API-Key: %s"\n' "$(_cfg_esc "$UKU_KEY")"
+    fi
     if [ -n "$idem" ]; then printf 'header = "Idempotency-Key: %s"\n' "$(_cfg_esc "$idem")"; fi
     local h
     for h in ${UKU_HEADERS[@]+"${UKU_HEADERS[@]}"}; do printf 'header = "%s"\n' "$(_cfg_esc "$h")"; done
@@ -3570,6 +3577,44 @@ EOF
 # they are told, every time, that this update is not verified.
 # UKU_INSTALL_URL is resolved once, near auto_update, and is dev-only (S6.1) —
 # read the resolved value here rather than the raw environment.
+# uku health — is the API up? Needs no credential, by design.
+#
+# GET /api/v3/health is unauthenticated on the server, and this is the one
+# command that must work before `uku auth login` has ever been run: "is it me
+# or is it them" is the first question anyone asks, and answering it used to
+# require signing in first. The credential gate checked PRESENCE, not validity,
+# so an unauthenticated user got rc=2 from an endpoint that answers 200 to bare
+# curl.
+#
+# Exit codes follow the existing meanings: 0 up, 3 the API answered but is
+# unwell (503), 5 could not be reached at all.
+cmd_health() {
+  # A base may still come from --base or a profile, so load what there is —
+  # but never require it.
+  load_creds 2>/dev/null || true
+  if ! _UKU_NO_AUTH=1 UKU_SOFT=1 do_request GET /api/v3/health; then
+    if [ "${UKU_AGENT:-0}" = "1" ]; then
+      UKU_SUMMARY="health: $UKU_BASE unreachable"
+      _agent_error "could not reach $UKU_BASE" "$EX_NET" @@doctor; return "$EX_NET"
+    fi
+    die "could not reach $UKU_BASE (network error)" "$EX_NET" @@doctor
+  fi
+  local rc=0
+  case "$REPLY_STATUS" in 2*) rc=0 ;; *) rc="$EX_API" ;; esac
+  if _wants_extras; then UKU_SUMMARY="health: HTTP $REPLY_STATUS from $UKU_BASE"; fi
+  if [ "${UKU_AGENT:-0}" = "1" ] || [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then
+    render "$REPLY_BODY"
+  else
+    local st; st="$(printf '%s' "$REPLY_BODY" | _json_scan field status 2>/dev/null | tr -d '"')"
+    [ -n "$st" ] || st="HTTP $REPLY_STATUS"
+    if [ "$rc" = "0" ]; then info "$UKU_BASE — $st"; else warn "$UKU_BASE — $st (HTTP $REPLY_STATUS)"; fi
+    if have jq; then
+      printf '%s' "$REPLY_BODY" | jq -r '.components // {} | to_entries[] | "  \(.key): \(.value)"' 2>/dev/null || true
+    fi
+  fi
+  return "$rc"
+}
+
 cmd_update() {
   local url="$UKU_INSTALL_URL"
   local self; self="$(command -v uku 2>/dev/null || printf '%s' "$0")"
@@ -3634,6 +3679,7 @@ me          |              |                         |                |         
 search      |              |                         |                | --limit                                                 | <query>                                         | NOT a server-side global search — the API offers none this CLI can verify. It is ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), one request each :: a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did :: `--limit` is per endpoint
 api         |              |                         |                | !--describe @list --client @data @bulk                  | <METHOD> :: </api/v3/...>                       | METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks` :: `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient :: this reaches every v3 endpoint, so prefer it over dropping to curl :: `--client NAME` works on a GET whose path is one of the collections that carry a client_id; on a write it is a usage error
 batch       |              | list show               | ls             |                                                         | show <run-id>                                   | reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request :: `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
+health      |              |                         |                |                                                         |                                                 | asks the API if it is up — NEEDS NO CREDENTIAL, so it answers before `uku auth login` has ever run :: exits 0 up, 3 the API answered but is unwell, 5 could not be reached at all :: this is the "is it me or is it them" check; `uku doctor` is the "is it my setup" one
 doctor      |              |                         |                |                                                         |                                                 | `--json` (the global flag) gives the whole report as JSON :: exits 1 only when a REQUIRED check fails, never for a warning :: it names which credential store the active account uses — the OS keyring, the 0600 file, or the environment — which is the one thing about UKU_KEYRING worth never guessing at
 update      |              |                         |                |                                                         |                                                 | re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
 completions |              | bash zsh                |                |                                                         | <shell>                                         | eval "$(uku completions zsh)" in your rc
@@ -4396,6 +4442,7 @@ $(_bold "ACCOUNTS")  (one login, many companies — keep a sandbox beside your m
   uku --account main invoices list    Run one command against a specific account
 
 $(_bold "MORE")
+  uku health                          Is the API up? Needs no credential
   uku doctor [--json]                 Check PATH, shadowing, tools, creds, skill
   uku setup agents                    Teach your coding agents the uku contract
   uku update                          Upgrade in place to the newest release
@@ -4703,6 +4750,7 @@ case "$cmd" in
   api)      cmd_api "$@" ;;
   batch)    cmd_batch "$@" ;;
   doctor)   cmd_doctor "$@" ;;
+  health)   cmd_health "$@" ;;
   setup-agents) cmd_setup agents "$@" ;;
   update)   cmd_update "$@" ;;
   completions) cmd_completions "$@" ;;
