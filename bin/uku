@@ -904,6 +904,25 @@ _announce_base() {
   _UKU_BASE_SAID=1
   [ "$UKU_BASE" = "$UKU_BASE_DEFAULT" ] && return 0
   local host; host="$(_url_host "$UKU_BASE")"
+  # C7 (2026-08-03) — DELIBERATELY NOT ANNOUNCED, after trying it and measuring.
+  #
+  # The bug ledger lists silent cleartext-to-loopback as the one gap in the
+  # transport fence. It was implemented, and it is the wrong call:
+  #
+  #   * non-loopback cleartext is already REFUSED outright, so this warning can
+  #     never fire on anything except a local dev server. It is not a warning
+  #     about a risky situation; it is a warning that fires on every command of
+  #     an ordinary development day.
+  #   * four existing assertions broke, and they encode the contract rather
+  #     than merely brushing it: "a successful read writes nothing to stderr",
+  #     "nothing is offered on stderr when nobody is watching", "nothing about
+  #     the missing jq leaks into a clean read".
+  #   * the audit of the retired Python client reached the same conclusion
+  #     independently (reference/python-client/README.md:43): announcing every
+  #     command trains people to skip the warning that matters.
+  #
+  # The fence itself is what protects the key, and it stays: any http base that
+  # is not loopback dies in _check_base_transport before a request is built.
   _is_loopback_host "$host" && return 0
   printf '%s %s\n' "$(_color 33 '→')" "sending Uku credentials to $host — not the default $(_url_host "$UKU_BASE_DEFAULT")" >&2
   return 0
@@ -1079,10 +1098,18 @@ do_request() {
   # 52 empty reply · 56 error receiving data. An idempotent read may be
   # re-issued once on any of them. A WRITE never is — an interrupted POST may
   # still have been applied, which is the whole doctrine of this CLI.
+  # C14 — curl's own stderr used to go straight to the terminal, so an
+  # unreachable host produced TWO messages: curl's "curl: (7) Failed to connect
+  # to ... port ...: Connection refused", then the CLI's own polite line. The
+  # fix is not to silence curl — its reason is the useful half — but to capture
+  # it and fold it into the one message the CLI prints, so there is a single
+  # explanation instead of a raw one racing a clean one.
+  local errf; _mktemp errf
   local rc=0 attempt=1
   while :; do
     rc=0
-    REPLY_STATUS="$(curl "${args[@]}")" || rc=$?
+    : > "$errf"
+    REPLY_STATUS="$(curl "${args[@]}" 2>"$errf")" || rc=$?
     if [ "$rc" -eq 0 ]; then break; fi
     if [ "$attempt" -eq 1 ]; then
       case "$method" in
@@ -1095,10 +1122,19 @@ do_request() {
     break
   done
   if [ "$rc" -ne 0 ]; then
+    # curl says WHY in one line; strip its "curl: (7) " prefix, which names an
+    # exit code the reader cannot act on, and keep the reason.
+    local why=""
+    why="$(sed -n '1s/^curl: ([0-9]*) //p' "$errf" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    _rmtmp "$errf"
     # UKU_SOFT lets callers (doctor) probe without the CLI dying on a flake.
     [ "${UKU_SOFT:-0}" = "1" ] && { REPLY_STATUS=0; REPLY_BODY=""; REPLY_HEADERS=""; return 1; }
+    if [ -n "$why" ]; then
+      die "could not reach $UKU_BASE (network error) — $why" "$EX_NET" @@doctor
+    fi
     die "could not reach $UKU_BASE (network error)" "$EX_NET" @@doctor
   fi
+  _rmtmp "$errf"
   REPLY_BODY="$(cat "$tmp")"
   REPLY_HEADERS="$(cat "$hdrf" 2>/dev/null || true)"
   _rmtmp "$tmp" "$cfg" "$hdrf" "${body:-}"   # the reply is in memory now; don't hoard buffers (see _rmtmp)
