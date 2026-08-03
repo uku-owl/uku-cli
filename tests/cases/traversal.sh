@@ -117,4 +117,59 @@ uku clients list
 assert_status 0 'a normal read after switching back still works'
 assert_request_count 1 'and it reached the fixture'
 
+# ── C9 — the OTHER traversal axis: the URL path, not the filename ────────
+# Everything above is a name becoming a FILENAME. This is a reference becoming
+# a URL PATH. Same shape of bug, different destination: curl normalises `..`
+# before sending, so `uku api GET /../../oauth/token` reached /oauth/token —
+# outside /api/v3, with the API key attached — and the server saw an entirely
+# ordinary request.
+#
+# The assertion that pins it is assert_no_requests, for the same reason the
+# victim file is what pins the section above: the exit code alone passed on the
+# old code, because a 404 from an endpoint that should never have been asked is
+# still just a failed request.
+note 'C9 — a .. segment must never reach the wire'
+
+reset_requests
+uku api GET /../../oauth/token
+assert_status 1 'a .. path is a usage error'
+assert_err_contains "'..' segment" 'and names what it refused'
+assert_no_requests 'THE POINT: nothing reached the wire, so no endpoint outside /api/v3 ever saw the key'
+
+reset_requests
+uku api GET /api/v3/../../oauth/token
+assert_status 1 'a .. buried after a legitimate prefix is refused too'
+assert_no_requests 'still nothing sent'
+
+reset_requests
+uku api GET /api/v3/%2e%2e/%2e%2e/oauth/token
+assert_status 1 'and the percent-encoded form, which curl forwards untouched'
+assert_err_contains 'percent-encoded' 'named as its own case'
+assert_no_requests 'still nothing sent'
+
+# --by-id is the curated-command vector: it used to take the argument verbatim
+# and interpolate it into "/api/v3/clients/$id", so the guard cannot live in
+# `uku api` alone.
+reset_requests
+uku clients get '../../oauth/token' --by-id
+assert_status 1 '--by-id will not accept a path as an id'
+assert_err_contains 'is an id' 'and fails naming the actual mistake, not a path error'
+assert_no_requests 'nothing sent'
+
+# Non-vacuity (Lesson 2): if `..` were rejected everywhere, the two controls
+# below would fail — proving these assertions discriminate rather than banning
+# the characters outright.
+note 'C9 controls — legitimate paths must still go through'
+
+reset_requests
+uku api GET '/api/v3/clients?q=a..b'
+assert_status 0 '".." inside a QUERY VALUE is legitimate and still sent'
+assert_request_count 1 'it reached the fixture'
+assert_request 1 query 'q=a..b' 'with the dots intact'
+
+reset_requests
+uku api GET '/api/v3/clients/a..b'
+assert_status 0 '".." inside a path SEGMENT is not a .. segment'
+assert_request_count 1 'and is sent unchanged'
+
 finish

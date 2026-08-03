@@ -908,8 +908,45 @@ _announce_base() {
   return 0
 }
 
+# _check_path PATH — C9. A request path must stay inside the namespace the
+# base URL names. `uku api GET /../../oauth/token` used to reach /oauth/token
+# with the API key attached: curl normalises the `..` before sending, so the
+# server saw a perfectly ordinary request for an endpoint this CLI is not
+# supposed to be able to reach.
+#
+# It lives here, in do_request, and not in cmd_api, because cmd_api is not the
+# only way a path is built. Curated commands interpolate a resolved reference
+# straight into "/api/v3/clients/$id", and _resolve_ref hands back whatever the
+# user passed when --by-id says "trust me". One guard at the single chokepoint
+# covers every caller present and future; a guard in cmd_api covers one.
+#
+# Only the part before `?` is checked: `..` is perfectly legitimate inside a
+# query VALUE (a search for "a..b"), and rejecting it there would break real
+# usage to fix a problem that does not exist in that position.
+_check_path() {
+  local p="${1%%\?*}"
+  case "$p" in
+    /*) : ;;
+    *) die "a request path must start with '/' (got '$p'). Nothing was sent." "$EX_USAGE" ;;
+  esac
+  # Wrapping in slashes makes the pattern catch a `..` segment anywhere,
+  # including first and last, while still ignoring `a..b` inside a segment.
+  case "/$p/" in
+    */../*) die "that path contains a '..' segment, which would escape $UKU_BASE and reach an endpoint this CLI does not model — with your API key attached. Nothing was sent." "$EX_USAGE" ;;
+  esac
+  # curl forwards %2e untouched; a server that decodes before routing would see
+  # the traversal we just refused in its plain form.
+  local lower; lower="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    *%2e%2e*) die "that path contains a percent-encoded '..' segment, which some servers decode before routing. Nothing was sent." "$EX_USAGE" ;;
+  esac
+}
+
 do_request() {
   local method="$1" path="$2" data="${3:-}"
+  # Before the URL is even assembled — a refused path must not reach curl, and
+  # must not create the 0600 credential config either.
+  _check_path "$path"
   local url="$UKU_BASE$path"
   REPLY_PATH="$path"
   REPLY_METHOD="$method"
@@ -1850,7 +1887,16 @@ _resolve_ref() {
     return 0
   fi
   # The user said which meaning they wanted; there is nothing left to decide.
-  if [ "$UKU_BY" = "id" ]; then UKU_REF_ID="$arg"; return 0; fi
+  # --by-id still has to LOOK like an id (C9). This branch used to take the
+  # argument verbatim, so `--by-id ../../oauth/token` was interpolated straight
+  # into the request path. do_request refuses that now regardless, but a
+  # reference that cannot be an id should fail here, naming the actual mistake,
+  # rather than as a path error two layers down.
+  if [ "$UKU_BY" = "id" ]; then
+    _looks_like_id "$arg" \
+      || die "--by-id says '$arg' is an id, but an id is digits (or a dashed hex id). Drop --by-id to look it up by name. Nothing was sent." "$EX_USAGE" "@@$res.list"
+    UKU_REF_ID="$arg"; return 0
+  fi
   if [ "$UKU_BY" = "name" ]; then _resolve_name "$res" "$arg"; return 0; fi
   if _looks_like_id "$arg"; then
     # A read costs nothing: no request, no lookup, no ambiguity. A write queues
