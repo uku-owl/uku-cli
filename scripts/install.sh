@@ -27,7 +27,10 @@
 #   UKU_BASE_URL_DL   Raw repo base to fetch bin/uku from
 #                     (default: https://raw.githubusercontent.com/uku-owl/uku-cli)
 #   UKU_SKIP_SETUP    Set to 1 to skip the post-install sign-in + agent setup
-#   UKU_SETUP_AGENT   claude | cursor | codex | all | none  (forwarded to `uku setup agents`)
+#   UKU_SETUP_AGENT   auto | claude | cursor | codex | all | none  (forwarded to
+#                     `uku setup agents`). Interactively you are asked; with no
+#                     terminal nothing is written unless you set this, because
+#                     `setup agents` writes to $HOME and to ./AGENTS.md.
 #   NO_COLOR          Disable colored output
 set -eu
 
@@ -211,8 +214,22 @@ if [ -r /dev/tty ] && [ -c /dev/tty ]; then
        printf '\n'; "$TARGET" setup agents < /dev/tty || true ;;
   esac
 else
-  # non-interactive (CI / agent) — install the skill best-effort, print next steps
-  UKU_SETUP_AGENT="${UKU_SETUP_AGENT:-auto}" "$TARGET" setup agents >/dev/null 2>&1 || true
+  # Non-interactive (CI, Dockerfile, agent sandbox). C11: this used to default
+  # to UKU_SETUP_AGENT=auto and run `setup agents` silently, which writes
+  # $HOME/.claude/skills/uku/SKILL.md — and, when it detects codex, APPENDS a
+  # block to ./AGENTS.md in whatever directory the install happened to run
+  # from. With `auto` and nothing detected it installs the Claude skill anyway.
+  #
+  # Writing to a user's home and to a file in the build's working directory is
+  # not something to do because nobody was there to object. Interactively we
+  # ASK; here the equivalent of asking is requiring it to be said.
+  if [ -n "${UKU_SETUP_AGENT:-}" ] && [ "${UKU_SETUP_AGENT}" != "none" ]; then
+    step "Setting up agent files (UKU_SETUP_AGENT=$UKU_SETUP_AGENT)…"
+    "$TARGET" setup agents || true
+  else
+    step "$(dim 'No agent files written. To install them:') $(bold 'uku setup agents')"
+    step "  $(dim 'or re-run this installer with') $(bold 'UKU_SETUP_AGENT=auto|claude|cursor|codex|all')"
+  fi
   printf '\n'; step "Next: set $(dim 'UKU_API_KEY + UKU_COMPANY')  or run  $(bold 'uku auth login')"
 fi
 
