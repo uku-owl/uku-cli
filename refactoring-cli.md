@@ -421,6 +421,21 @@ Required review on `uku-owl/uku-cli` main, so one stolen token is not sufficient
 **Goal:** everything fixable without waiting for the API deploy.
 **Effort:** ~2-3 days. All items here are release-safe today.
 
+> ### ✅ SHIPPED 2026-08-03 — except § 5.3, which needs a ruling
+>
+> | | Status |
+> |---|---|
+> | § 5.1 C3 idempotency | ✅ done — **and the rationale below was wrong; corrected in place** |
+> | § 5.2 C5 warnings | ✅ done — **emitted from `check_status`, not `render()`; see why** |
+> | § 5.3 C6 exit codes | ⏳ **the only Phase 2 item outstanding.** Needs a CTO ruling |
+> | § 5.4 C9 traversal | ✅ done |
+> | § 5.5 C10, C11, C14 | ✅ done. **C7 implemented, measured, and REVERTED** |
+> | § 5.6 `uku health` | ✅ done |
+> | § 5.7 test gaps | ✅ done — 400 and 409 covered, shellcheck gating in `bin/ci` |
+>
+> `bin/ci` green at 1397 passed / 0 failed, from a 1306 baseline. Every guard
+> was proven by re-injecting its bug; the mutation counts are in each commit.
+
 ### 5.1 C3 — Idempotency-Key (and an honest limit on what it buys)
 
 **Where:** `do_request()` header block, `bin/uku:932-937`, gated on method the
@@ -466,9 +481,28 @@ retries. They do not, not safely:
   bitten by twice.
 
 **Therefore ship the conservative version now:** send the key on every non-GET/HEAD
-request, keep the existing refusal to auto-retry writes. The gain is real and
-immediate — when a *user or agent* re-runs a write after an ambiguous failure,
-the second call replays instead of double-creating. Auto-retry stays off.
+request, keep the existing refusal to auto-retry writes. Auto-retry stays off.
+
+> **⚠ CORRECTION — the sentence that used to be here was wrong, and it is the
+> one that would send someone re-implementing this the same wrong way.**
+>
+> It claimed the gain was that "when a user or agent re-runs a write after an
+> ambiguous failure, the second call replays instead of double-creating."
+> **It does not.** A key minted per process protects exactly one thing: the 428
+> re-send in `_heal_428`, the only path in this CLI that repeats a write. Two
+> runs of `uku tasks create` are two processes, two keys, and two tasks — which
+> is *correct*, because those really are two requests to create something.
+>
+> Cross-invocation safety cannot be inferred and has to be asked for. That is
+> what the new **`--idempotency-key`** flag is: an agent retrying a write it is
+> unsure about passes the key it used the first time and gets the original
+> response back. Deriving the key from the request instead would make two
+> deliberate identical creates collide and silently return the first one.
+>
+> Shipped: key minted in `do_request`, `_heal_428` sets `_UKU_IDEM_REUSE` so the
+> re-send carries the first attempt's key, and the flag is validated at its parse
+> site (newline → header forgery in the `curl -K` config; >200 chars → the API's
+> own 400). Pinned by `tests/cases/retry-428.sh` §C3 and `write-safety.sh` §C3.
 
 **And file the API-side ticket** so option (b) never becomes necessary: ask
 `uku_service` to declare idempotency coverage in the OpenAPI spec (e.g. an
@@ -488,10 +522,17 @@ as an error.
 
 ### 5.2 C5 — surface `warnings[]`
 
-**Where:** the two places every successful response is finally emitted —
-`render()` (`bin/uku:1030-1038`) and `_agent_ok()` (`bin/uku:1592-1606`, which
-today extracts only `.data` and `.meta` via `_json_scan`). `check_status()`
-(`bin/uku:1174-1264`) handles only non-2xx, so it is not sufficient alone.
+**Where — and the obvious answer is wrong.** This went into `render()` first,
+which looked right and was not: `table()`'s TTY branch renders columns and
+returns **without ever calling `render()`**, so the one caller who most needs to
+be told — a person reading a table — was the only one who never was.
+
+**Shipped from `check_status()`'s 2xx branch**, which is on the path of every
+response and is therefore the only place it can be done once. `_agent_ok()`
+additionally carries them inside the envelope so an agent has one document
+rather than two channels to reconcile. UKU_SOFT probes (the ETag fetch behind a
+428, the search fan-out) stay silent — a warning about a request the user never
+made is noise.
 
 Known codes: `TIME_ENTRY_OVERLAP`, `MONITOR_OVERLAP`, `AGREEMENT_OVERLAP`, plus
 deprecation notices. Shape: `{code, message}`, sometimes with `details`.
@@ -549,6 +590,19 @@ all, given someone has scripted `[ $? -eq 2 ]`? My read: yes, once, batched — 
 it is your call, and it should be made deliberately rather than absorbed as an
 implementation detail.
 
+**⚠ There is a GREEN TEST TO FLIP when this lands.** `tests/cases/exit-codes.sh`
+now covers 400 and asserts, by name:
+
+```
+assert_status 3 'MISSING_COMPANY is exit 3 today — see refactoring-cli.md 5.3'
+```
+
+That pins **today's wrong behaviour on purpose**, so the change is visible as a
+deliberate edit rather than discovered as a mysterious failure. Whoever
+implements C6 flips that assertion to `2` in the same commit. The same file also
+covers a validation 400 and a 409 `IDEMPOTENCY_KEY_REUSED`; only the
+`MISSING_COMPANY` one is expected to move.
+
 ### 5.4 C9 — path traversal, at the request layer
 
 **Two vectors, one guard.**
@@ -576,10 +630,36 @@ message was printed. Extend it to the `--by-id` vector.
 
 | ID | Site | Fix |
 |---|---|---|
-| C7 | `_check_base_transport` `bin/uku:873-877` | Loopback cleartext is allowed (correctly) but silent. `_announce_base` (`bin/uku:901-909`) fires only for non-default bases. Add an explicit stderr line whenever a **plaintext** base is used, naming that the live key is being sent in the clear. |
+| C7 | `_announce_base` | ❌ **IMPLEMENTED, MEASURED, REVERTED — see below.** |
 | C10 | `bin/uku:1061` and `bin/uku:1084` | `local IFS=','; set -- $raw` — unquoted, so pathname expansion applies to `--fields`. Quote, or `set -f` around it. Two sites, same bug. |
 | C11 | `scripts/install.sh:215` | The non-interactive branch runs `setup agents` unprompted, which writes `~/.claude/skills/uku/SKILL.md` (`_setup_claude`, `bin/uku:4032-4042`) and appends to `./AGENTS.md` in the cwd. Make the non-interactive path require explicit `UKU_SETUP_AGENT`, defaulting to none. |
 | C14 | `bin/uku:979` | `curl` runs with `-sS` and unsuppressed stderr, so on an unreachable host curl's raw error prints alongside the CLI's own clean message at `bin/uku:994`. Capture curl stderr to a file; emit it only under `--verbose`. Note `auto_update` (`bin/uku:4401`) and the doctor probe (`bin/uku:3206`) already do `2>/dev/null` — this is inconsistency, not oversight. |
+
+#### C7 — why it was reverted, and what would change the answer
+
+The ledger calls silent cleartext-to-loopback the one gap in the transport
+fence. It was implemented and measured, and three independent sources said no:
+
+- **It can only ever fire on local development.** Non-loopback cleartext is
+  already refused outright in `_check_base_transport`, so there is no other
+  situation left for it to warn about. It is not a warning about a risky
+  moment; it is a line on every command of an ordinary dev day.
+- **Four existing assertions broke, and they are contract** — *"a successful
+  read writes nothing to stderr"*, *"nothing is offered on stderr when nobody is
+  watching"*, *"nothing about the missing jq leaks into a clean read"*.
+- **`reference/python-client/README.md:43` reached the same conclusion
+  independently:** announcing on every command trains people to skip the warning
+  that matters, and *"`bin/uku` makes the same call; it is the right one"*.
+
+There is also no low-noise version available: every Uku key is `uku_live_`,
+there is no test-key tier, so the CLI cannot warn only when a *production*
+credential is at stake.
+
+**What would change the answer:** a key tier that marks non-production keys, or
+a persisted once-per-base acknowledgement rather than once-per-invocation. The
+reasoning is recorded in `_announce_base` itself so it is not re-litigated from
+scratch. **The CTO can overturn this** — it is a two-line change plus four test
+updates.
 
 ### 5.6 `uku health` — the one C8 item that ships now
 
@@ -603,8 +683,17 @@ Concrete 400 cases, taken from handlers rather than invented:
 
 409 cases arrive with C3 (§ 5.1).
 
-Add **shellcheck** as a `bin/ci` stage — there is none today, and the bash-3.2
-pattern scan at `bin/ci:43-67` is a hand-rolled partial substitute.
+**✅ Done.** shellcheck is stage 3 of `bin/ci`, gating at severity **warning**,
+where the repo is clean. It earned its place on the first run: two genuinely
+dead variables and a `cd` without a failure guard in `bin/ci` itself.
+
+Scope is split deliberately — shipped code gated with nothing excluded; test
+cases exclude exactly `SC2034` and `SC1112`, both false positives against this
+harness, with the reasons in `bin/ci`. Notes stay ungated (`SC2015`, `SC2012`
+are deliberate idioms). **Missing shellcheck reports SKIPPED, not passed** — a
+stage cannot gate what it cannot run, so Phase 3's CI must install it.
+
+HTTP coverage is now 200 201 400 401 403 404 409 412 422 428 429 500 503.
 
 ---
 
