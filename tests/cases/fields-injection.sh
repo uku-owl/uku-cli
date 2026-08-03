@@ -72,4 +72,43 @@ uku clients list --fields 'zzz // env.UKU_API_KEY' --agent
 assert_status 1 'and refused under --agent'
 assert_out_not_contains "$TEST_API_KEY" 'no leak in the agent envelope either'
 
+# ── 5 — C10: the comma split must not expand globs ───────────────────────
+# The allowlist above is reached by splitting on commas with `set --` on an
+# UNQUOTED expansion, which is subject to pathname expansion as well as word
+# splitting. So the value the allowlist inspected was not always the value the
+# user passed: in a directory containing files named `id` and `name`,
+# `--fields '*'` was replaced by those filenames BEFORE _valid_field ran, every
+# name passed, and the request went out with its columns chosen by whatever
+# happened to be in the working directory.
+#
+# Non-vacuity first (Lesson 2): with no bait files, `*` stays literal and is
+# refused for unrelated reasons, so both assertions below would pass against
+# the unfixed code for free.
+note '5 — the comma split must not expand globs'
+mkdir -p "$CASE_DIR/globbait"
+( cd "$CASE_DIR/globbait" && touch id name )
+assert_true 'the bait directory really does contain glob-able field names' \
+  sh -c "[ -f '$CASE_DIR/globbait/id' ] && [ -f '$CASE_DIR/globbait/name' ]"
+
+# cd in the CURRENT shell, never in a ( subshell ): uku() records the run into
+# $OUT/$ERR/$STATUS, and a subshell discards all three, leaving the assertions
+# below reading the PREVIOUS test's values — passing without ever running this
+# one. That mistake was made here first and caught by this very comment.
+_glob_cwd="$PWD"
+cd "$CASE_DIR/globbait"
+
+reset_requests
+uku clients list --fields '*'
+assert_status 1 "'*' is a usage error, not the cwd's filenames"
+assert_err_contains "got '*'" 'the CLI reports the literal value the user passed'
+assert_no_requests 'and nothing is sent — columns are never chosen by the filesystem'
+
+reset_requests
+uku clients list --fields 'id,?ame'
+assert_status 1 "'?' does not expand either"
+assert_err_contains "got '?ame'" 'and that value is reported literally too'
+assert_no_requests 'still nothing sent'
+
+cd "$_glob_cwd"
+
 finish

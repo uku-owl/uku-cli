@@ -1058,7 +1058,16 @@ _valid_field() {
 # sees names that were already checked — neither has to remember to re-check.
 _check_fields_arg() {
   local raw="$1" field
+  # `set --` on an unquoted expansion is subject to pathname expansion as well
+  # as word splitting, so a --fields value containing * or ? would be replaced
+  # by matching filenames in the cwd before _valid_field ever saw it. In a
+  # directory holding a file named `id`, `--fields '*'` expanded to the real
+  # filenames and validated clean. set -f turns globbing off for the split; the
+  # surrounding state is restored either way.
+  local _reset_f=''; case "$-" in *f*) : ;; *) _reset_f=1 ;; esac
+  set -f
   local IFS=','; set -- $raw; unset IFS
+  [ -z "$_reset_f" ] || set +f
   for field in "$@"; do
     _valid_field "$field" || die "--fields wants plain field names (letters, digits, underscore — e.g. id,name); got '$field'." "$EX_USAGE"
   done
@@ -1080,8 +1089,17 @@ _project_fields() {
 # table BODY COL1 COL2 ...  — compact table of .data[] fields when jq present.
 table() {
   local body="$1"; shift
-  # --fields id,name overrides the default columns (#8)
-  if [ -n "${UKU_FIELDS:-}" ]; then local IFS=','; set -- $UKU_FIELDS; unset IFS; fi
+  # --fields id,name overrides the default columns (#8). set -f for the same
+  # reason as in _check_fields_arg: an unquoted `set --` globs as well as
+  # splits. _check_fields_arg has already rejected * and ? by the time we get
+  # here, so this is belt-and-braces — but it is one line, and it means this
+  # site does not silently depend on a check that lives 20 lines away.
+  if [ -n "${UKU_FIELDS:-}" ]; then
+    local _reset_f=''; case "$-" in *f*) : ;; *) _reset_f=1 ;; esac
+    set -f
+    local IFS=','; set -- $UKU_FIELDS; unset IFS
+    [ -z "$_reset_f" ] || set +f
+  fi
   if [ "${UKU_AGENT:-0}" = "1" ] || [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty || ! have jq; then
     # --fields is explicit intent, and JSON is what a script or an agent gets by
     # default — so honour it there too, by projecting each row down to the keys
