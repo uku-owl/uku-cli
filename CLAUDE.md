@@ -1,0 +1,194 @@
+# CLAUDE.md — uku-cli
+
+The public command-line client for Uku, over public API v3.
+
+## Story
+
+**Pain:** Uku has three ways in — REST, MCP, and this CLI — and they drift. The CLI's own `--help` currently tells users the API has no search endpoint. It does. A task completed through this CLI silently skips automations, client-portal sync and notifications, because it uses a write path the API deprecated. Neither failure is visible from inside this repo, because everything here checks the CLI against *itself*.
+
+**What it does:** gives terminals, CI, and AI agents native access to a firm's Uku data, inside the exact permissions of the credential handed to it.
+
+**Outcome wanted:** the fastest, least surprising way for an agent or a developer to operate Uku — provably in step with the API, and safe enough to hand a customer.
+
+## Status & ownership
+
+**CTO-owned as of 2026-08-03.** Open to revision up to and including a total rewrite — language and shape are NOT settled (see § Open decisions). v0.6.0, bash + curl, `jq` optional.
+
+**Nothing releases until it is right.** There is no deadline pressure on this repo. Prefer the correct fix over the quick one, and say so when you defer something.
+
+## PRIME DIRECTIVE — don't break existing usage
+
+Existing command syntax, flags, output shapes and exit-code *meanings* are a contract. Someone has scripted them. Revise and rewrite internals freely; **change the surface only when it is broken**, and when you must, say so loudly in `.surface-breaking` and the changelog.
+
+If a rewrite happens, the new implementation must pass the *existing* behavioural tests. That suite is this repo's best asset — treat it as the specification.
+
+---
+
+## THE MOST IMPORTANT SECTION — how to know what the API actually does
+
+**Never take an API fact from prose. Not from this file, not from `README.md`, not from `--help`, not from a help-centre page, not from `llms-full.txt`.** Prose drifts and then lies with confidence. The phantom-search bug below is exactly that failure.
+
+There are two different machine-generated truths, and you need both:
+
+| Question | Command | Can it be wrong? |
+|---|---|---|
+| What is **released** (live in production)? | `curl -s https://app.getuku.com/api/v3/openapi.json` | **No.** FastAPI generates it from the live router table at request time. |
+| What is **built** (merged, maybe not deployed)? | `uku_service/CLAUDE/api/openapi.json` | Only by being stale — regenerate from a running dev server. |
+| What can a *user* do, semantically? | `curl -s https://app.getuku.com/api/v3/capabilities` — **⚠ 404 in production as of 2026-08-03; built, not yet released.** Until it deploys, read it from a local/staging server. | No — built from the same enforcement tables the API uses. Unauthenticated by design. |
+| Narrative, conventions, gotchas | `/api/v3/llms-full.txt`, `uku_service/CLAUDE/api/CLAUDE_API_V3.md` | **Yes.** Useful for intent; never authoritative for surface. |
+
+**Built ≠ released, and the gap is real.** On 2026-08-03 production served **182 operations** while the repo had **217**. A CLI implemented against the repo would ship commands that 404 for every customer. Any drift tooling must distinguish the two and refuse to ship ahead of production.
+
+The `/capabilities` caveat above is that same trap, caught in this very file within minutes of writing it — the author asserted an endpoint existed because it existed in the repo, then measured production and found a 404. **Assume this file is stale about the API. Re-measure.** That is the whole point of the table: the commands are durable, the facts around them are not.
+
+Backend repo: `../uku_service`. Ask it directly rather than guessing.
+
+---
+
+## Bug ledger
+
+Severity-ordered. `✅ verified` = reproduced first-hand; otherwise reported by audit and worth re-confirming before you act.
+
+### Critical — blocks any customer release
+
+**C1 — Unsigned auto-update pipes a remote URL into `sh`, unattended, daily.**
+`bin/uku` `auto_update()` is opt-out (`UKU_NO_AUTO_UPDATE`), runs on nearly every invocation, and on a version bump calls `cmd_update` → `curl -fsSL "$UKU_INSTALL_URL" | sh`. ✅ verified: both endpoints live (`raw.githubusercontent.com/.../VERSION` → 200, `getuku.com/install-cli` → 308).
+
+Two things make this worse than it looks:
+- **The payload URL resolves through Vercel.** `getuku.com/install-cli` → 308 (`server: Vercel`) → `raw.githubusercontent.com/.../scripts/install.sh`. Whoever controls the marketing site controls where `-L` lands. The marketing site is a lower-trust deploy path than the app, and is currently in the RCE path for every installation.
+- **Every integrity control lives *inside* `install.sh`.** Controls inside the artifact cannot protect the *choice* of artifact. `install.sh` says so itself: *"It is NOT authenticity — the artefact and its checksum come from the same repo."*
+
+Persistence multiplier: the update path also owns `_setup_claude`, which writes `~/.claude/skills/uku/SKILL.md` — so a compromise rewrites what customers' coding agents read.
+
+**Fix, in order:** (1) invert the default to opt-in or notify-only — one line, removes the standing channel today; (2) point `UKU_INSTALL_URL_DEFAULT` at a GitHub release asset so Vercel leaves the chain; (3) sign releases (minisign / GitHub artifact attestations) with a key that does not live in the artifact repo, verified in both `install.sh` and `cmd_update`; (4) branch protection + required review, so one stolen token is not sufficient.
+
+This is a *product decision* honestly disclosed in `SECURITY.md`, not an oversight. Unattended updates have real value for agent installs. Decide deliberately — but the current shape cannot ship to accounting firms.
+
+### High — customer-visible correctness
+
+**C2 — Task completion uses the deprecated write path.** ✅ verified: zero occurrences of `/complete` or `/reopen` in `bin/uku`. `tasks patch --data '{"status":"finished"}'` skips `finished_at`, client-portal auto-finish, `finished`-trigger automations, activity records and notifications. The API ships `POST /tasks/{id}/complete` and `/reopen` for exactly this. A firm completing tasks via CLI is silently losing automation e-mails.
+
+**C3 — No `Idempotency-Key` on any write, ever.** ✅ verified: no occurrence in `bin/uku`. The API's middleware covers ~20 top-level creators plus action sub-paths (`invoices/{id}/mark-paid|mark-unpaid|send`, `tasks/{id}/complete|reopen`, `tasks/bulk-action`, `workflow-templates/{id}/apply|push`, `clients/{id}/documents-folder`, `members/{id}/agreements`). The CLI reasoned correctly *from* this gap — it refuses to retry a 429'd write because the request may or may not have landed — but the constraint is self-imposed. Send a key, stable across retries, and safe write retries become available.
+
+**C4 — `--help` asserts a falsehood about the API.** ✅ verified, `bin/uku:3068`: *"Not a server-side search: the API has none."* `GET /api/v3/search` exists (cross-entity: invoices, contacts, suppliers, contracts, tasks, notes). The CLI instead fans out 5 requests, misses four of those entity types, and burns 5× the rate-limit budget. Note `bin/uku:3413` hedges — *"none this CLI can verify"* — which is the more honest phrasing and points straight at the missing capability: **it had no way to check.** That is what § Drift control fixes.
+
+### Medium
+
+**C5 — the API's `warnings[]` array is dropped.** ✅ verified: never read. `TIME_ENTRY_OVERLAP`, `MONITOR_OVERLAP` and deprecation notices never reach the user on a TTY.
+**C6 — exit codes collapse distinct failures** — 401/403 → 2, 404/500 → 3, rate-limit/network → 5. Agents branch on `$?`; these need separating.
+**C7 — loopback cleartext is allowed *and* unannounced.** `--base http://127.0.0.1:PORT` ships the live production key to any local process with no stderr line. The non-loopback refusal is excellent; this is the one gap in it.
+**C8 — credentials demanded for endpoints that need none.** `/health`, `/capabilities`, `/openapi.json` all return 200 to bare curl; the CLI refuses with rc=2. The gate checks credential *presence*, not validity. You cannot check whether the API is up, or discover capabilities, before signing in — and `capabilities` is precisely what an agent wants *first*. Add `uku health` and `uku capabilities` subcommands.
+
+### Low
+
+**C9** — `..` in an `api` path escapes the `/api/v3` prefix (`uku api GET /../../oauth/token` reached `/oauth/token` with the credential attached). Note: enforce at the request layer, not just the `api` command — curated commands interpolate paths too.
+**C10** — unquoted `local IFS=','; set -- $raw` → pathname expansion on `--fields`.
+**C11** — non-interactive install runs `setup agents`, appending to `./AGENTS.md` in the cwd and writing `~/.claude/skills/` unprompted.
+**C12** — `--help --agent` (14 KB) is *larger* than human `--help` (9.8 KB). Backwards; the machine variant is the one that should be lean.
+**C13** — `api --describe` is a hand-maintained ~12-resource map. Stale, and doesn't know `/search`, `/capabilities`, `/teams`, `/workflow-templates`, `/reports/*`, `/mcp-usage` exist. Replace with live `/api/v3/capabilities`.
+**C14** — curl's raw stderr leaks twice on an unreachable host, alongside the CLI's own clean message.
+
+### Capability gaps vs the current API
+
+No OAuth (see § Auth). No cursor-pagination follow (`meta.next_cursor` is passed through but never followed). No `/search`, `/capabilities`, `/teams`, `/workflow-templates`, `/reports/*`, `/mcp-usage`.
+
+### Process
+
+No CI — `bin/ci` is "run before you push", i.e. discipline, not a gate. The test suite **never scripts an HTTP 400** and covers 422 once, yet 400 is what the API returns for the commonest misconfiguration (`MISSING_COMPANY`). No shellcheck. `LICENSE` is MIT here while the sibling Python client declared Proprietary — settle it.
+
+---
+
+## Auth — the one architectural gap
+
+The CLI supports pasted API keys only. The API implements **OAuth 2.1 + PKCE** (`uku_service/backend/handlers/oauth_handlers.py`), including dynamic client registration and — importantly — `_valid_redirect_uri` already permits plain-http **loopback**, so a CLI browser flow needs no server change.
+
+Why it matters: a pasted *integration* key is **tenant-wide** and can carry `admin`/`financials`. An OAuth-minted key is **person-scoped**, `read`+`write`, with `financials` only if the consenting user holds Manage Account and ticks a box. Today every CLI user and every agent holds the most powerful credential the platform issues.
+
+**Be honest about the cost in bash:** PKCE S256 needs SHA-256 + base64url, the flow needs a loopback HTTP listener, and the token exchange needs JSON parsing — in a tool whose selling point is bash + curl with `jq` optional. Shelling out to `python3` is pragmatic but dents the zero-dependency claim. This is the single strongest argument for a rewrite; weigh it honestly rather than forcing it.
+
+Also note the API now issues **refresh tokens** (24h access, 90d rotating refresh, with reuse detection that revokes the whole family). If you implement OAuth: persist the rotated pair atomically, never send a refresh token twice, and refuse to use a credential against an origin other than the one it was minted for.
+
+---
+
+## Drift control — the highest-leverage work in this repo
+
+`.surface` (359 facts) + `check-surface.sh` + `check-drift.sh` are genuinely well-engineered. `check-surface.sh` is an asymmetric backward-compatibility ratchet: additions need a deliberate `--update`, removals fail until acknowledged in `.surface-breaking`. `check-drift.sh` cross-checks README, the generated skill, `--help`, the dispatcher's case labels and the remedy table — and check 3 *executes* every declared command against the real dispatcher rather than trusting a parse.
+
+**But not one of those 359 facts references the Uku API.** The gate checks the CLI against itself. That is precisely why `--help` can assert the API has no search endpoint and stay green.
+
+**The fix is cheap because the machinery exists.** Add an API-derived fact type — `op GET /api/v3/tasks` — generated from the published spec. The existing ratchet then gives API-coverage drift control for free: a new operation shows up as NEW SURFACE, a removed one fails until acknowledged. No new tooling, no code generator, no unreviewable diffs.
+
+Make it distinguish **released** from **built** (see above) so the CLI can never ship a command production doesn't serve. Run it in CI on every PR *and* on a daily schedule, so API-side changes surface within a day rather than at the next release.
+
+---
+
+## Lessons learned — earned, not theoretical
+
+**On testing**
+1. **Test the test.** Every guard here was proven by re-injecting the bug and confirming red. Four mutations were injected into this repo's suite; all four were caught. That is why it is trustworthy.
+2. **Write non-vacuity guards.** A fixture whose two values coincide makes every test below it pass for free. Assert the fixture discriminates *before* asserting behaviour.
+3. **A test that cannot fail is worse than no test** — it retires the question. One CLI's import fence never ran because `conftest` aborted first; a `--if-match auto` bug hid behind a fixture that answered GET on any path.
+4. **Live tests find what mocks cannot.** Mocked suites missed: idempotency being unreachable, credentials crossing origins, a CLI pointing at production, timezone anchoring. All were caught the moment something real was on the other end.
+5. **Assert on side-effect absence.** `traversal.sh` is this repo's best case: it checks the victim file still exists, not that a message was printed. Exit-code-only assertions passed against the *old, broken* code.
+
+**On agents as users**
+6. **Context is the agent's currency.** `--help` at 9.8 KB is paid on every session. For comparison: this repo's skill file ~18 KB; Uku's MCP `tools/list` ~22.7 K tokens; Basecamp's CLI covers 155 endpoints in ~11–12 K. Lean help is a feature.
+7. **Round trips cost inferences, not milliseconds.** One tool call ≈ one model turn ≈ seconds. A CLI's structural advantage over MCP is that an agent can chain `uku a && uku b && uku c` in a *single* round trip. Design for batching.
+8. **Exit codes are the agent's control flow.** Collapsing 401 and 403 forces prose parsing. Map `MISSING_COMPANY` to *auth*, not *validation* — an agent seeing "validation" retries with different data and loops forever.
+9. **Teach discovery, don't enumerate.** Basecamp's skill covers 155 endpoints via decision trees, a quick-reference table, and "walk the tree: start at `--agent --help`". Constraints live in a `notes` field in the introspectable help rather than inlined.
+
+**On security**
+10. **A credential minted for one origin must never be sent to another.** Found independently in *both* Uku CLIs. Check every layer — one had the fence on its refresh token but not its access token.
+11. **Validate discovery metadata against the origin that served it** (RFC 8414 §3.3), and do **not** follow redirects while doing so — a 302 to production returns a document that legitimately names production, so the check passes while every endpoint points away.
+12. **Keep secrets out of argv.** `curl -K` config files, as done here, is the right call — argv is world-readable via `ps`.
+13. **Allowlist, don't denylist, for credential stores.** An allowlist miss costs a fallback file; a denylist miss costs the secret in cleartext.
+
+**On drift**
+14. **A client's own docs must never assert facts about the server.** Point at the generated spec. Every hand-maintained resource list eventually lies.
+15. **Documentation that isn't executed is decoration.** The only reason this repo's docs match its code is that `check-drift.sh` runs them. Extend that property to the API.
+
+---
+
+## What "better" looks like
+
+Reference implementation worth studying: **`basecamp/basecamp-cli`** — same audience shape, ships **no MCP server**, CLI + skill + native Claude Code / Codex plugins. Go, so it distributes signed cross-platform binaries via Homebrew, Scoop, deb/rpm/apk, AUR and Nix rather than `curl | sh` alone. OAuth 2.1 preferring **device flow** (approve a short code in a browser) over an auth-code redirect — better for a CLI, since it works over SSH, headless, and when the browser is on a different machine. Named profiles, keyring storage, JSON envelope with breadcrumbs, `doctor`.
+
+Note this repo already converged independently on breadcrumbs, `doctor`, profiles, output polymorphism and an agent-skill installer. The gaps are distribution, device-flow auth, and API-anchored drift control.
+
+---
+
+## Open decisions — resolve before large work
+
+1. **Stay bash, or rewrite?** Bash's cost is concentrated in OAuth (above), Windows (`bin/uku` targets bash 3.2; "Windows", "WSL", "PowerShell" appear nowhere), and static analysis. Its value is 51 commits of hard-won API archaeology, 1306 wire-level assertions, and an adversarial security audit it passed clean. **The audience is AI agents and developers**, so Windows matters less than it would for end-customers — but a rewrite would also buy signed cross-platform binaries. Decide explicitly, with the PRIME DIRECTIVE in force either way.
+2. **Auto-update policy** — opt-in, notify-only, or signed-and-on (§ C1).
+3. **Licence** — MIT stands, but reconcile it with the platform's position.
+
+---
+
+## Definition of done
+
+- [ ] C1 resolved; nothing pipes an unverified remote artifact into a shell
+- [ ] C2–C4 fixed: correct completion endpoint, idempotency keys, real `/search`
+- [ ] `check-drift.sh` anchored to the API spec, distinguishing released from built, running in CI
+- [ ] CI exists and gates every PR
+- [ ] Test suite covers HTTP 400 and 422
+- [ ] `--help`/skill restructured for progressive disclosure; machine variant smaller than the human one
+- [ ] Existing command surface unchanged, or every deviation recorded in `.surface-breaking`
+- [ ] Auth decision made and implemented
+- [ ] SOC 2: repo added to asset inventory, subprocessor list, access-control matrix (same gap exists for `infra` and `mailbox` — close together)
+
+## Release context — you are ahead of production
+
+A large batch of API v3 / MCP work is **committed but not deployed** (branch `staging` in `../uku_service`, 2026-08-03). Production is running the *older* surface. That means:
+
+- Several endpoints this repo should eventually use — `/capabilities`, `/mcp-usage`, sparse `fields=`, `If-None-Match`, widened cursor support — **exist in the repo and 404 in production.** Build against them only once they ship.
+- Nothing here is on a deadline. The plan is a single coordinated release of API + MCP + CLI (+ help and marketing content, handled separately) once everything is right.
+- The whole platform is in **development and staging testing**, iterating aggressively. Test against staging or a local server, not production.
+
+## Reference
+
+- Backend, API v3 and MCP: `../uku_service` — start at `CLAUDE/api/CLAUDE_API_V3.md`
+- Platform-wide conventions and the three-surface propagation rule: `../CLAUDE.md`
+- OAuth server: `../uku_service/backend/handlers/oauth_handlers.py`
+- Idempotency contract: `../uku_service/backend/api_v3/middleware/idempotency.py`
+- ETag/optimistic locking: `../uku_service/backend/api_v3/services/_optimistic_lock.py`
