@@ -3764,6 +3764,64 @@ _surface_emit() {
   done <<EOF
 $(_surface_table)
 EOF
+  _surface_ops
+  return 0
+}
+
+# ── the API operations this CLI calls (Phase 3) ──────────────────────
+# One `op METHOD /path` fact per API v3 operation the CLI can issue, with
+# record ids written as {id}.
+#
+# This declares what the CLI USES, deliberately not what the API OFFERS.
+# Production serves 182 operations; transcribing all of them here would inflate
+# every --dump-surface and every byte of bin/uku, which an agent pays for on
+# each session, to describe endpoints this CLI never calls. The API's own
+# surface is tracked separately, in .api-released.
+#
+# Two independent checks keep this list honest, because on its own it would be
+# a third hand-maintained source of truth next to the dispatcher and the
+# surface table:
+#
+#   tests/run.sh        every operation OBSERVED on the wire across the whole
+#                       suite must appear here. That is the executed check —
+#                       it cannot be fooled by a parse, in the same way that
+#                       check-drift.sh check 3c runs each declared command
+#                       against the real dispatcher instead of grepping for it.
+#   scripts/check-api.sh  every operation here must exist in PRODUCTION. That
+#                       is the ship gate: it makes it impossible to release a
+#                       command that 404s for every customer.
+_surface_ops() {
+  # Reads without an id, then with; then the writes. Kept sorted by path so a
+  # diff against a new API version is readable.
+  cat <<'OPS'
+op GET /api/v3/clients
+op GET /api/v3/clients/{id}
+op GET /api/v3/contracts
+op GET /api/v3/contracts/{id}
+op GET /api/v3/health
+op GET /api/v3/invoices
+op GET /api/v3/invoices/{id}
+op GET /api/v3/members
+op GET /api/v3/members/{id}
+op GET /api/v3/products
+op GET /api/v3/products/{id}
+op GET /api/v3/projects
+op GET /api/v3/projects/{id}
+op GET /api/v3/tasks
+op GET /api/v3/tasks/{id}
+op GET /api/v3/time-entries
+op GET /api/v3/time-entries/{id}
+op POST /api/v3/clients
+op POST /api/v3/contracts/{id}/rows
+op POST /api/v3/invoices
+op POST /api/v3/tasks
+op POST /api/v3/time-entries
+op PATCH /api/v3/clients/{id}
+op PATCH /api/v3/contracts/{id}
+op PATCH /api/v3/tasks/{id}
+op PATCH /api/v3/time-entries/{id}
+op DELETE /api/v3/tasks/{id}
+OPS
   return 0
 }
 

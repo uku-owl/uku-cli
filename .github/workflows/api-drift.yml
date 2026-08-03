@@ -1,0 +1,49 @@
+# Daily: fetch the LIVE production spec and compare it to .api-released.
+#
+# bin/ci's api stage is deliberately offline — it reads the committed snapshot,
+# so a PR never fails because GitHub could not reach app.getuku.com. That makes
+# PRs deterministic and makes this job the only thing standing between the
+# snapshot and staleness.
+#
+# ⚠ IF THIS JOB IS NOT RUNNING, .api-released IS A SOUVENIR, NOT A FACT.
+# The retired Python client built the same snapshot machinery and its copy went
+# 34 operations stale because nothing refreshed it
+# (reference/python-client/README.md:58). A stale snapshot that reports "clean"
+# is worse than no gate at all, because it is believed.
+name: api-drift
+
+on:
+  schedule:
+    # 06:00 UTC — before the Tallinn working day, so a change to the API that
+    # landed overnight is known about before anyone builds against it.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails when an operation the CLI CALLS has vanished from production, or
+      # when the CLI declares one production does not serve. New operations are
+      # reported and do not fail — the API is allowed to grow faster than its
+      # client.
+      - name: Compare the CLI against live production
+        run: bash scripts/check-api.sh --live
+
+      # The report is the point even on success: it names how many live
+      # operations this CLI does not yet call, which is the coverage question
+      # the handover cares about.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            printf '## API drift\n\n```\n'
+            bash scripts/check-api.sh --live 2>&1 || true
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"

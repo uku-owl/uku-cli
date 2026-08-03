@@ -306,6 +306,33 @@ note time a time entry has no name, so `get` takes an id or a pasted URL — nev
 note time there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>`
 note update re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
 note version identical to `uku --version`
+op DELETE /api/v3/tasks/{id}
+op GET /api/v3/clients
+op GET /api/v3/clients/{id}
+op GET /api/v3/contracts
+op GET /api/v3/contracts/{id}
+op GET /api/v3/health
+op GET /api/v3/invoices
+op GET /api/v3/invoices/{id}
+op GET /api/v3/members
+op GET /api/v3/members/{id}
+op GET /api/v3/products
+op GET /api/v3/products/{id}
+op GET /api/v3/projects
+op GET /api/v3/projects/{id}
+op GET /api/v3/tasks
+op GET /api/v3/tasks/{id}
+op GET /api/v3/time-entries
+op GET /api/v3/time-entries/{id}
+op PATCH /api/v3/clients/{id}
+op PATCH /api/v3/contracts/{id}
+op PATCH /api/v3/tasks/{id}
+op PATCH /api/v3/time-entries/{id}
+op POST /api/v3/clients
+op POST /api/v3/contracts/{id}/rows
+op POST /api/v3/invoices
+op POST /api/v3/tasks
+op POST /api/v3/time-entries
 sub account add
 sub account current
 sub account list

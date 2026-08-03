@@ -53,6 +53,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # An ALLOWLIST, which means a header the CLI genuinely sends is invisible to
 # every assertion until it is named here — and an assertion comparing two
 # absent headers passes. Add the header here first, then assert on it.
+def normalize_op_path(path):
+    """`/api/v3/contracts/41219/rows` -> `/api/v3/contracts/{id}/rows`.
+
+    Returns None for anything that is not an API v3 path, which drops the
+    fixtures that are not API operations at all: the /VERSION release pointer,
+    and the /slow and /reject/... routes that exist to test timeouts and base
+    rejection.
+
+    Normalisation is by POSITION, not by shape. Under /api/v3/ the layout is
+    /api/v3/<collection>/<id>[/<sub>[/<id>]], so the id positions are fixed and
+    known. Shape-matching was tried first and is subtly wrong: it has to guess
+    whether a segment "looks like" an id, and it guessed wrong on `a..b` — a
+    deliberate C9 control asserting that dots inside a segment are NOT a
+    traversal. Position cannot be fooled that way.
+    """
+    if path != "/api/v3" and not path.startswith("/api/v3/"):
+        return None
+    parts = path.split("/")           # ['', 'api', 'v3', <collection>, <id>, …]
+    for i in (4, 6):
+        if len(parts) > i and parts[i]:
+            parts[i] = "{id}"
+    return "/".join(parts)
+
+
 RECORDED_HEADERS = [
     "X-API-Key",
     "X-Uku-Company",
@@ -166,6 +190,23 @@ class Handler(BaseHTTPRequestHandler):
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
                     fh.flush()
                     os.fsync(fh.fileno())
+
+        # UKU_OPLOG: an APPEND-ONLY record of every (method, path) the CLI put
+        # on the wire, across the whole suite. The per-case log above is reset
+        # by reset_requests, so it cannot answer "which API operations does this
+        # CLI actually call?" — and that question is what anchors the `op` facts
+        # in .surface to observed behaviour instead of to a hand-kept list.
+        #
+        # Normalised here rather than in the reader, so the file is a set of
+        # operations rather than a transcript: numeric and uuid-ish segments
+        # become {id}, and the query string is dropped.
+        oplog = os.environ.get("UKU_OPLOG")
+        if oplog:
+            norm = normalize_op_path(path)
+            if norm is not None:
+                with STATE["lock"]:
+                    with open(oplog, "a", encoding="utf-8") as fh:
+                        fh.write(f"{method} {norm}\n")
 
     def _handle(self, method):
         raw = self.path

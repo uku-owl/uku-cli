@@ -83,6 +83,7 @@ if [ -n "${UKU_BASE_URL:-}" ]; then
 fi
 
 files=""
+run_all=0
 if [ "$#" -gt 0 ]; then
   for arg in "$@"; do
     f="$CASES_DIR/$arg"
@@ -96,6 +97,7 @@ if [ "$#" -gt 0 ]; then
     files="$files $f"
   done
 else
+  run_all=1
   for f in "$CASES_DIR"/*.sh; do [ -f "$f" ] && files="$files $f"; done
 fi
 
@@ -103,6 +105,27 @@ total_ok=0
 total_not_ok=0
 failed_cases=""
 started="$(date +%s)"
+
+# ── op coverage (Phase 3) ────────────────────────────────────────────
+# Every request the CLI puts on the wire during the suite is appended here by
+# tests/server.py, normalised to METHOD /api/v3/<path with ids as {id}>. After
+# the cases finish, that OBSERVED set is compared against the `op` facts the
+# CLI declares in its surface table.
+#
+# This is the executed half of the drift gate, and it is the half that matters:
+# the declared list is hand-maintained, so on its own it is a third source of
+# truth that can quietly omit an operation the CLI genuinely calls. Comparing
+# it to what actually went over a socket is the same insurance check 3c in
+# check-drift.sh buys by running every declared command against the real
+# dispatcher, rather than trusting a parse.
+#
+# Only run for a FULL suite: a single-case run sees a fraction of the traffic
+# and would report every other operation as unobserved.
+UKU_OPLOG=""
+if [ "$run_all" = "1" ]; then
+  UKU_OPLOG="$(mktemp)"; export UKU_OPLOG
+  trap 'rm -f "$UKU_OPLOG"' EXIT
+fi
 
 for f in $files; do
   name="$(basename "$f" .sh)"
@@ -135,6 +158,23 @@ if [ -n "$failed_cases" ]; then
   printf '────────────────────────────────────────────────\n'
   exit 1
 fi
+# ── op coverage verdict ──────────────────────────────────────────────
+if [ -n "$UKU_OPLOG" ] && [ -s "$UKU_OPLOG" ]; then
+  observed="$(LC_ALL=C sort -u "$UKU_OPLOG")"
+  declared="$("$TESTS_DIR/../bin/uku" --dump-surface | sed -n 's/^op //p' | LC_ALL=C sort -u)"
+  undeclared="$(printf '%s\n' "$observed" | LC_ALL=C comm -23 - <(printf '%s\n' "$declared"))"
+  if [ -n "$undeclared" ]; then
+    printf '\n\033[31mOP DRIFT\033[0m — the CLI called operations it does not declare:\n'
+    printf '%s\n' "$undeclared" | sed 's/^/    /'
+    printf '  Every API operation this CLI uses must be an `op` fact, so that\n'
+    printf '  scripts/check-api.sh can refuse to ship one production does not serve.\n'
+    printf '  Add it to the surface table in bin/uku, then: scripts/check-surface.sh --update\n'
+    printf '────────────────────────────────────────────────\n'
+    exit 1
+  fi
+  printf 'op coverage: %d observed, all declared.\n' "$(printf '%s\n' "$observed" | grep -c .)"
+fi
+
 printf 'All green.\n'
 printf '────────────────────────────────────────────────\n'
 exit 0

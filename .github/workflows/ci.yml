@@ -1,0 +1,51 @@
+# bin/ci on every push and every PR. This is the gate.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # bin/ci reports a missing shellcheck as SKIPPED rather than passing, so
+      # without this the lint stage would silently not run in the one place it
+      # is meant to be mandatory.
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Show versions
+        run: |
+          bash --version | head -1
+          shellcheck --version | sed -n 's/^version: /shellcheck /p'
+          python3 --version
+          jq --version
+
+      # The whole gate, in the same one command a developer runs locally.
+      # Deliberately not split into per-stage steps: a green tick per stage
+      # looks tidier and makes it possible for the set of stages here to drift
+      # from the set in bin/ci, which is exactly the class of bug this repo
+      # keeps finding.
+      - name: bin/ci
+        run: bash bin/ci
+
+# NOTE — there is deliberately no "run the suite without jq" job.
+#
+# jq being optional is already executed, and executed better, by
+# tests/cases/no-jq.sh: hide_cmd (tests/lib/harness.sh) makes `command -v jq`
+# fail through a symlink farm while curl, python3 and the rest stay
+# resolvable, and it opens with a self-check proving the helper actually hides
+# jq before anything is built on that.
+#
+# Running the WHOLE suite without jq would fail on day one, and not because the
+# CLI is broken: assertions in health.sh and output-modes.sh pipe $OUT through
+# jq to inspect it. That is a test of the tests, not of the promise.

@@ -43,7 +43,7 @@ assert_true 'two dumps in a row are byte-identical' \
 assert_true 'the dump is sorted and free of duplicates' \
   sh -c "LC_ALL=C sort -u '$CASE_DIR/d1' | cmp -s - '$CASE_DIR/d1'"
 assert_true 'the dump is one fact per line, every line a known kind' \
-  sh -c "! grep -vE '^(cmd|cmdalias|sub|subalias|flag|gflag|doc|arg|note) ' '$CASE_DIR/d1'"
+  sh -c "! grep -vE '^(cmd|cmdalias|sub|subalias|flag|gflag|doc|arg|note|op) ' '$CASE_DIR/d1'"
 assert_true 'the committed .surface is exactly what the CLI declares' \
   cmp -s "$CASE_DIR/d1" "$REPO_ROOT/.surface"
 assert_true 'the dump needs no credentials, no network, no server' \

@@ -3,18 +3,23 @@
 #
 #   bin/ci
 #
-# Six stages, in the order in which a failure is cheapest to understand:
+# Seven stages, in the order in which a failure is cheapest to understand:
 #
 #   1  bash -n            the file parses at all
 #   2  bash 3.2           no construct macOS's shipped bash cannot run
 #   3  shellcheck         static analysis, at severity warning
 #   4  check-surface.sh   the committed .surface matches the declared one
 #   5  check-drift.sh     docs, code and help all agree with the table
-#   6  tests/run.sh       the behaviour itself
+#   6  check-api.sh       every operation the CLI calls is live in production
+#   7  tests/run.sh       the behaviour itself
 #
-# Stages 3-5 come BEFORE the tests on purpose: they are seconds, they need no
-# fixture server, and a lint, surface or doc break is the kind of thing a green
-# test suite happily hides.
+# Stages 3-6 come BEFORE the tests on purpose: they are seconds, they need no
+# fixture server, and a lint, surface, doc or API break is the kind of thing a
+# green test suite happily hides.
+#
+# Stages 1-5 check the CLI against ITSELF. Stage 6 is the only one that checks
+# it against the API it is a client of, and stage 7 closes the loop by proving
+# the operations it declares are the ones it actually puts on the wire.
 #
 # Exit: 0 only if every stage passed.
 set -uo pipefail
@@ -24,7 +29,7 @@ cd "$ROOT" || { printf '  cannot cd to %s\n' "$ROOT" >&2; exit 1; }
 
 FAILED=""
 STAGE=0
-_stage() { STAGE=$((STAGE + 1)); printf '\n\033[1m[%d/6] %s\033[0m\n' "$STAGE" "$1"; }
+_stage() { STAGE=$((STAGE + 1)); printf '\n\033[1m[%d/7] %s\033[0m\n' "$STAGE" "$1"; }
 _verdict() { # NAME RC
   if [ "$2" = "0" ]; then printf '  \033[32m✓\033[0m %s\n' "$1"
   else printf '  \033[31m✗\033[0m %s (exit %s)\n' "$1" "$2"; FAILED="$FAILED $1"; fi
@@ -114,7 +119,21 @@ rc=0
 scripts/check-drift.sh || rc=$?
 _verdict 'drift' "$rc"
 
-# ── 6 tests ──────────────────────────────────────────────────────────
+# ── 6 api ────────────────────────────────────────────────────────────
+# The other five stages check the CLI against itself. This one checks it
+# against the API, which is the thing it is a client of — and the gap the
+# handover calls the highest-leverage work in the repo.
+#
+# Offline on purpose: it reads the committed .api-released snapshot, so a PR
+# never fails because GitHub could not reach app.getuku.com. The live fetch is
+# a separate, scheduled job (scripts/check-api.sh --live), because an API-side
+# change should surface within a day rather than at the next release.
+_stage 'api — every operation the CLI calls is served in production'
+rc=0
+scripts/check-api.sh || rc=$?
+_verdict 'api' "$rc"
+
+# ── 7 tests ──────────────────────────────────────────────────────────
 _stage 'tests — tests/run.sh'
 rc=0
 tests/run.sh || rc=$?
@@ -127,6 +146,6 @@ if [ -n "$FAILED" ]; then
   printf '════════════════════════════════════════════════\n'
   exit 1
 fi
-printf '\033[32mCI PASSED\033[0m — syntax · bash 3.2 · shellcheck · surface · drift · tests\n'
+printf '\033[32mCI PASSED\033[0m — syntax · bash 3.2 · shellcheck · surface · drift · api · tests\n'
 printf '════════════════════════════════════════════════\n'
 exit 0
