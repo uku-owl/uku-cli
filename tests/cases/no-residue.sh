@@ -119,14 +119,39 @@ assert_no_file_contains "$PII" 'and neither does the request body'
 # did not itself die of it, drops it: the run finishes with exit 0 and the trap
 # never fires. Measured while writing this case. Hence python: it is the only
 # thing on the box that can put the CLI in its own session and killpg it.
+#
+# Wait for the request to reach the server rather than sleeping a fixed 1s:
+# tests/server.py logs and fsyncs BEFORE it honours `delay`, so a /slow line
+# means curl is connected and blocked. A timed sleep loses this race under a
+# loaded/parallel run — the signal lands before curl exists and is dropped.
+#
+# Non-vacuity first: if SIGINT is ignored here, everything below measures the
+# harness rather than the CLI.
+assert_equals \
+  "$("$PYTHON_BIN" -c 'import signal; print("IGNORED" if signal.getsignal(signal.SIGINT) is signal.SIG_IGN else "deliverable")')" \
+  'deliverable' \
+  'SIGINT can be delivered here at all (else everything below is vacuous)'
+
 : > "$OUT_FILE"; : > "$ERR_FILE"
-STATUS="$("$PYTHON_BIN" - "$UKU_BIN" "$OUT_FILE" "$ERR_FILE" <<'PY'
+STATUS="$("$PYTHON_BIN" - "$UKU_BIN" "$OUT_FILE" "$ERR_FILE" "$REQ_LOG" <<'PY'
 import os, signal, subprocess, sys, time
-binp, outp, errp = sys.argv[1], sys.argv[2], sys.argv[3]
+binp, outp, errp, reqlog = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(outp, "w") as o, open(errp, "w") as e:
     p = subprocess.Popen([binp, "api", "GET", "/slow"], stdout=o, stderr=e,
                          stdin=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(1.0)
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        try:
+            with open(reqlog, encoding="utf-8") as fh:
+                if any('"/slow"' in line for line in fh):
+                    break
+        except OSError:
+            pass
+        if p.poll() is not None:
+            break            # it exited before ever reaching the wire
+        time.sleep(0.02)
+    else:
+        print("TIMEOUT-no-request", file=sys.stderr)
     os.killpg(os.getpgid(p.pid), signal.SIGINT)
     rc = p.wait()
 print(128 - rc if rc < 0 else rc)

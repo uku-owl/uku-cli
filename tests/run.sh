@@ -4,6 +4,13 @@
 #   tests/run.sh                 run every tests/cases/*.sh
 #   tests/run.sh exit-codes      run one case (with or without the .sh)
 #
+# Cases run in parallel (see § concurrency below); output is buffered per case
+# and printed in the order the cases were named, so the transcript is identical
+# whatever the job count. Two knobs:
+#
+#   UKU_TEST_JOBS=1              serial, same code path — for a clean bisect
+#   UKU_TEST_KEEP=1              keep each case's raw stdout/stderr on disk
+#
 # Exits non-zero if anything failed. bash 3.2 compatible.
 
 # ─────────────────────────────────────────────────────────────────────
@@ -106,6 +113,24 @@ total_not_ok=0
 failed_cases=""
 started="$(date +%s)"
 
+# ── concurrency ──────────────────────────────────────────────────────
+# Safe because setup_case already gives every case its own temp dir, HOME,
+# config home and ephemeral server port. UKU_TEST_JOBS=1 is serial, same path.
+jobs_n="${UKU_TEST_JOBS:-}"
+if [ -z "$jobs_n" ]; then
+  jobs_n="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || printf 2)"
+  [ "$jobs_n" -gt 8 ] 2>/dev/null && jobs_n=8   # past ~8 it stops helping
+fi
+case "$jobs_n" in ''|*[!0-9]*) jobs_n=2 ;; esac
+[ "$jobs_n" -lt 1 ] && jobs_n=1
+
+RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uku-run-XXXXXX")"
+if [ "${UKU_TEST_KEEP:-0}" = "1" ]; then
+  printf 'keeping per-case output in %s\n' "$RUN_DIR"
+else
+  trap 'rm -rf "$RUN_DIR"' EXIT
+fi
+
 # ── op coverage (Phase 3) ────────────────────────────────────────────
 # Every request the CLI puts on the wire during the suite is appended here by
 # tests/server.py, normalised to METHOD /api/v3/<path with ids as {id}>. After
@@ -121,17 +146,68 @@ started="$(date +%s)"
 #
 # Only run for a FULL suite: a single-case run sees a fraction of the traffic
 # and would report every other operation as unobserved.
-UKU_OPLOG=""
-if [ "$run_all" = "1" ]; then
-  UKU_OPLOG="$(mktemp)"; export UKU_OPLOG
-  trap 'rm -f "$UKU_OPLOG"' EXIT
-fi
+#
+# Each case gets its OWN oplog file, merged after the run. One shared file
+# appended to by N concurrent fixture servers would work in practice — the
+# lines are short and opened O_APPEND — but "in practice" is not a property
+# worth resting a gate on when a per-case file costs nothing.
+OPLOG_MERGED=""
+[ "$run_all" = "1" ] && OPLOG_MERGED="$RUN_DIR/oplog-merged"
 
+# ── launch ───────────────────────────────────────────────────────────
+# Throttled by counting the rc.* files the finished cases leave behind, not by
+# `jobs -r` or `kill -0`: a child that has exited but not been reaped is still
+# a live process to `kill -0`, so it would over-count and stall the run. The rc
+# file is written as the case's last act, which makes it an unambiguous
+# "finished" marker.
+_completed() {
+  local n=0 rcf
+  for rcf in "$RUN_DIR"/rc.*; do [ -f "$rcf" ] && n=$((n + 1)); done
+  printf '%s' "$n"
+}
+
+# set -m is load-bearing: without job control, bash sets SIGINT to IGNORED in
+# background commands, and SIG_IGN survives exec — so no-residue.sh's Ctrl-C
+# test would signal a deaf CLI and pass nothing. Found the hard way.
+set -m
+
+# Indexed, not keyed by name, so `tests/run.sh smoke smoke` can't self-overwrite.
+launched=0
 for f in $files; do
   name="$(basename "$f" .sh)"
+  launched=$((launched + 1))
+  slot="$(printf '%03d-%s' "$launched" "$name")"
+  while [ "$((launched - 1 - $(_completed)))" -ge "$jobs_n" ]; do sleep 0.05; done
+  (
+    [ -n "$OPLOG_MERGED" ] && export UKU_OPLOG="$RUN_DIR/oplog.$slot"
+    bash "$f" > "$RUN_DIR/out.$slot" 2>&1
+    printf '%s\n' "$?" > "$RUN_DIR/rc.$slot"
+  ) &
+done
+wait
+
+# ── collect, in the order the cases were named ───────────────────────
+collected=0
+idx=0
+for f in $files; do
+  name="$(basename "$f" .sh)"
+  idx=$((idx + 1))
+  slot="$(printf '%03d-%s' "$idx" "$name")"
   printf '\n\033[1m# %s\033[0m\n' "$name"
-  out="$(bash "$f" 2>&1)"
-  rc=$?
+
+  # A case whose result never landed is a LOST case, and a parallel runner that
+  # loses work while reporting green is strictly worse than a slow serial one.
+  # Counted here and hard-failed below, not just noted.
+  if [ ! -f "$RUN_DIR/rc.$slot" ]; then
+    printf '# %s produced no result at all — the runner lost it\n' "$name"
+    total_not_ok=$((total_not_ok + 1))
+    failed_cases="$failed_cases $name"
+    continue
+  fi
+  collected=$((collected + 1))
+
+  out="$(cat "$RUN_DIR/out.$slot")"
+  rc="$(tr -d '[:space:]' < "$RUN_DIR/rc.$slot")"
   printf '%s\n' "$out"
   n_ok="$(printf '%s\n' "$out" | grep -c '^ok ' || true)"
   n_bad="$(printf '%s\n' "$out" | grep -c '^not ok ' || true)"
@@ -149,18 +225,31 @@ for f in $files; do
   fi
 done
 
+[ -n "$OPLOG_MERGED" ] && cat "$RUN_DIR"/oplog.* > "$OPLOG_MERGED" 2>/dev/null
+
 elapsed=$(( $(date +%s) - started ))
 printf '\n────────────────────────────────────────────────\n'
-printf 'uku CLI test suite — %d passed, %d failed  (%d total, %ds)\n' \
-  "$total_ok" "$total_not_ok" "$((total_ok + total_not_ok))" "$elapsed"
+printf 'uku CLI test suite — %d passed, %d failed  (%d total, %ds, %d job(s))\n' \
+  "$total_ok" "$total_not_ok" "$((total_ok + total_not_ok))" "$elapsed" "$jobs_n"
+
+# count-in == count-out. Deliberately its own verdict, checked before the
+# pass/fail totals are believed: if the runner launched more cases than it
+# collected results for, then "0 failed" is a statement about the cases that
+# happened to come back, and means nothing.
+if [ "$collected" -ne "$launched" ]; then
+  printf 'RUNNER FAULT — launched %d case(s), collected %d result(s).\n' "$launched" "$collected"
+  printf 'A missing result is not a pass. Re-run with UKU_TEST_JOBS=1 UKU_TEST_KEEP=1.\n'
+  printf '────────────────────────────────────────────────\n'
+  exit 1
+fi
 if [ -n "$failed_cases" ]; then
   printf 'FAILED cases:%s\n' "$failed_cases"
   printf '────────────────────────────────────────────────\n'
   exit 1
 fi
 # ── op coverage verdict ──────────────────────────────────────────────
-if [ -n "$UKU_OPLOG" ] && [ -s "$UKU_OPLOG" ]; then
-  observed="$(LC_ALL=C sort -u "$UKU_OPLOG")"
+if [ -n "$OPLOG_MERGED" ] && [ -s "$OPLOG_MERGED" ]; then
+  observed="$(LC_ALL=C sort -u "$OPLOG_MERGED")"
   declared="$("$TESTS_DIR/../bin/uku" --dump-surface | sed -n 's/^op //p' | LC_ALL=C sort -u)"
   undeclared="$(printf '%s\n' "$observed" | LC_ALL=C comm -23 - <(printf '%s\n' "$declared"))"
   if [ -n "$undeclared" ]; then
