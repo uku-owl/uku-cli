@@ -3463,7 +3463,7 @@ _api_describe() {
     hit="$(printf '%s\n' "$all" | grep -iE "(^|[[:space:]])$1([[:space:]]|\$)" || true)"
     if [ -n "$hit" ]; then
       printf '%s\n' "$hit"
-      printf 'Whole document: uku capabilities · every path and field: %s/api/v3/openapi.json\n' "$UKU_BASE"
+      printf 'Whole document: uku capabilities · every path and field: %s/api/v3/openapi.json\n' "${UKU_BASE:-$UKU_BASE_DEFAULT}"
       return 0
     fi
     warn "no '$1' in what this server reports — the whole document follows:"
@@ -3487,7 +3487,7 @@ _api_describe_all() {
   else
     why="unreachable"
   fi
-  printf 'Uku API v3 — what this server says it offers (base: %s)\n' "$UKU_BASE"
+  printf 'Uku API v3 — what this server says it offers (base: %s)\n' "${UKU_BASE:-$UKU_BASE_DEFAULT}"
   if [ -n "$body" ] && have jq; then
     printf '%s' "$body" | jq -r '
       "  READABLE   " + (((.data.entities // {}) | to_entries | map(select(.value.read == true)) | map(.key)) | join(" ")),
@@ -3504,7 +3504,7 @@ _api_describe_all() {
     printf '  This server serves no /api/v3/capabilities, so there is nothing to\n'
     printf '  summarise here that would not be a guess.\n'
   fi
-  printf 'Authoritative for every path and field: %s/api/v3/openapi.json\n' "$UKU_BASE"
+  printf 'Authoritative for every path and field: %s/api/v3/openapi.json\n' "${UKU_BASE:-$UKU_BASE_DEFAULT}"
   printf 'Reach any endpoint: uku api <METHOD> <path> [--data @f] [--query k=v] [--yes]\n'
 }
 
