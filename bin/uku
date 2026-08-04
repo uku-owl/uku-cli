@@ -3198,13 +3198,37 @@ cmd_clients() {
     *) die "usage: uku clients <list|get|create|patch>" "$EX_USAGE" @@help.topic clients ;;
   esac
 }
+# _task_action SUB LABEL REF — POST /tasks/{id}/complete|reopen. C2.
+#
+# These take NO body, which is why they cannot go through write_resource. The
+# reason they exist at all: `patch --data '{"status":"finished"}'` reaches the
+# same column but skips finished_at, the client-portal auto-finish,
+# finished-trigger automations, the activity record and the notifications. The
+# API's own handler calls that path deprecated for completion.
+_task_action() {
+  local sub="$1" label="$2" ref="${3:-}"
+  [ -n "$ref" ] || die "usage: uku tasks $sub <task_id|title|url>" "$EX_USAGE" @@help.topic tasks
+  [ -n "${UKU_BATCH:-}" ] && die "uku tasks $sub takes one task, not --batch." "$EX_USAGE" @@help.topic tasks
+  _resolve_ref tasks "$ref" write
+  local id="$UKU_REF_ID"
+  load_creds; need_auth
+  confirm_write "$label task $id"
+  _ref_probe_now
+  do_request POST "/api/v3/tasks/$id/$sub" ""
+  check_status "$REPLY_BODY"
+  _after_write POST "/api/v3/tasks/$id/$sub" "$REPLY_BODY"
+  render "$REPLY_BODY"
+}
+
 cmd_tasks() {
   case "${1:-list}" in
     list) shift || true; parse_list_flags "$@"; list_resource /api/v3/tasks id title status client_id ;;
     get)  [ -n "${2:-}" ] || die "usage: uku tasks get <task_id|title|url>" "$EX_USAGE" @@help.topic tasks; _resolve_ref tasks "$2"; get_resource "/api/v3/tasks/$UKU_REF_ID" ;;
     create) shift || true; parse_list_flags "$@"; write_resource POST /api/v3/tasks "create a task" ;;
     patch)  [ -n "${2:-}" ] || die "usage: uku tasks patch <id|title|url> --data @f  (e.g. status/date)" "$EX_USAGE" @@help.topic tasks; _resolve_ref tasks "$2" write; local id="$UKU_REF_ID"; shift 2; parse_list_flags "$@"; write_resource PATCH "/api/v3/tasks/$id" "update task $id" ;;
-    *) die "usage: uku tasks <list|get|create|patch>" "$EX_USAGE" @@help.topic tasks ;;
+    complete) local cref="${2:-}"; shift 2 2>/dev/null || shift $# ; parse_list_flags "$@"; _task_action complete "complete" "$cref" ;;
+    reopen)   local rref="${2:-}"; shift 2 2>/dev/null || shift $# ; parse_list_flags "$@"; _task_action reopen "reopen" "$rref" ;;
+    *) die "usage: uku tasks <list|get|create|patch|complete|reopen>" "$EX_USAGE" @@help.topic tasks ;;
   esac
 }
 cmd_time() {
@@ -3699,7 +3723,7 @@ auth        |              | login status logout print-header | print-headers | 
 account     | accounts     | list add use current remove | ls switch who rm | --company --key-stdin                               | use <name> :: add <name> :: remove <name>       | `--account <name>` is a GLOBAL flag, NOT a subcommand here: `uku --account main tasks list` :: `add` is sugar for `uku auth login --account <name>` :: run `uku account current` before any write — a sandbox and the real firm look identical in the output :: `remove` deletes the account's key from the OS keyring as well as the profile file, and exits 3 if the keyring would not release it
 setup       | setup-agents | agents                  |                |                                                         |                                                 | UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
 clients     | client       | list get !create !patch |                | @list @data @bulk                                       | get <client_id> :: patch <client_id> :: get/patch also take a client NAME or a pasted URL | a write needs --yes when stdout is not a TTY (exit 4 otherwise) :: --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read :: `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks` :: on `patch`, an id-shaped argument costs one extra GET: it is checked against client NAMES too, because `12345678` and `CAFE-1` are both — `--by-id` skips the check :: `--client` is not a filter here (you are already listing clients) — use `--q`
-tasks       | task         | list get !create !patch |                | @list --client @data @bulk                              | get <task_id> :: patch <task_id> :: get/patch also take a task TITLE or a pasted URL | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from :: an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates :: `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand :: that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs :: NAME resolution never happens in a `--batch`, and never for an argument that already looks like an id — but on a WRITE an id-shaped argument is still PROBED for a record whose name is that exact string (one extra GET), and a collision is refused until `--by-id` or `--by-name` says which was meant; on a read the id-shaped argument passes straight through with no request :: a name lookup reads at most 100 records and compares `meta.total` against them: when more could exist than were examined it refuses, because a match it cannot see the alternatives to is not a unique one
+tasks       | task         | list get !create !patch !complete !reopen |                | @list --client @data @bulk                              | get <task_id> :: patch <task_id> :: complete <task_id> :: reopen <task_id> :: get/patch also take a task TITLE or a pasted URL | `create` needs `title`; status/date/client_id are optional :: a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from :: an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates :: `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand :: that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs :: NAME resolution never happens in a `--batch`, and never for an argument that already looks like an id — but on a WRITE an id-shaped argument is still PROBED for a record whose name is that exact string (one extra GET), and a collision is refused until `--by-id` or `--by-name` says which was meant; on a read the id-shaped argument passes straight through with no request :: a name lookup reads at most 100 records and compares `meta.total` against them: when more could exist than were examined it refuses, because a match it cannot see the alternatives to is not a unique one :: `complete` and `reopen` are the REAL completion path — `patch --data '{"status":"finished"}'` reaches the same column but skips finished_at, the client-portal auto-finish, finished-trigger automations, the activity record and the notifications, and the API calls it deprecated for completion :: neither takes a body, and neither is harmless on a task still in status `new`: `new` marks a recurring occurrence as untouched and therefore DELETABLE by the re-provisioning teardown, so moving the status makes that occurrence permanent. Completing or reopening a `new` task changes whether it survives regeneration
 time        |              | list get !create        |                | @list --client @data @bulk                              | get <id> :: get also takes a pasted URL (no name field here) | there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entries/<id>` :: `create` needs task_id, person_id and start :: `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending :: a time entry has no name, so `get` takes an id or a pasted URL — never a name
 invoices    | invoice      | list get !create        |                | @list --client @data @bulk                              | get <invoice_id> :: get also takes a pasted URL (no name field here) | money needs an All-scope key — a `403 … scope` is the system working as designed, do not retry around it :: there is no `uku invoices patch`; use `uku api PATCH /api/v3/invoices/<id>` :: there is no `uku invoices send` and no `uku invoices mark-paid` either — the API has both as POSTs, so use `uku api POST /api/v3/invoices/<id>/send --yes` and `uku api POST /api/v3/invoices/<id>/mark-paid --yes`. Do not guess a subcommand for a money action :: an invoice has no name field, so `get` takes an id or a pasted URL — never a name
 members     | member       | list get                |                | @list                                                   | get <id> :: get also takes a member NAME or a pasted URL | read-only in the CLI — member writes go through `uku api` :: `get` also takes a member NAME (resolved through `--q`) or a pasted URL
@@ -3862,6 +3886,8 @@ op POST /api/v3/clients
 op POST /api/v3/contracts/{id}/rows
 op POST /api/v3/invoices
 op POST /api/v3/tasks
+op POST /api/v3/tasks/{id}/complete
+op POST /api/v3/tasks/{id}/reopen
 op POST /api/v3/time-entries
 op PATCH /api/v3/clients/{id}
 op PATCH /api/v3/contracts/{id}
@@ -4554,6 +4580,14 @@ $(_bold "WRITES")  (deliberate — need a TTY or --yes; money needs an All key)
   uku time create --data @entry.json [--yes]      task_id + person_id + start; a
                                       start with no end is a TIMER, not logged work
   uku invoices create --data @invoice.json [--yes]
+  uku tasks complete <id> [--yes]                        uku tasks reopen <id> [--yes]
+                                      The real completion path. A patch to
+                                      status=finished skips finished_at, portal
+                                      sync, automations and notifications.
+                                      Not harmless on a task still in status
+                                      `new`: that marks a recurring occurrence
+                                      as disposable, and moving the status makes
+                                      it permanent.
   No patch for time or invoices — use: uku api PATCH /api/v3/<resource>/<id>
 
 $(_bold "BULK")  (one JSON object per line; one confirm for the whole file)

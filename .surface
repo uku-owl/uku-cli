@@ -20,9 +20,11 @@ arg products get also takes a product NAME or a pasted URL
 arg projects get <id>
 arg projects get also takes a project NAME or a pasted URL
 arg search <query>
+arg tasks complete <task_id>
 arg tasks get <task_id>
 arg tasks get/patch also take a task TITLE or a pasted URL
 arg tasks patch <task_id>
+arg tasks reopen <task_id>
 arg time get <id>
 arg time get also takes a pasted URL (no name field here)
 cmd account
@@ -62,8 +64,10 @@ doc api --describe
 doc clients create
 doc clients patch
 doc invoices create
+doc tasks complete
 doc tasks create
 doc tasks patch
+doc tasks reopen
 doc time create
 exit 0 ok
 exit 1 usage
@@ -306,10 +310,12 @@ note search a resource that errors is reported as FAILED, never folded into "0 r
 note setup UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
 note tasks NAME resolution never happens in a `--batch`, and never for an argument that already looks like an id — but on a WRITE an id-shaped argument is still PROBED for a record whose name is that exact string (one extra GET), and a collision is refused until `--by-id` or `--by-name` says which was meant; on a read the id-shaped argument passes straight through with no request
 note tasks `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand
+note tasks `complete` and `reopen` are the REAL completion path — `patch --data '{"status":"finished"}'` reaches the same column but skips finished_at, the client-portal auto-finish, finished-trigger automations, the activity record and the notifications, and the API calls it deprecated for completion
 note tasks `create` needs `title`; status/date/client_id are optional
 note tasks a 428 on `POST /api/v3/tasks` is NOT healed — it is a collection POST with no id to read an ETag from
 note tasks a name lookup reads at most 100 records and compares `meta.total` against them: when more could exist than were examined it refuses, because a match it cannot see the alternatives to is not a unique one
 note tasks an argument that is not id-shaped is resolved by NAME through the same `--q` a list takes: one match is used and named on stderr, several REFUSE and list the candidates
+note tasks neither takes a body, and neither is harmless on a task still in status `new`: `new` marks a recurring occurrence as untouched and therefore DELETABLE by the re-provisioning teardown, so moving the status makes that occurrence permanent. Completing or reopening a `new` task changes whether it survives regeneration
 note tasks that the endpoint HONOURS client_id is the one thing here that could not be verified offline, so it is MEASURED: any returned row whose client_id differs from the one asked for means the filter was not applied, and the command fails with exit 3 instead of handing back an unfiltered list. A row with no client_id (or a null one) proves nothing and never trips it, and `--client` refuses up front without jq because that comparison is what it needs
 note time `create` needs task_id, person_id and start
 note time `start` with no `end` is a RUNNING TIMER, not logged work — the CLI refuses duration-without-end before sending
@@ -343,6 +349,8 @@ op POST /api/v3/clients
 op POST /api/v3/contracts/{id}/rows
 op POST /api/v3/invoices
 op POST /api/v3/tasks
+op POST /api/v3/tasks/{id}/complete
+op POST /api/v3/tasks/{id}/reopen
 op POST /api/v3/time-entries
 sub account add
 sub account current
@@ -388,10 +396,12 @@ sub products list
 sub projects get
 sub projects list
 sub setup agents
+sub tasks complete
 sub tasks create
 sub tasks get
 sub tasks list
 sub tasks patch
+sub tasks reopen
 sub time create
 sub time get
 sub time list

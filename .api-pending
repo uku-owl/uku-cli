@@ -1,0 +1,20 @@
+# .api-pending — operations that are BUILT but not RELEASED.
+#
+# scripts/check-api.sh normally fails any `op` fact production does not serve,
+# because shipping one means a command that 404s for every customer. An entry
+# here says "we know, this is deliberate, it is verified against a local or
+# staging server and is waiting on the API deploy".
+#
+# Rules:
+#   * scripts/release.sh REFUSES while this file has any entry. That is the
+#     real gate — the tree may be ahead, a release may not.
+#   * an entry only counts while production genuinely lacks the operation.
+#     Listing one that has shipped is an error, not a leftover.
+#
+# Format: one verbatim `METHOD /path` line, ids written as {id}.
+
+# 2026-08-04 — Phase 4 (C2). Verified against a local API v3 server on :8890
+# (218 operations, branch `staging`): new -> finished -> in_progress observed
+# end to end. Production served 182 operations and 404s both of these.
+POST /api/v3/tasks/{id}/complete
+POST /api/v3/tasks/{id}/reopen
