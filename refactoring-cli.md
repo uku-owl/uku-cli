@@ -1,9 +1,192 @@
 # refactoring-cli.md — the implementation plan
 
-**Status:** written 2026-08-03. **Phases 0, 2 and 3 shipped** on branch
-`sec/phase0-install-chain` (unpushed, `main` untouched). Phase 1 and Phase 6 need
-CTO decisions; Phase 4 is blocked on the API deploy. Per-phase status is in each
-section header.
+**Status:** written 2026-08-03. **Phases 0, 1, 2, 3, 4 and 5 shipped** on branch
+`sec/phase0-install-chain` (**pushed** 2026-08-04; `main` untouched at `f04f500`,
+v0.6.0). **Phase 6 — the auth work — is DECIDED and NOT started: the answer is a
+Go rewrite.** Start it in a fresh session; see § 0 below.
+
+---
+
+## 0. START HERE — next session
+
+**The next piece of work is the Go rewrite.** The decision was taken 2026-08-04
+with the full argument and measurements in § 11.1. It is not provisional: the
+remaining roadmap (OAuth, signed cross-platform distribution, Windows) is exactly
+where bash is weakest, and every one of the eight bugs found on 2026-08-04 was a
+bash bug rather than a logic bug.
+
+### What the rewrite inherits, and what it must honour
+
+| | |
+|---|---|
+| **The specification** | `tests/` — **1,480 assertions**. 301 of ~324 CLI invocations `exec` the binary as a subprocess against a language-agnostic Python fixture, so a Go binary dropped at `bin/uku` is held to all of them **unchanged**. |
+| **The contract** | `.surface` — **424 facts**, including 31 `op` facts and the 10 `exit N name` codes. `scripts/check-surface.sh` ratchets it; `.surface-breaking` is the only way to deviate. |
+| **The ship gate** | `.api-released` (182 production operations) + `.api-pending` (4 built-but-undeployed). `scripts/release.sh` refuses while `.api-pending` is non-empty — verified. |
+| **PRIME DIRECTIVE** | The new binary passes the existing suite, or it does not ship. |
+
+**The one test that will NOT port as-is:** `tests/cases/update-trust.sh` greps
+`bin/uku` for `UKU_INSTALL_URL_DEFAULT` / `UKU_UPDATE_URL_DEFAULT` as literal
+source text (lines 37, 51). A compiled binary must expose those another way —
+`-ldflags` plus a hidden subcommand, or `uku --dump-surface`-style output.
+`tests/cases/signing.sh` similarly rewrites the `UKU_RELEASE_PUBKEY` heredoc in a
+copy of `bin/uku`; same treatment.
+
+### Do this early in the rewrite session
+
+**Fix the test-portability debt once, properly** — do NOT do it in bash first.
+The first remote CI run (2026-08-04, GitHub Actions, ubuntu-latest, bash 5, GNU
+coreutils) was **1443 passed / 37 failed**. The suite had only ever run on macOS
+with bash 3.2 and BSD tools. One failure was a real CLI bug and is fixed
+(`aca123f`, `UKU_BASE` unbound under `set -u`). The other 36 are harness
+assumptions:
+
+- `tests/cases/audit-log.sh` (2) — `stat -f` is "file format" on macOS and
+  "filesystem status" on Linux; the assertion received a disk-usage dump.
+- `tests/cases/doctor.sh` (1) — asserts the output contains the literal
+  `bash 3.2`.
+- `tests/cases/keyring.sh` (~33) — the stubs assume macOS `security`; Linux
+  resolves `secret-tool`.
+
+These were deliberately left red rather than fixed in bash, because the Go
+session inherits the same tests through the subprocess boundary and the work
+should be done once. **CI on this branch is red on purpose. That is an accurate
+signal, not a broken build.**
+
+### Worth asking the API team before committing to the OAuth design
+
+**Device flow** (`urn:ietf:params:oauth:grant-type:device_code`). Measured on a
+local server 2026-08-04: `grant_types_supported: ["authorization_code",
+"refresh_token"]`, and `.well-known/oauth-authorization-server` **404s**. Device
+flow removes the loopback listener, and is better UX over SSH and for headless
+agents whatever the language.
+
+### Hand-off prompt — API team, OAuth device flow
+
+Paste this into an agent working in `uku_service`. Written 2026-08-04.
+
+> **Question about API v3 OAuth: is device flow (RFC 8628) available, planned, or
+> possible?**
+>
+> Context: `uku-cli` (the public CLI over API v3, separate repo `uku-owl/uku-cli`)
+> is being rewritten and needs to replace pasted integration keys with OAuth. A
+> pasted integration key is **tenant-wide** and can carry `admin`/`financials`;
+> an OAuth-minted key is person-scoped. Today every CLI user and every AI agent
+> holds the most powerful credential the platform issues, which is the single
+> biggest remaining security gap in that client.
+>
+> **Please verify all of the following against a running server rather than
+> against my prose — I measured it from the outside and may be wrong about where
+> things live.**
+>
+> What I measured on 2026-08-04, against a local API v3 server on `127.0.0.1:8890`
+> (branch `staging`, 218 operations):
+>
+> 1. `backend/handlers/oauth_handlers.py:183` advertises
+>    `"grant_types_supported": ["authorization_code", "refresh_token"]`.
+> 2. `GET /.well-known/oauth-authorization-server` returned **404** on that
+>    server. If the metadata document is served somewhere else, tell me the
+>    actual path — a client is supposed to discover endpoints from it (RFC 8414)
+>    rather than hardcode them, and hardcoding is how clients drift.
+> 3. I found no device-authorization endpoint and no
+>    `urn:ietf:params:oauth:grant-type:device_code` handling.
+> 4. `_valid_redirect_uri` already permits plain-http **loopback**, so the
+>    authorization-code + PKCE flow needs no server change to work from a CLI.
+>
+> **The questions:**
+>
+> a. Does device flow exist anywhere I did not look, or is it genuinely absent?
+>
+> b. If absent — how much work is it to add? Roughly: a
+>    `POST /oauth/device_authorization` returning `device_code`, `user_code`,
+>    `verification_uri`, `interval` and `expires_in`; a browser page where a
+>    signed-in user enters the `user_code` and consents; and
+>    `POST /oauth/token` accepting `grant_type=urn:ietf:params:oauth:grant-type:device_code`
+>    with `authorization_pending` / `slow_down` / `expired_token` /
+>    `access_denied` responses while polling.
+>
+> c. Is there any objection to it on security or product grounds? It is a real
+>    trade — the user types a short code rather than following a redirect, so the
+>    code must be short-lived, rate-limited and bound to one client.
+>
+> d. Is the `.well-known` document intended to be public? If yes, which path?
+>
+> **Why it matters for the CLI**, so you can weigh it against other work:
+> authorization-code + PKCE requires the CLI to run a **loopback HTTP listener**
+> and hold a redirect open. That breaks in the three places this CLI is most
+> used — over SSH, on a headless box, and inside an AI agent with no browser on
+> the same machine. Device flow works in all three: print a code, the user
+> approves it anywhere, the CLI polls. It is why `basecamp/basecamp-cli` (the
+> closest comparable tool) prefers it.
+>
+> **What I need back:** a yes/no on whether it exists, a rough effort estimate if
+> not, and any objection. I am not asking for it to be built now — I need to know
+> whether to design the CLI's auth around a loopback listener or around a code,
+> and that decision is hard to reverse later.
+>
+> Also relevant while you are in there: two bugs are already filed from this
+> work — **UKU-849** (`/tasks/{id}/reopen` docstring wrongly claims a no-op for
+> status `new`; the code is correct and must not change) and **UKU-850**
+> (`/capabilities` reports `read: false` for readable resources).
+
+---
+
+---
+
+## 0.1 Everything still outstanding
+
+**Needs a person, not code:**
+
+| Item | Who / what |
+|---|---|
+| **Signing key** | `scripts/sign.sh --keygen`, then paste the public half into `bin/uku` **and** `scripts/install.sh`. The machinery is built and tamper-tested; it ships **inert** (`UKU_RELEASE_PUBKEY` empty) until this is done. Private key must not live in this repo — `--keygen` refuses to write it there. |
+| **Branch protection** | Required review on `uku-owl/uku-cli` `main`, so one stolen token is not sufficient (§ 4.4). Needs GitHub admin. |
+| **Licence** | MIT here vs the retired Python client's Proprietary. Still unresolved. |
+| **SOC 2** | `uku-cli` is in scope but absent from the asset inventory, subprocessor list and access-control matrix — same gap as `infra` and `mailbox`, plus `getuku-astro` deploy access, now a production trust root. Close together. |
+| **Local dev API key** | `api_key` id **184**, company 4, named "uku-cli-local-dev (delete me)", scopes read/write/admin/financials. Minted 2026-08-04 to verify Phase 4 against `127.0.0.1:8890`. Delete when done. |
+| **`reference/`** | Untracked in the working tree. Commit or remove. |
+
+**Needs the API deploy:**
+
+- `.api-pending` holds four operations — `POST /tasks/{id}/complete`,
+  `POST /tasks/{id}/reopen`, `GET /search`, `GET /capabilities`. All verified
+  against a local server; all 404 in production. **Emptying this file is part of
+  shipping the API release, not an afterthought** — `release.sh` refuses until it
+  is empty.
+- Re-run `scripts/check-api.sh --live` and `--update` after the deploy.
+
+**Needs a push or a release:**
+
+- **GitHub Releases** (§ 4.1) — `gh release create` with `bin/uku`,
+  `bin/uku.sha256`, `scripts/install.sh` and their `.sig` files. Measured
+  2026-08-03: `gh api repos/uku-owl/uku-cli/releases` is empty.
+- **Migrate both install URLs** (§ 4.2) to `releases/latest/download/`, and
+  repoint the `getuku.com/install-cli` redirect in lockstep. Until then the
+  release ritual in `release.sh` still prints a `curl … | shasum` check against
+  the marketing URL — deliberate, and it must move with the URLs.
+
+**Filed against `uku_service` (2026-08-04), track to closure:**
+
+- **UKU-849** — `/tasks/{id}/reopen`'s docstring wrongly calls the `new` case a
+  no-op. The CODE IS CORRECT and must not change: `status = 'new'` marks a
+  recurring occurrence as untouched and therefore destroyable by the
+  re-provisioning teardown, so any interaction must move it. Predicate:
+  `virtual_task_module.py:796`.
+- **UKU-850** — `/capabilities` reports `read: false` for `teams` and
+  `workflow-templates`, which are readable; `/mcp-usage` and `/reports/*` are
+  absent entirely. Until fixed, **no client may treat `/capabilities` as a route
+  index** — the CLI deliberately does not.
+
+**Decisions already taken, recorded so they are not re-litigated:**
+
+- **C6** — exit codes split (403→7, 400/422→8, 429→9, `MISSING_COMPANY`→2).
+  Approved by the CTO 2026-08-04 as a deliberate surface break; in
+  `.surface-breaking`.
+- **C7** — loopback cleartext warning: implemented, measured, **reverted**. See
+  § 5.5.
+- **Auto-update** — notify-only, never installs by itself (Phase 0).
+- **Bash vs Go** — **Go** (§ 11.1).
+
+---
 
 **Companion to:** `CLAUDE.md` (the handover + bug ledger). Where this file and the
 ledger disagree, **this file wins** — every claim below was measured, and § 1
@@ -1125,10 +1308,11 @@ uku-cli knowledge. Kept verbatim in this plan so the two stay in sync.
 
 ## 11. Open decisions — resolve before the phase that needs them
 
-### 11.1 Bash, or rewrite in Go? — measured 2026-08-04
+### 11.1 Bash, or rewrite in Go? — DECIDED 2026-08-04: **Go**
 
-CTO leaning: **maybe Go, time is not a constraint.** Here is the case, with the
-numbers rather than the vibes.
+**Resolved.** The CTO approved the rewrite on 2026-08-04. What follows is the
+argument that produced the decision, kept because the reasoning is what stops it
+being re-opened on a bad day. Execution notes are in § 0.
 
 #### The claim that turned out to be wrong
 

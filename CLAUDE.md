@@ -12,7 +12,29 @@ The public command-line client for Uku, over public API v3.
 
 ## Status & ownership
 
-**CTO-owned as of 2026-08-03.** Open to revision up to and including a total rewrite — language and shape are NOT settled (see § Open decisions). v0.6.0, bash + curl, `jq` optional.
+**CTO-owned as of 2026-08-03.** v0.6.0, bash + curl, `jq` optional.
+
+> ### ⚠ THE NEXT PIECE OF WORK IS A **GO REWRITE** — decided 2026-08-04
+>
+> The language question is **settled**. Do not start new feature work in bash.
+> Read [`refactoring-cli.md`](refactoring-cli.md) **§ 0 — START HERE** before
+> anything else; it carries the execution notes, everything still outstanding,
+> and a pasteable prompt for the API team about OAuth device flow.
+>
+> **State:** branch `sec/phase0-install-chain`, pushed 2026-08-04, 28 commits.
+> `main` is untouched at `f04f500` (v0.6.0). **Phases 0–5 shipped.** 1,480
+> assertions, 424 surface facts.
+>
+> **CI on that branch is RED on purpose.** The first remote run (Linux, bash 5,
+> GNU coreutils) was 1443/37. One failure was a real bug and is fixed; the other
+> 36 are macOS assumptions in the test harness (`stat -f`, a literal `bash 3.2`,
+> macOS `security` vs Linux `secret-tool`). They were left for the Go session to
+> fix **once**, since the tests port through the subprocess boundary.
+>
+> **Why Go, in one line:** the whole remaining roadmap — OAuth, signed
+> cross-platform distribution, Windows — is where bash is weakest, and every one
+> of the eight bugs found on 2026-08-04 was a bash bug, not a logic bug. The full
+> argument with measurements is `refactoring-cli.md` § 11.1.
 
 **Nothing releases until it is right.** There is no deadline pressure on this repo. Prefer the correct fix over the quick one, and say so when you defer something.
 
@@ -198,7 +220,12 @@ Note this repo already converged independently on breadcrumbs, `doctor`, profile
 
 ## Open decisions — resolve before large work
 
-1. **Stay bash, or rewrite?** Bash's cost is concentrated in OAuth (above), Windows (`bin/uku` targets bash 3.2; "Windows", "WSL", "PowerShell" appear nowhere), and static analysis. Its value is 51 commits of hard-won API archaeology, 1306 wire-level assertions, and an adversarial security audit it passed clean. **The audience is AI agents and developers**, so Windows matters less than it would for end-customers — but a rewrite would also buy signed cross-platform binaries. Decide explicitly, with the PRIME DIRECTIVE in force either way.
+1. **~~Stay bash, or rewrite?~~ RESOLVED 2026-08-04 — rewrite in Go.** Kept below
+   for the reasoning, which is what stops it being re-opened. The claim that a
+   rewrite could not reuse the suite turned out to be **false**: 301 of ~324 CLI
+   invocations exec the binary as a subprocess against a language-agnostic
+   fixture, so a Go binary at `bin/uku` inherits all 1,480 assertions unchanged.
+   Original framing: Bash's cost is concentrated in OAuth (above), Windows (`bin/uku` targets bash 3.2; "Windows", "WSL", "PowerShell" appear nowhere), and static analysis. Its value is 51 commits of hard-won API archaeology, 1306 wire-level assertions, and an adversarial security audit it passed clean. **The audience is AI agents and developers**, so Windows matters less than it would for end-customers — but a rewrite would also buy signed cross-platform binaries. Decide explicitly, with the PRIME DIRECTIVE in force either way.
 2. **Auto-update policy** — opt-in, notify-only, or signed-and-on (§ C1).
 3. **Licence** — MIT stands, but reconcile it with the platform's position.
 
@@ -216,9 +243,14 @@ Note this repo already converged independently on breadcrumbs, `doctor`, profile
 - [ ] Auth decision made and implemented — **needs the bash-vs-rewrite call first**
 - [ ] SOC 2: repo added to asset inventory, subprocessor list, access-control matrix (same gap exists for `infra` and `mailbox` — close together; **add getuku-astro deploy access**, which is now a production trust root)
 
-**Open, and needing a decision rather than an implementation:** C6 (exit-code
-break), signing key custody + branch protection, bash-vs-rewrite, licence.
-Full status per phase: [`refactoring-cli.md`](refactoring-cli.md).
+**Decided 2026-08-04:** C6 (take the break — done), C7 (implemented, measured,
+reverted), auto-update (notify-only — done), **bash-vs-rewrite (Go)**.
+
+**Still open, needing a person rather than code:** provision the signing key
+(`scripts/sign.sh --keygen` — the machinery is built and tamper-tested but ships
+inert until a key is pasted in), branch protection on `main`, the licence, and
+the SOC 2 inventory rows. Full list: [`refactoring-cli.md`](refactoring-cli.md)
+§ 0.1.
 
 ## Release context — you are ahead of production
 
