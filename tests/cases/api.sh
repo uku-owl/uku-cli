@@ -12,6 +12,18 @@ server_script <<'JSON'
       "response": {"status": 201, "body": {"data": {"id": 77}}} },
     { "method": "DELETE", "path": "/api/v3/tasks/77",
       "response": {"status": 204, "body": ""} },
+    { "method": "GET",    "path": "/api/v3/capabilities",
+      "response": {"status": 200, "body": {"data": {
+        "how_to_use": "ask here first",
+        "entities": {
+          "tasks":   {"read": true,  "create": true,  "update": true,  "delete": false},
+          "clients": {"read": true,  "create": true,  "update": true,  "delete": false},
+          "teams":   {"read": false, "create": false, "update": false, "delete": false,
+                      "unavailable_because": "use the dedicated team endpoints. Read teams with GET /teams."}
+        },
+        "curated_tools": {"search": ["search"], "reports": ["get_time_report"]},
+        "not_available": []
+      }}} },
     { "method": "HEAD",   "path": "/api/v3/members",
       "response": {"status": 200, "body": ""} }
   ]
@@ -90,14 +102,18 @@ assert_no_requests 'nothing sent'
 reset_requests
 uku api --describe
 assert_status 0 '--describe exits 0'
-assert_out_contains 'Uku API v3 — resource map' 'it prints the resource map'
-assert_out_contains '/api/v3/time-entries' 'with the endpoints on it'
-assert_no_requests '--describe is offline'
+# C13: --describe used to recite a hand-maintained map, which is how it came to
+# not know /search, /capabilities, /teams or /reports/* existed. It now ASKS the
+# server. That costs it the offline property, deliberately: the only thing it
+# could say offline was a stale claim.
+assert_out_contains 'Uku API v3 — what this server says it offers' 'it prints what the server offers'
+assert_out_contains '/api/v3/openapi.json' 'and names the authoritative document'
+assert_request_count 1 '--describe asks the server rather than reciting a map'
+assert_request 1 path /api/v3/capabilities 'and the thing it asks is /capabilities'
 
 reset_requests
 uku api --describe tasks
 assert_status 0 '--describe <resource> exits 0'
 assert_out_contains 'tasks' 'and filters to that resource'
-assert_no_requests 'still offline'
 
 finish

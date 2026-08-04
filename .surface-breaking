@@ -126,3 +126,29 @@ note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} 
 # A script that branched on the OLD codes still works for the cases it handled
 # unless it treated 2/3/5 as exhaustive. Ratcheted from now on: the codes are
 # `exit N name` facts in .surface, so the next change cannot be silent.
+
+# 2026-08-04 — C4. `uku search` became a UNION and three notes were replaced,
+# not merely reworded. The first was FALSE and is the reason this whole
+# API-anchored gate exists:
+#
+note search NOT a server-side global search — the API offers none this CLI can verify. It is ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), one request each
+note search `--limit` is per endpoint
+note search a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did
+#
+#   * the first asserted the API has no search endpoint. GET /api/v3/search
+#     exists and covers invoice, contact, supplier, contract, task, note. It is
+#     now a union: the overlap with the fan-out is `tasks` ALONE, so replacing
+#     the fan-out would have silently dropped clients — which is what someone
+#     searching "Acme" almost always means.
+#   * `--limit` is still per endpoint, but is now clamped to 20 for the
+#     server-side half, because /search 400s above that.
+#   * "a resource that errors is FAILED" still holds, with one carve-out: a 404
+#     from /search means this Uku does not serve the endpoint, which is an
+#     absence of capability, not a failed lookup. Reported as
+#     `server_search:false`, exit unchanged.
+#
+# OUTPUT SHAPE: `.kind` moves from "fanout" to "union", a `.server_search`
+# boolean is added, and `.resources[]` gains invoices/contacts/suppliers/
+# contracts/notes entries whose `.path` is /api/v3/search. Anyone selecting by
+# `.resources[].resource` still works; anyone asserting the ARRAY LENGTH, or
+# `.kind == "fanout"`, does not.

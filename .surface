@@ -4,6 +4,7 @@ arg account use <name>
 arg api </api/v3/...>
 arg api <METHOD>
 arg batch show <run-id>
+arg capabilities [rest or mcp]
 arg clients get <client_id>
 arg clients get/patch also take a client NAME or a pasted URL
 arg clients patch <client_id>
@@ -31,6 +32,7 @@ cmd account
 cmd api
 cmd auth
 cmd batch
+cmd capabilities
 cmd clients
 cmd completions
 cmd contracts
@@ -49,6 +51,7 @@ cmd time
 cmd update
 cmd version
 cmdalias account accounts
+cmdalias capabilities caps
 cmdalias clients client
 cmdalias contracts contract
 cmdalias invoices invoice
@@ -277,6 +280,10 @@ note auth the transport rule and the non-default-host line apply to `auth login`
 note auth what the keyring buys is exact — the key is not in a file this CLI writes, so whatever can read your files does not get it. It does NOT stop you, or anything running as you, from asking the keyring for it
 note batch `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
 note batch reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request
+note capabilities `uku api --describe` is the short summary of the same document
+note capabilities asks the API what a caller can do — NEEDS NO CREDENTIAL, so an agent can run it FIRST, before `uku auth login`
+note capabilities for what a path IS, read /api/v3/openapi.json
+note capabilities it is authoritative for INTENT, not for reachability: measured on a live server, `teams` and `workflow-templates` come back read:false while their own reason string explains how to read them, and /mcp-usage and /reports/* are absent entirely
 note clients --batch belongs to `create`; `uku clients list --batch` is a usage error, not a bulk read
 note clients `--client` is not a filter here (you are already listing clients) — use `--q`
 note clients `get`/`patch` also take a NAME or a pasted URL — see the `--client` note on `tasks`
@@ -304,9 +311,11 @@ note products `get` also takes a product NAME or a pasted URL
 note products read-only in the CLI; the API does accept `POST /api/v3/products` (needs `name`) — reach it with `uku api`
 note projects `get` also takes a project NAME or a pasted URL
 note projects read-only in the CLI; the API does accept `POST /api/v3/projects` (needs `name`) — reach it with `uku api`
-note search NOT a server-side global search — the API offers none this CLI can verify. It is ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), one request each
-note search `--limit` is per endpoint
-note search a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did
+note search `--limit` is per endpoint, and is clamped to 20 for the server-side half because the API refuses more
+note search a UNION of two sources: ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), plus the API's own `GET /api/v3/search` for invoices, contacts, suppliers, contracts and notes
+note search a resource that errors IS a failure, never folded into "0 results" — exit 3 when any did
+note search a server that does not serve /search is reported as `server_search:false` and is NOT a failure — the fan-out half still answered
+note search the overlap is `tasks` alone, which comes from the fan-out only, so nothing is counted twice
 note setup UKU_SETUP_AGENT=claude|cursor|codex|all|none picks the target; the default `auto` detects what is installed
 note tasks NAME resolution never happens in a `--batch`, and never for an argument that already looks like an id — but on a WRITE an id-shaped argument is still PROBED for a record whose name is that exact string (one extra GET), and a collision is refused until `--by-id` or `--by-name` says which was meant; on a read the id-shaped argument passes straight through with no request
 note tasks `--client NAME|ID` resolves the name once and sends `client_id=<id>` — the same query pair you would type by hand
@@ -324,6 +333,7 @@ note time there is NO `uku time patch` — use `uku api PATCH /api/v3/time-entri
 note update re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
 note version identical to `uku --version`
 op DELETE /api/v3/tasks/{id}
+op GET /api/v3/capabilities
 op GET /api/v3/clients
 op GET /api/v3/clients/{id}
 op GET /api/v3/contracts
@@ -337,6 +347,7 @@ op GET /api/v3/products
 op GET /api/v3/products/{id}
 op GET /api/v3/projects
 op GET /api/v3/projects/{id}
+op GET /api/v3/search
 op GET /api/v3/tasks
 op GET /api/v3/tasks/{id}
 op GET /api/v3/time-entries

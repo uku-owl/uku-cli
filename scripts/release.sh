@@ -77,6 +77,22 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'HEAD')"
     Switch branch, or state the release branch deliberately:  scripts/release.sh $VERSION --branch $BRANCH"
 info "on branch $(bold "$BRANCH")"
 
+# ── refuse to release ahead of production ─────────────────────────────
+# .api-pending lists operations the CLI calls that production does not serve
+# yet. Shipping one means a command that 404s for every customer. The tree is
+# allowed to be ahead so the work can be built and tested against a local
+# server; a RELEASE is not.
+if [ -s .api-pending ]; then
+  PENDING="$(grep -v '^[[:space:]]*\(#\|$\)' .api-pending || true)"
+  if [ -n "$PENDING" ]; then
+    printf '\n'; printf '%s\n' "$PENDING" | sed 's/^/      /'; printf '\n'
+    err "the operations above are in .api-pending — built, but not served by production.
+    Releasing would ship commands that 404 for every customer. Confirm they are
+    live (scripts/check-api.sh --live), remove them from .api-pending, and re-run."
+  fi
+fi
+info "nothing pending an API release"
+
 # A dirty tree means the tag would not describe what you tested, and the
 # checksum would be computed over a file nobody else has.
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then

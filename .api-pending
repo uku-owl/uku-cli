@@ -18,3 +18,9 @@
 # end to end. Production served 182 operations and 404s both of these.
 POST /api/v3/tasks/{id}/complete
 POST /api/v3/tasks/{id}/reopen
+
+# 2026-08-04 — Phase 4 (C4, C8/C13). Verified on the same local server:
+# /search returns six always-present category keys; /capabilities answers 200
+# with no credential at all. Both 404 in production.
+GET /api/v3/search
+GET /api/v3/capabilities

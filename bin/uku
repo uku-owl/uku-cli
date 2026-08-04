@@ -3266,18 +3266,21 @@ cmd_invoices() {
   esac
 }
 
-# ── uku search — ONE query, fanned out ───────────────────────────────
-# What this is, exactly, because the difference matters: the Uku API v3 offers
-# no global search endpoint that this CLI can verify, and inventing one is how
-# a tool starts lying. So `uku search` is the loop a person would otherwise
-# type by hand — the SAME `--q` that `uku <res> list --q` has always sent, run
-# once against each list endpoint in UKU_SEARCH_RESOURCES (the ones with a name
-# field, so a text query means something there). One request per resource, no
-# server-side join, no ranking across resources.
+# ── uku search — ONE query, a UNION of two sources ───────────────────
+# C4. This used to say "the API has no search endpoint". It has one:
+# GET /api/v3/search covers invoice, contact, supplier, contract, task, note.
+#
+# It is a UNION, not a replacement, because the overlap is `tasks` ALONE. The
+# fan-out covers clients, members, products and projects, which /search does
+# not — and "Acme" almost always means a client. Swapping one for the other
+# would silently drop the answer people actually want. `tasks` comes from the
+# fan-out and is skipped on the server side, so nothing is counted twice.
 #
 # A resource that ERRORS is reported as failed. Folding an HTTP 500 into "0
 # results" would tell the user their firm has no such client when the truth is
 # that nobody looked — the single most dangerous thing a search can do.
+# A 404 from /search is the ONE exception: it means this Uku does not serve the
+# endpoint yet, which is an absence of capability, not a failed lookup.
 cmd_search() {
   local q="" limit=10
   while [ $# -gt 0 ]; do
@@ -3330,11 +3333,63 @@ $names
 EOF
     fi
   done
-  json="{\"query\":$(_json_str "$q"),\"kind\":\"fanout\",\"resources\":[$json]}"
+  # ── the server-side half ────────────────────────────────────────
+  # /search caps `limit` at 20 per category and 400s above it, while the
+  # fan-out has no such bound — so clamp here rather than failing a query the
+  # fan-out half would have answered.
+  local slimit="$limit"
+  case "$slimit" in ''|*[!0-9]*) slimit=10 ;; esac
+  [ "$slimit" -gt 20 ] && slimit=20
+  local srv_rc=0 srv_avail=1
+  _UKU_NO_HEAL=1 UKU_SOFT=1 do_request GET "/api/v3/search$(build_query q="$q" category=all limit="$slimit")" || srv_rc=$?
+  local scat sdata scnt snames
+  if [ "$srv_rc" != "0" ]; then
+    failed=$((failed + 1))
+    json="$json,{\"resource\":\"(server search)\",\"path\":\"/api/v3/search\",\"ok\":false,\"status\":null,\"error\":$(_json_str "could not reach $UKU_BASE"),\"count\":null,\"data\":null}"
+    tty_rows="$tty_rows(server search)	FAILED — could not reach $UKU_BASE"$'\n'
+  elif [ "$REPLY_STATUS" = "404" ]; then
+    # Not a failure: this Uku predates /search. The fan-out half still answered.
+    srv_avail=0
+    json="$json,{\"resource\":\"(server search)\",\"path\":\"/api/v3/search\",\"ok\":true,\"available\":false,\"status\":404,\"error\":null,\"count\":0,\"data\":null}"
+  else
+    case "$REPLY_STATUS" in
+      2*)
+        # tasks is deliberately absent: the fan-out already searched it, and
+        # counting it twice would overstate the hits.
+        for scat in invoices contacts suppliers contracts notes; do
+          sdata="$(printf '%s' "$REPLY_BODY" | (have jq && jq -c ".data.$scat // []" 2>/dev/null || printf '[]'))"
+          [ -n "$sdata" ] || sdata="[]"
+          scnt="$(printf '%s' "$sdata" | _json_scan len -)"
+          case "$scnt" in ''|-1) scnt=0 ;; esac
+          hits=$((hits + scnt))
+          json="$json,{\"resource\":$(_json_str "$scat"),\"path\":\"/api/v3/search\",\"ok\":true,\"status\":$REPLY_STATUS,\"error\":null,\"count\":$scnt,\"data\":$sdata}"
+          tty_rows="$tty_rows$scat	$scnt"$'\n'
+          if have jq && [ "$scnt" -gt 0 ]; then
+            # No per-category name map: suppliers/contracts/notes were empty on
+            # every server measured, so their label field is unverified. Try the
+            # usual ones in order rather than assert one that may not exist.
+            snames="$(printf '%s' "$sdata" | jq -r '.[]? | "\(.id)  \(.name // .title // .invoice_number // .client_name // "-" | tostring)"' 2>/dev/null | head -n "$slimit" || true)"
+            while IFS= read -r nl; do [ -n "$nl" ] || continue; tty_rows="$tty_rows \t  $nl"$'\n'; done <<EOF
+$snames
+EOF
+          fi
+        done ;;
+      *)
+        failed=$((failed + 1))
+        json="$json,{\"resource\":\"(server search)\",\"path\":\"/api/v3/search\",\"ok\":false,\"status\":$REPLY_STATUS,\"error\":$(_json_str "HTTP $REPLY_STATUS — $(_body_msg "$REPLY_BODY" | tr '\n' ' ' | cut -c1-120)"),\"count\":null,\"data\":null}"
+        tty_rows="$tty_rows(server search)	FAILED — HTTP $REPLY_STATUS (not searched, NOT zero results)"$'\n' ;;
+    esac
+  fi
+
+  json="{\"query\":$(_json_str "$q"),\"kind\":\"union\",\"server_search\":$([ "$srv_avail" = "1" ] && printf true || printf false),\"resources\":[$json]}"
 
   local nres summary
   nres="$(printf '%s' "$UKU_SEARCH_RESOURCES" | wc -w | tr -d '[:space:]')"
-  summary="$hits match(es) for '$q' across $nres list endpoints"
+  if [ "$srv_avail" = "1" ]; then
+    summary="$hits match(es) for '$q' across $nres list endpoints + the server-side /search"
+  else
+    summary="$hits match(es) for '$q' across $nres list endpoints (this Uku has no /search)"
+  fi
   [ "$failed" -gt 0 ] && summary="$summary · $failed endpoint(s) FAILED and were not searched"
   if _wants_extras; then
     UKU_SUMMARY="$summary"
@@ -3344,7 +3399,7 @@ EOF
   elif [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then printf '%s\n' "$json"
   else
     printf '  %s %s\n' "$(_bold "search \"$q\"")" \
-      "$(_dim '— one --q per list endpoint. Not a server-side search: the API has none.')"
+      "$(_dim "$([ "$srv_avail" = "1" ] && printf -- '— one --q per list endpoint, plus the API'"'"'s own /search. Union, not a join: no ranking across resources.' || printf -- '— one --q per list endpoint. This Uku serves no /search, so only the list endpoints were searched.')")"
     printf '%s' "$tty_rows" | { have column && column -t -s "$(printf '\t')" || tr '\t' ' '; }
     have jq || warn "install jq to see the matching records, not just the counts."
     [ "$failed" -gt 0 ] && warn "$failed endpoint(s) failed — those are UNSEARCHED, not empty."
@@ -3392,32 +3447,65 @@ cmd_api() {
 _api_describe() {
   # optional resource filter: `uku api --describe tasks` prints just its lines
   if [ -n "${1:-}" ]; then
-    _api_describe_all | grep -iA1 "^  $1 " || { warn "no '$1' in the map — full map + the spec:"; _api_describe_all; }
+    # The argument becomes part of a regex, so it is checked rather than
+    # trusted — a resource name is letters, digits, dash, underscore and
+    # nothing else. (Same reasoning as the --fields and path guards.)
+    case "$1" in
+      # [:alnum:], never [A-Za-z0-9]: under et_EE.UTF-8 on bash 3.2 an explicit
+      # alpha RANGE matches everything, so `--describe tasks` was refused. Every
+      # other guard in this file already uses the class form — this is why.
+      *[![:alnum:]_-]*) die "a resource name for --describe is letters, digits, '-' and '_' only." "$EX_USAGE" @@api.describe ;;
+    esac
+    # ONE fetch, reused: the old version called _api_describe_all twice on a
+    # miss, which is two requests to say "not found".
+    local all hit
+    all="$(_api_describe_all)"
+    hit="$(printf '%s\n' "$all" | grep -iE "(^|[[:space:]])$1([[:space:]]|\$)" || true)"
+    if [ -n "$hit" ]; then
+      printf '%s\n' "$hit"
+      printf 'Whole document: uku capabilities · every path and field: %s/api/v3/openapi.json\n' "$UKU_BASE"
+      return 0
+    fi
+    warn "no '$1' in what this server reports — the whole document follows:"
+    printf '%s\n' "$all"
     return 0
   fi
   _api_describe_all
 }
 _api_describe_all() {
-  cat <<'MAP'
-Uku API v3 — resource map (base: https://app.getuku.com)
-  RESOURCE       METHODS   PATH                          POST requires (min)
-  clients        GET,POST  /api/v3/clients               name
-                 GET,PATCH,DELETE /clients/{id}
-  tasks          GET,POST  /api/v3/tasks                 title
-                 GET,PATCH,DELETE /tasks/{id}            (status,date,client_id optional)
-  time-entries   GET,POST  /api/v3/time-entries          task_id, person_id, start
-                 GET,PATCH,DELETE /time-entries/{id}     (end,duration,billable optional)
-  invoices       GET,POST  /api/v3/invoices              client_id
-                 GET,PATCH /invoices/{id} · POST /{id}/send · /{id}/mark-paid
-  members        GET       /api/v3/members
-  products       GET,POST  /api/v3/products              name
-  contracts      GET,POST  /api/v3/contracts             client_id
-  projects       GET,POST  /api/v3/projects              name
-  topics         GET,POST  /api/v3/topics · contacts GET,POST /api/v3/contacts
-  agreements     GET,POST  /api/v3/agreements · client-groups GET,POST /api/v3/client-groups
-Full spec (authoritative for every field): https://app.getuku.com/api/v3/openapi.json
-Reach any endpoint: uku api <METHOD> <path> [--data @f] [--query k=v] [--yes]
-MAP
+  # C13. This was a hand-maintained ~20-line map. It went stale and then lied
+  # confidently — it did not know /search, /capabilities, /teams,
+  # /workflow-templates, /reports/* or /mcp-usage existed. A client must never
+  # assert facts about its server, so it asks instead.
+  local body="" why="reachable"
+  # load_creds for the BASE, not for a credential — /capabilities needs none.
+  # And no blanket 2>/dev/null here: it used to hide do_request exiting the
+  # process outright, which printed nothing at all and looked like an empty map.
+  load_creds 2>/dev/null || true
+  if _UKU_NO_AUTH=1 UKU_SOFT=1 do_request GET "/api/v3/capabilities?surface=rest"; then
+    case "$REPLY_STATUS" in 2*) body="$REPLY_BODY" ;; *) why="absent" ;; esac
+  else
+    why="unreachable"
+  fi
+  printf 'Uku API v3 — what this server says it offers (base: %s)\n' "$UKU_BASE"
+  if [ -n "$body" ] && have jq; then
+    printf '%s' "$body" | jq -r '
+      "  READABLE   " + (((.data.entities // {}) | to_entries | map(select(.value.read == true)) | map(.key)) | join(" ")),
+      "  WRITABLE   " + (((.data.entities // {}) | to_entries | map(select(.value.create == true or .value.update == true)) | map(.key)) | join(" ")),
+      "  CURATED    " + (((.data.curated_tools // {}) | keys) | join(" "))' 2>/dev/null || true
+    printf '  NOTE       read:false means "use the dedicated endpoint", NOT "unreachable".\n'
+  elif [ -n "$body" ]; then
+    printf '  (install jq to summarise it, or: uku capabilities --json)\n'
+  elif [ "$why" = "unreachable" ]; then
+    printf '  Could not reach this server, so there is nothing here but the paths\n'
+    printf '  below. This command asks the API rather than reciting a built-in map,\n'
+    printf '  because the built-in map went stale and then lied.\n'
+  else
+    printf '  This server serves no /api/v3/capabilities, so there is nothing to\n'
+    printf '  summarise here that would not be a guess.\n'
+  fi
+  printf 'Authoritative for every path and field: %s/api/v3/openapi.json\n' "$UKU_BASE"
+  printf 'Reach any endpoint: uku api <METHOD> <path> [--data @f] [--query k=v] [--yes]\n'
 }
 
 # _detect_shadow — a `uku` shell function/alias shadows the binary (a subshell
@@ -3670,6 +3758,52 @@ cmd_health() {
   return "$rc"
 }
 
+# uku capabilities [rest|mcp] — what this API says a caller can do (C8/C13).
+# Unauthenticated by design, like `uku health`: an agent wants this BEFORE it
+# has a credential, and the endpoint takes no Depends() at all.
+#
+# NOT a route index, and the CLI must not present it as one. Measured against a
+# live server 2026-08-04: `teams` and `workflow-templates` come back read:false
+# while their own reason string explains how to read them, and /mcp-usage and
+# /reports/* do not appear at all. The spec is authoritative for reachability;
+# this is authoritative for INTENT. (uku_service UKU-850.)
+cmd_capabilities() {
+  load_creds 2>/dev/null || true
+  local surface="${1:-rest}"
+  case "$surface" in
+    rest|mcp) : ;;
+    *) die "usage: uku capabilities [rest|mcp]" "$EX_USAGE" @@help.topic capabilities ;;
+  esac
+  if ! _UKU_NO_AUTH=1 UKU_SOFT=1 do_request GET "/api/v3/capabilities?surface=$surface"; then
+    if [ "${UKU_AGENT:-0}" = "1" ]; then
+      _agent_error "could not reach $UKU_BASE" "$EX_NET" "$(_bc_render @@doctor)"; return "$EX_NET"
+    fi
+    die "could not reach $UKU_BASE (network error)" "$EX_NET" @@doctor
+  fi
+  case "$REPLY_STATUS" in
+    404) die "this Uku does not serve /api/v3/capabilities yet. The OpenAPI spec is always there: uku api GET /api/v3/openapi.json" "$EX_API" @@api.describe ;;
+    2*) : ;;
+    *) check_status "$REPLY_BODY" ;;
+  esac
+  if _wants_extras; then UKU_SUMMARY="capabilities ($surface) from $UKU_BASE"; fi
+  if [ "${UKU_AGENT:-0}" = "1" ] || [ "${UKU_JSON:-0}" = "1" ] || ! _is_tty; then
+    render "$REPLY_BODY"
+  else
+    info "$UKU_BASE — capabilities ($surface)"
+    if have jq; then
+      printf '%s' "$REPLY_BODY" | jq -r '
+        (.data.entities // {}) | to_entries
+        | map(select(.value.read == true))
+        | "  readable: " + (map(.key) | join(", "))' 2>/dev/null || true
+      printf '%s' "$REPLY_BODY" | jq -r '"  curated: " + ((.data.curated_tools // {}) | keys | join(", "))' 2>/dev/null || true
+      warn "read:false here means \"use the dedicated endpoint\", not \"unreachable\" — check the spec before believing an absence."
+    else
+      warn "install jq for a summary, or use --json for the whole document."
+    fi
+  fi
+  return 0
+}
+
 cmd_update() {
   local url="$UKU_INSTALL_URL"
   local self; self="$(command -v uku 2>/dev/null || printf '%s' "$0")"
@@ -3731,9 +3865,10 @@ products    | product      | list get                |                | @list   
 contracts   | contract     | list get                |                | @list --client                                          | get <id> :: get also takes a pasted URL (no name field here) | read-only in the CLI; contract rows are ETag-guarded — see `uku help api` and the 428 rules :: a contract has no name field, so `get` takes an id or a pasted URL — never a name
 projects    | project      | list get                |                | @list --client                                          | get <id> :: get also takes a project NAME or a pasted URL | read-only in the CLI; the API does accept `POST /api/v3/projects` (needs `name`) — reach it with `uku api` :: `get` also takes a project NAME or a pasted URL
 me          |              |                         |                |                                                         |                                                 | prints exactly what `uku auth status` prints — the identity behind the active key
-search      |              |                         |                | --limit                                                 | <query>                                         | NOT a server-side global search — the API offers none this CLI can verify. It is ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), one request each :: a resource that errors is reported as FAILED, never folded into "0 results" — exit 3 when any did :: `--limit` is per endpoint
+search      |              |                         |                | --limit                                                 | <query>                                         | a UNION of two sources: ONE `--q` fanned out over the list endpoints that have a name field (clients, tasks, members, products, projects), plus the API's own `GET /api/v3/search` for invoices, contacts, suppliers, contracts and notes :: the overlap is `tasks` alone, which comes from the fan-out only, so nothing is counted twice :: a server that does not serve /search is reported as `server_search:false` and is NOT a failure — the fan-out half still answered :: a resource that errors IS a failure, never folded into "0 results" — exit 3 when any did :: `--limit` is per endpoint, and is clamped to 20 for the server-side half because the API refuses more
 api         |              |                         |                | !--describe @list --client @data @bulk                  | <METHOD> :: </api/v3/...>                       | METHOD and PATH are POSITIONAL, not flags: `uku api GET /api/v3/tasks` :: `uku api --describe [resource]` prints the resource map — the fastest way for an agent to orient :: this reaches every v3 endpoint, so prefer it over dropping to curl :: `--client NAME` works on a GET whose path is one of the collections that carry a client_id; on a write it is a usage error
 batch       |              | list show               | ls             |                                                         | show <run-id>                                   | reads the LOCAL ledger under $UKU_CONFIG_HOME/batches and sends no request :: `uku batch` is not how you run a batch — that is `uku <res> create --batch @f.jsonl`
+capabilities| caps         |                         |                |                                                         | [rest or mcp]                                   | asks the API what a caller can do — NEEDS NO CREDENTIAL, so an agent can run it FIRST, before `uku auth login` :: it is authoritative for INTENT, not for reachability: measured on a live server, `teams` and `workflow-templates` come back read:false while their own reason string explains how to read them, and /mcp-usage and /reports/* are absent entirely :: for what a path IS, read /api/v3/openapi.json :: `uku api --describe` is the short summary of the same document
 health      |              |                         |                |                                                         |                                                 | asks the API if it is up — NEEDS NO CREDENTIAL, so it answers before `uku auth login` has ever run :: exits 0 up, 3 the API answered but is unwell, 5 could not be reached at all :: this is the "is it me or is it them" check; `uku doctor` is the "is it my setup" one
 doctor      |              |                         |                |                                                         |                                                 | `--json` (the global flag) gives the whole report as JSON :: exits 1 only when a REQUIRED check fails, never for a warning :: it names which credential store the active account uses — the OS keyring, the 0600 file, or the environment — which is the one thing about UKU_KEYRING worth never guessing at
 update      |              |                         |                |                                                         |                                                 | re-runs the installer for the newest RELEASE tag, checksum-verified; UKU_CHANNEL=main opts into the unverified rolling edge
@@ -3869,12 +4004,14 @@ op GET /api/v3/clients
 op GET /api/v3/clients/{id}
 op GET /api/v3/contracts
 op GET /api/v3/contracts/{id}
+op GET /api/v3/capabilities
 op GET /api/v3/health
 op GET /api/v3/invoices
 op GET /api/v3/invoices/{id}
 op GET /api/v3/members
 op GET /api/v3/members/{id}
 op GET /api/v3/products
+op GET /api/v3/search
 op GET /api/v3/products/{id}
 op GET /api/v3/projects
 op GET /api/v3/projects/{id}
@@ -4559,9 +4696,9 @@ $(_bold "FINDING A RECORD")  (you rarely have the id — see: uku help names)
                                       account's; the last id in it is the id.
   uku tasks list --client "Acme"      Resolve once, filter by client_id
   uku search "acme"                   One --q across the list endpoints that
-                                      have a name field. NOT a server-side
-                                      search — the API has none. See:
-                                      uku help search
+                                      have a name field, UNION the API's own
+                                      /search (invoices, contacts, suppliers,
+                                      contracts, notes). See: uku help search
   Singular works everywhere: uku client get 41 = uku clients get 41
 
 $(_bold "RESOURCES")  (read with any key · every one takes list [flags] and get <id>)
@@ -4599,7 +4736,9 @@ $(_bold "BULK")  (one JSON object per line; one confirm for the whole file)
   See: uku help batch
 
 $(_bold "ESCAPE HATCH")  (any endpoint in the API v3 — METHOD and PATH are positional)
-  uku api --describe [resource]       The resource map: paths + required fields
+  uku capabilities [rest|mcp]         What this API says a caller can do.
+                                      Needs no credential — run it first.
+  uku api --describe [resource]       The same document, summarised
   uku api GET  /api/v3/members --query limit=5
   uku api POST /api/v3/tasks --data @task.json --yes
 
@@ -4919,6 +5058,7 @@ case "$cmd" in
   batch)    cmd_batch "$@" ;;
   doctor)   cmd_doctor "$@" ;;
   health)   cmd_health "$@" ;;
+  capabilities|caps) cmd_capabilities "$@" ;;
   setup-agents) cmd_setup agents "$@" ;;
   update)   cmd_update "$@" ;;
   completions) cmd_completions "$@" ;;

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # search — ONE --q, fanned out over the list endpoints that have a name field.
 #
-# The two things worth pinning: it really is N independent list requests (there
-# is no server-side global search to lean on), and an endpoint that ERRORS is
-# reported as failed rather than folded into "0 results" — telling someone
-# their firm has no such client when nobody actually looked is the worst thing
-# a search can do.
+# C4: it is a UNION — the list fan-out PLUS the API's own /api/v3/search. The
+# header used to say "there is no server-side global search to lean on", which
+# was false and is the reason the drift gate is anchored to the API now.
+#
+# What is worth pinning: the request count (fan-out + one), that `tasks` is not
+# counted twice, that a server WITHOUT /search degrades instead of failing, and
+# that an endpoint which ERRORS is reported as failed rather than folded into
+# "0 results" — telling someone their firm has no such client when nobody
+# actually looked is the worst thing a search can do.
 . "$(dirname "$0")/../lib/harness.sh"
 
 setup_case
@@ -29,7 +33,7 @@ start_server
 
 note '1 — the fan-out: one request per resource, the same --q on each'
 uku search "acme" --limit 3
-assert_request_count 5 'five list endpoints, five requests'
+assert_request_count 6 'five list endpoints plus the server-side /search'
 assert_request 1 path /api/v3/clients
 assert_request 1 query 'q=acme&limit=3' 'the query is the --q a list already takes; --limit is per endpoint'
 assert_request 2 path /api/v3/tasks
@@ -72,7 +76,7 @@ JSON
 start_server
 uku search "acme"
 assert_status 0 'all five answered → exit 0'
-assert_request_count 5 'still one request each'
+assert_request_count 6 'still one request each, plus /search'
 assert_request 1 query 'q=acme&limit=10' 'the default --limit is 10, per endpoint'
 assert_out_contains '"count":1' 'each endpoint reports its own hits'
 assert_out_not_contains '"ok":false' 'nothing is marked failed'
