@@ -22,7 +22,13 @@
 # gate is against RELEASED, always, and being ahead of it is a failure.
 #
 # CHECK 1 — the ship gate (offline, runs on every PR)
-#   Every `op` fact the CLI declares must exist in .api-released.
+#   Every `op` fact the CLI declares must exist in .api-released, UNLESS it is
+#   acknowledged in .api-pending. Pending ops are built-but-not-deployed: the
+#   endpoint exists in ../uku_service and is verifiable against a local server,
+#   but production still 404s it. They are allowed in the tree so the work can
+#   be written and tested; scripts/release.sh REFUSES while any remain, so they
+#   cannot reach a customer. Emptying .api-pending is part of shipping the API
+#   release, not an afterthought.
 #
 # CHECK 2 — coverage drift (needs the network, runs daily)
 #   Production vs .api-released. New operations are reported so the CLI can
@@ -44,6 +50,7 @@ cd "$ROOT" || { printf 'cannot cd to %s\n' "$ROOT" >&2; exit 1; }
 
 UKU="${UKU_BIN:-$ROOT/bin/uku}"
 SNAPSHOT="$ROOT/.api-released"
+PENDING="$ROOT/.api-pending"
 SPEC_URL="${UKU_SPEC_URL:-https://app.getuku.com/api/v3/openapi.json}"
 LIVE=0; UPDATE=0
 for a in "$@"; do
@@ -100,11 +107,28 @@ fi
 
 [ -f "$SNAPSHOT" ] || { printf '  %s no %s — run: scripts/check-api.sh --update\n' "$(red '✗')" ".api-released"; exit 1; }
 LC_ALL=C sort -u "$SNAPSHOT" > "$TMP/released"
+: > "$TMP/pending"
+[ -f "$PENDING" ] && grep -v '^[[:space:]]*\(#\|$\)' "$PENDING" | LC_ALL=C sort -u > "$TMP/pending"
 
 # ── CHECK 1 — the ship gate ───────────────────────────────────────────
 printf '\n%s\n' "$(bold 'api: every operation the CLI calls is served in production')"
-LC_ALL=C comm -23 "$TMP/declared" "$TMP/released" > "$TMP/ahead"
+LC_ALL=C comm -23 "$TMP/declared" "$TMP/released" > "$TMP/ahead_all"
+LC_ALL=C comm -23 "$TMP/ahead_all" "$TMP/pending" > "$TMP/ahead"
 n_ahead="$(grep -c . < "$TMP/ahead" || true)"
+n_pending="$(grep -c . < "$TMP/pending" || true)"
+
+# A pending entry only counts while the operation is genuinely absent from
+# production. Listing one that HAS shipped is an error, not a harmless
+# leftover: it would pre-authorise a future op nobody reviewed. Same rule
+# .surface-breaking has.
+LC_ALL=C comm -12 "$TMP/pending" "$TMP/released" > "$TMP/stale"
+n_stale="$(grep -c . < "$TMP/stale" || true)"
+if [ "$n_stale" -gt 0 ]; then
+  printf '  %s %s pending operation(s) that production now SERVES:\n' "$(red '✗')" "$n_stale"
+  sed 's/^/      /' < "$TMP/stale"
+  printf '  They have shipped. Remove them from .api-pending.\n'
+  fail=1
+fi
 if [ "$n_ahead" -gt 0 ]; then
   printf '  %s %s operation(s) the CLI declares but production does NOT serve:\n' "$(red '✗')" "$n_ahead"
   sed 's/^/      /' < "$TMP/ahead"
@@ -113,7 +137,12 @@ if [ "$n_ahead" -gt 0 ]; then
   printf '  API release, or drop the command.\n'
   fail=1
 else
-  printf '  %s all %s declared operations are live\n' "$(green '✓')" "$n_declared"
+  printf '  %s all %s declared operations are live\n' "$(green '✓')" "$((n_declared - n_pending))"
+fi
+if [ "$n_pending" -gt 0 ]; then
+  printf '  %s %s operation(s) acknowledged in .api-pending — built, NOT released:\n' "$(dim '→')" "$n_pending"
+  sed 's/^/      /' < "$TMP/pending"
+  printf '  Not a failure here, but scripts/release.sh refuses while any remain.\n'
 fi
 
 # ── CHECK 2 — coverage drift, only with a live fetch ──────────────────

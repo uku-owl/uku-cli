@@ -1311,14 +1311,29 @@ here has been implemented, and no `op` fact was added.**
    (`task_service.py:1472-1476`, `1595-1599`) with the `ErrorResponse` shape.
 3. **`VALIDATION_ERROR` is the code at both 400 and 422.** The status is the only
    discriminator — directly relevant to C6's taxonomy (§ 5.3).
-4. **⚠ Likely API bug — `/reopen`'s docstring is false.** It claims
-   (`task_service.py:1564-1565`) that reopening an already-in-progress *or new*
-   task is a no-op 200. The guard tests `status == STATUS_IN_PROGRESS` only
-   (`task_service.py:1589`), and `STATUS_NEW != STATUS_IN_PROGRESS`
-   (`constants.py:1038-1039`). Reopening a task in status `new` therefore mutates
-   it, writes activities and fires the `task.updated` webhook. The parity suite
-   seeds `status="in_progress"` throughout, so it never covers this.
-   **→ file against `uku_service`.**
+4. **`/reopen` on a task in status `new` — the DOCSTRING is the bug, not the code.**
+   Reproduced first-hand against the local server on 2026-08-04: task 19609710
+   went `new` → `in_progress` on `POST /reopen`, HTTP 200 (restored afterwards).
+   The docstring (`task_service.py:1564-1565`) calls that case a no-op; the guard
+   at `task_service.py:1589` tests `status == STATUS_IN_PROGRESS` only, and
+   `STATUS_NEW != STATUS_IN_PROGRESS` (`constants.py:1038-1039`).
+   **Per the product owner, the behaviour is correct and must not change:** a
+   task stays `new` only until something interacts with it — a checklist item, a
+   revision, a timer (even one whose time is later deleted) all move it to
+   `in_progress`. Reopen is an interaction. So the guard must NOT be widened;
+   the docstring must be corrected and the side effects listed. The parity
+   suite's factory only ever seeds `in_progress`, so the branch is untested
+   either way. **→ filed against `uku_service`.**
+   *A CLI must therefore not treat `reopen` as safe to issue speculatively.*
+
+   **Why the transition exists, from the product owner:** recurring tasks
+   generate instances and the cleanup destroys older ones — but only ones
+   nobody has touched. `status = 'new'` is the marker for "untouched, therefore
+   disposable"; any real interaction moves it to `in_progress` and takes it out
+   of the cleanup's reach. The status is a **data-safety marker, not a progress
+   indicator**. Widening the guard would leave an interacted-with task marked
+   disposable and let the cleanup destroy a user's work.
+
 5. **`/capabilities` is not a route index.** `GET /mcp-usage` (`mcp_usage.py:24`)
    appears nowhere in it; `reports/*` only inside `curated_tools`
    (`server.py:2291`), never as an entity. Its own text concedes the OpenAPI doc
