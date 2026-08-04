@@ -30,6 +30,9 @@ EX_API=3       # API returned an error status (4xx/5xx)
 EX_CONFIRM=4   # a deliberate write was refused (no --yes, no TTY)
 EX_NET=5       # network error / could not reach the API (retry-worthy)
 EX_CONFLICT=6  # HTTP 412 — the record changed under you. Re-read, re-apply. NEVER auto-retried.
+EX_FORBIDDEN=7 # HTTP 403 — authenticated, but this key may not. Re-auth does NOT help.
+EX_VALIDATION=8 # HTTP 400/422 — the request was wrong. Change it; retrying it unchanged cannot work.
+EX_RATELIMIT=9 # HTTP 429, or a spent local budget. Wait, then retry. Distinct from 5: the API is up.
 
 # ── Small helpers ────────────────────────────────────────────────────
 _is_tty()  { [ -t 1 ]; }
@@ -681,7 +684,9 @@ _pace_write() {
   [ "$w" -gt 0 ] || return 0
   rst="$(_rl_write_reset)"
   if [ "$w" -gt "$UKU_RL_MAX_WAIT" ]; then
-    die "write rate limit is spent and does not reset for ${w}s (at $(_rl_when "$rst")). Refusing to block that long — nothing was sent. Re-run after then, or raise UKU_RL_MAX_WAIT." "$EX_NET"
+    # C6: a spent budget is a rate limit, not a network failure. Same code as a
+    # 429, because it is the same instruction: wait, then retry.
+    die "write rate limit is spent and does not reset for ${w}s (at $(_rl_when "$rst")). Refusing to block that long — nothing was sent. Re-run after then, or raise UKU_RL_MAX_WAIT." "$EX_RATELIMIT"
   fi
   warn "write rate limit spent — waiting ${w}s for the window to reset ($(_rl_when "$rst"))…"
   sleep "$w"
@@ -1390,8 +1395,9 @@ check_status() {
     2*) if [ "${UKU_AGENT:-0}" != "1" ] && [ "${UKU_SOFT:-0}" != "1" ]; then _emit_warnings "$body"; fi
         return 0 ;;
     401|403)
-      # Exit codes are the agent's API: auth/permission failures are EX_AUTH (2),
-      # distinct from a generic API error (3), so an agent knows to re-auth.
+      # C6: 401 and 403 are different instructions. 401 (EX_AUTH) means re-auth;
+      # 403 (EX_FORBIDDEN) means this key never will, so re-auth is a wasted
+      # round trip and the agent must escalate or pick another action.
       local code msg
       code="$(printf '%s' "$body" | (have jq && jq -r '.error.code // .code // empty' 2>/dev/null || true))"
       msg="$(printf '%s' "$body" | (have jq && jq -r '.error.message // .error // .message // empty' 2>/dev/null || true))"
@@ -1400,13 +1406,15 @@ check_status() {
         *[Ss][Cc][Oo][Pp][Ee]*|*[Ff][Ii][Nn][Aa][Nn][Cc][Ii][Aa][Ll]*)
           warn "$(_bold "HTTP $s") — this key can't perform that action."
           warn "Financial actions need an All-scope key; read/operate keys can't touch money."
-          _api_fail "$EX_AUTH" "HTTP $s — this key can't perform that action: financial actions need an All-scope key." "$body" @@money.key ;;
+          # A scope refusal is EX_FORBIDDEN even at 401: no amount of re-auth
+          # with THIS key adds the scope.
+          _api_fail "$EX_FORBIDDEN" "HTTP $s — this key can't perform that action: financial actions need an All-scope key." "$body" @@money.key ;;
         *)
           warn "$(_bold "HTTP $s") — ${msg:-authentication or permission denied.}  Try: uku auth status"
           # 401 is "who are you"; 403 is "not you, or not that account".
           case "$s" in
             401) _api_fail "$EX_AUTH" "HTTP $s — ${msg:-authentication failed}" "$body" @@auth.login ;;
-            *)   _api_fail "$EX_AUTH" "HTTP $s — ${msg:-permission denied}" "$body" @@auth.status ;;
+            *)   _api_fail "$EX_FORBIDDEN" "HTTP $s — ${msg:-permission denied}" "$body" @@auth.status ;;
           esac ;;
       esac ;;
     409)
@@ -1453,7 +1461,7 @@ check_status() {
         warn "$(_bold "HTTP 429") — rate limited. Wait for the window to reset before retrying."
       fi
       warn "Reads may be retried (the CLI already waits once). A WRITE must not be retried — its outcome is unknown; GET to check whether it landed before resending."
-      _api_fail "$EX_NET" "HTTP 429 — rate limited.${rlw:+ The window resets in ${rlw}s.}" "$body" @@ratelimit.wait ;;
+      _api_fail "$EX_RATELIMIT" "HTTP 429 — rate limited.${rlw:+ The window resets in ${rlw}s.}" "$body" @@ratelimit.wait ;;
     5*)
       # The remedy splits by METHOD, because the two cases are not alike. On a
       # write the outcome is genuinely unknown and the only safe next move is a
@@ -1468,7 +1476,23 @@ check_status() {
         *)
           _api_fail "$EX_API" "HTTP $s — the server failed. For a write the outcome is unknown." "$body" @@unknown.outcome ;;
       esac ;;
-    400|404|422)
+    400|422)
+      # C6: a malformed request is not a server error — retrying it unchanged
+      # cannot work, so it gets its own code. MISSING_COMPANY is the exception
+      # the ledger calls out: the API says 400, but it means "you are not
+      # configured", and an agent told "validation" retries with different data
+      # forever. It is an auth-shaped problem, so it exits 2.
+      local vcode
+      vcode="$(printf '%s' "$body" | (have jq && jq -r '.error.code // .code // empty' 2>/dev/null || true))"
+      [ -z "$vcode" ] && vcode="$body"    # no jq, or no code field: match the raw body
+      warn "$(_bold "HTTP $s") — request failed."
+      case "$vcode" in
+        *MISSING_COMPANY*|*INVALID_COMPANY*)
+          _api_fail "$EX_AUTH" "HTTP $s — $(_body_msg "$body" | tr '\n' ' ' | cut -c1-200)" "$body" @@auth.status ;;
+        *)
+          _api_fail "$EX_VALIDATION" "HTTP $s — $(_body_msg "$body" | tr '\n' ' ' | cut -c1-200)" "$body" @@api.describe ;;
+      esac ;;
+    404)
       warn "$(_bold "HTTP $s") — request failed."
       _api_fail "$EX_API" "HTTP $s — $(_body_msg "$body" | tr '\n' ' ' | cut -c1-200)" "$body" @@api.describe ;;
     *)
@@ -1799,7 +1823,8 @@ _exit_name() {
   case "$1" in
     0) printf 'ok' ;;      1) printf 'usage' ;;   2) printf 'auth' ;;
     3) printf 'api' ;;     4) printf 'confirm' ;; 5) printf 'network' ;;
-    6) printf 'conflict' ;; *) printf 'error' ;;
+    6) printf 'conflict' ;; 7) printf 'forbidden' ;; 8) printf 'validation' ;;
+    9) printf 'ratelimit' ;; *) printf 'error' ;;
   esac
 }
 
@@ -3059,7 +3084,7 @@ run_batch() {
     local w; w="$(_rl_write_wait_secs)"
     if [ "$w" -gt "$UKU_RL_MAX_WAIT" ]; then
       stopped="write rate limit spent; it resets in ${w}s (at $(_rl_when "$(_rl_write_reset)")). Stopped before line $lineno — nothing was sent for it."
-      stop_rc="$EX_NET"
+      stop_rc="$EX_RATELIMIT"   # C6: same reason as _pace_write — wait, then --resume
       break
     fi
 
@@ -3765,7 +3790,29 @@ _surface_emit() {
 $(_surface_table)
 EOF
   _surface_ops
+  _surface_exits
   return 0
+}
+
+# ── the exit-code contract ───────────────────────────────────────────
+# Exit codes are the agent's control flow, so they are surface — but until C6
+# nothing declared them, which is why the taxonomy could be changed without
+# check-surface.sh noticing. One `exit N name` fact per code; _exit_name is the
+# implementation of the same table and tests/cases/exit-codes.sh proves each
+# one is reachable.
+_surface_exits() {
+  cat <<'EXITS'
+exit 0 ok
+exit 1 usage
+exit 2 auth
+exit 3 api
+exit 4 confirm
+exit 5 network
+exit 6 conflict
+exit 7 forbidden
+exit 8 validation
+exit 9 ratelimit
+EXITS
 }
 
 # ── the API operations this CLI calls (Phase 3) ──────────────────────
@@ -3932,7 +3979,7 @@ EOF
   done
   printf '],"global_flags":%s' "$(_json_arr_words "$(_surface_facts | awk '$1=="gflag" { printf "%s ", $2 }')")"
   printf ',"notes":%s' "$(_json_arr_lines "$(_surface_rest note '%global')")"
-  printf ',"exit_codes":{"0":"ok","1":"usage","2":"auth","3":"api","4":"confirm","5":"network","6":"conflict"}}\n'
+  printf ',"exit_codes":{"0":"ok","1":"usage","2":"auth","3":"api","4":"confirm","5":"network","6":"conflict","7":"forbidden","8":"validation","9":"ratelimit"}}\n'
   return 0
 }
 
@@ -4215,7 +4262,8 @@ description: Operate a firm's Uku (accounting practice management) from the term
 
 ## Output & exit codes (this is your API)
 - `--json` is the default when output is not a TTY — you already receive JSON. Lists wrap as `{ "data": [ … ], "meta": { "total", "limit", "offset", "has_more", "next_cursor" } }`; a single get wraps as `{ "data": { … } }`. Parse `.data`.
-- Exit codes: **0** ok · **1** usage · **2** auth (tell the user to run `uku auth login`) · **3** API error · **4** a write was refused because `--yes` was missing · **5** network / rate limited · **6** conflict: someone else changed the record (HTTP 412).
+- Exit codes — each one is a different next move, so branch on them rather than reading the message:
+  **0** ok · **1** usage · **2** auth: re-auth (`uku auth login`) · **3** API error (404/5xx) · **4** a write was refused because `--yes` was missing · **5** could not reach the API — retry-worthy · **6** conflict: someone else changed the record (HTTP 412) · **7** forbidden: authenticated, but this key may not — **re-auth will not help**, surface it · **8** validation: the request was wrong — change it, do not resend it unchanged · **9** rate limited — wait for the reset, then retry.
 
 ### `--agent` — ask for the envelope
 `--json` is the raw API body and never changes. `--agent` is the channel built for you; the two are alternatives, and passing both is a usage error.
@@ -4227,7 +4275,7 @@ uku clients list --limit 2 --agent
  "breadcrumbs":[{"cmd":"uku clients get 41","why":"that client in full"}]}
 ```
 - `data` and `meta` are the API's own values, spliced out of its body — the same values `--json` gives you. The one exception is `--fields`, which projects each row to the keys you named and re-serialises it through jq; ask for `--fields` and you are asking for a reshaped `.data`.
-- On failure: `{"ok":false,"error":"…","code":"auth","hint":"uku auth login"}` — and **the exit code is unchanged**. `code` is the stable name of the exit status (`usage` `auth` `api` `confirm` `network` `conflict`), so branch on either.
+- On failure: `{"ok":false,"error":"…","code":"auth","hint":"uku auth login"}` — and **the exit code is unchanged**. `code` is the stable name of the exit status (`usage` `auth` `api` `confirm` `network` `conflict` `forbidden` `validation` `ratelimit`), so branch on either.
 - `breadcrumbs` are the commands most plausibly next, with real ids already filled in. They are checked against the CLI's own command surface at build time, so a breadcrumb never names a command that does not exist. That is all it proves: a breadcrumb may still be a WRITE (`uku clients get 41` suggests `uku clients patch 41`), and a write always needs the same treatment as any other — state what it would change and let the human confirm before you add `--yes`. Read the command before you run it. `--no-hints` or `--quiet` empties the array.
 - A `--batch` run keeps its JSONL-per-line output under `--agent`: that stream is already the machine contract, and one envelope could not describe N independent outcomes. So there is **no `{"ok":…}` envelope at all** for a batch — including on failure, where the run exits **3** and the per-line objects are the only report. Parse the lines, not an envelope.
 

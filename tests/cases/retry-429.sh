@@ -61,7 +61,7 @@ JSON
 start_server
 
 uku clients list
-assert_status 5 'a read that stays rate limited is exit 5'
+assert_status 9 'a read that stays rate limited is exit 9 (rate limited, not unreachable)'
 assert_request_count 2 'the wait-and-retry happens once, and only once — no loop'
 assert_err_contains 'HTTP 429' 'and the rate limit is reported to the caller'
 teardown_case
@@ -81,7 +81,7 @@ JSON
 start_server
 
 uku api POST /api/v3/tasks --data '{"title":"x"}' --yes
-assert_status 5 'a 429 on a write is exit 5 (network / retry-later)'
+assert_status 9 'a 429 on a write is exit 9 — the API answered, so this is not exit 5'
 assert_request_count 1 'the write was sent exactly once and never retried'
 assert_err_contains 'HTTP 429' 'the rate limit is named'
 assert_err_contains 'A WRITE must not be retried' 'the message states the doctrine'
@@ -92,7 +92,7 @@ assert_err_contains 'GET to check whether it landed' 'and tells the caller what 
 # 0s the CLI must refuse to block — and send nothing.
 reset_requests
 UKU_RL_MAX_WAIT=0 uku api POST /api/v3/tasks --data '{"title":"y"}' --yes
-assert_status 5 'a spent write budget beyond the wait cap is refused'
+assert_status 9 'a spent write budget beyond the wait cap is refused'
 assert_err_contains 'Refusing to block that long' 'it says it refused rather than blocked'
 assert_err_contains 'nothing was sent' 'and that nothing was sent'
 assert_no_requests 'the paced write really did send nothing'

@@ -99,3 +99,30 @@ note %global `--agent` wraps the response in {ok,data,meta,summary,breadcrumbs} 
 # rather than merely true today, and the payload names it in a `more` field so
 # an agent reading top-to-bottom learns there is more before it consumes
 # twenty command cards.
+
+# 2026-08-04 — C6. The exit-code TAXONOMY changed. Nothing was removed from
+# .surface (the codes were not declared there until today — that was the bug
+# that let this change be invisible to the ratchet), so there is no verbatim
+# line to paste. This entry is the record instead, and it is a real break:
+#
+#   HTTP 403        exit 2 (auth)       -> exit 7 (forbidden)
+#   HTTP 400/422    exit 3 (api)        -> exit 8 (validation)
+#   HTTP 429        exit 5 (network)    -> exit 9 (ratelimit)
+#   spent local write budget, single and --batch
+#                   exit 5 (network)    -> exit 9 (ratelimit)
+#   MISSING_COMPANY / INVALID_COMPANY (an HTTP 400)
+#                   exit 3 (api)        -> exit 2 (auth)
+#
+# In the --agent envelope the `code` field moves with them: "auth" ->
+# "forbidden" on a 403, "api" -> "validation" on a 400/422.
+#
+# Why, given the PRIME DIRECTIVE: agents branch on $?. Collapsed, exit 2 told an
+# agent to re-authenticate when the key was fine and merely lacked a scope, and
+# exit 3 told it "your data was wrong" for MISSING_COMPANY — so it retried with
+# different data forever. Exit 5 meant "retry now" for a rate limit, where the
+# right move is to wait for the reset. Every one of those is a wrong next action
+# a script cannot recover from by reading prose.
+#
+# A script that branched on the OLD codes still works for the cases it handled
+# unless it treated 2/3/5 as exhaustive. Ratcheted from now on: the codes are
+# `exit N name` facts in .surface, so the next change cannot be silent.

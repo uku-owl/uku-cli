@@ -84,7 +84,7 @@ assert_err_contains '→ run: uku help tasks' 'and the remedy is where the requi
 
 reset_requests
 uku invoices create --data '{"client_id":1}' --yes
-assert_status 2 'a 403 on money is exit 2'
+assert_status 7 'a 403 on money is exit 7 (forbidden) — re-auth cannot fix a scope'
 assert_err_contains 'All-scope key' 'the remedy names the key that would work'
 assert_err_contains '→ ' 'and it is rendered as a remedy line'
 
@@ -231,8 +231,8 @@ assert_equals "$(jqx hint)" 'uku help' 'and the hint is in the envelope, not onl
 
 reset_requests
 uku invoices create --data '{"client_id":1}' --yes --agent
-assert_status 2 'a 403 is still exit 2'
-assert_equals "$(jqx code)" 'auth' 'code auth'
+assert_status 7 'a 403 is exit 7 under --agent too'
+assert_equals "$(jqx code)" 'forbidden' 'code forbidden — not auth, so an agent does not re-login'
 assert_out_contains 'All-scope key' 'the hint says which key would work'
 
 reset_requests

@@ -174,7 +174,7 @@ printf '{"title":"%s"}\n' "$PII" > "$CASE_DIR/lines.jsonl"
 printf 'limit=10\nremaining=0\nreset=%s\ntier=write\n' "$(( $(date +%s) + 9999 ))" \
   > "$UKU_CONFIG_HOME/ratelimit-env-write"
 uku tasks create --batch @"$CASE_DIR/lines.jsonl" --yes
-assert_status 5 'a spent write budget refuses rather than blocks'
+assert_status 9 'a spent write budget refuses rather than blocks'
 assert_err_contains 'write rate limit spent' 'and says why'
 assert_no_requests 'nothing was sent'
 assert_tmpdir_empty 'the refusal leaves no batch input behind'
@@ -196,7 +196,7 @@ JSON
 stop_server
 start_server
 uku clients list
-assert_status 2 'a 403 exits 2 (auth), the one failure path that was always clean'
+assert_status 7 'a 403 exits 7 (forbidden), the one failure path that was always clean'
 assert_tmpdir_empty 'and leaves nothing behind'
 assert_no_file_contains "$TEST_API_KEY" 'no key on disk after an API error'
 

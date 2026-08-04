@@ -65,6 +65,16 @@ doc invoices create
 doc tasks create
 doc tasks patch
 doc time create
+exit 0 ok
+exit 1 usage
+exit 2 auth
+exit 3 api
+exit 4 confirm
+exit 5 network
+exit 6 conflict
+exit 7 forbidden
+exit 8 validation
+exit 9 ratelimit
 flag account --company
 flag account --key-stdin
 flag api --all

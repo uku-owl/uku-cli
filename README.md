@@ -395,7 +395,7 @@ uku invoices create --data @march.json --yes --agent; echo "exit $?"
 ```json
 {"ok":false,
  "error":"HTTP 403 — this key can't perform that action: financial actions need an All-scope key.",
- "code":"auth",
+ "code":"forbidden",
  "hint":"this needs an All-scope key — create one in Uku (Settings, API), then sign in again with: uku auth login"}
 ```
 ```
@@ -447,13 +447,22 @@ help text into its context.
 
 | code | meaning |
 |------|---------|
-| `0`  | success |
-| `1`  | usage error / unknown command |
-| `2`  | not authenticated / credentials rejected |
-| `3`  | the API returned an error status (4xx/5xx) |
-| `4`  | a deliberate write was refused (no `--yes`, no TTY) |
-| `5`  | network error, or rate limited (HTTP 429); a `--batch` stopped on the rate limit |
-| `6`  | conflict — someone else changed the record (HTTP 412). Re-read and re-apply. |
+| code | meaning | what to do next |
+|------|---------|-----------------|
+| `0`  | success | — |
+| `1`  | usage error / unknown command | fix the command line |
+| `2`  | not authenticated, credentials rejected, or no company selected | `uku auth login` |
+| `3`  | the API returned an error status (404, 5xx, 409, 428) | read the message |
+| `4`  | a deliberate write was refused (no `--yes`, no TTY) | re-run with `--yes` |
+| `5`  | could not reach the API | retry; it is a transport failure |
+| `6`  | conflict — someone else changed the record (HTTP 412) | re-read, re-apply, write again |
+| `7`  | forbidden — authenticated, but this key may not (HTTP 403, scope) | **do not re-auth**; surface it |
+| `8`  | validation — the request was wrong (HTTP 400/422) | change the request; resending it unchanged cannot work |
+| `9`  | rate limited (HTTP 429, or a spent local write budget) | wait for the reset, then retry |
+
+`2` and `7` were one code until v0.7.0, as were `5` and `9`, and `8` was folded
+into `3`. See [`.surface-breaking`](.surface-breaking) — this is the one
+deliberate break in the CLI's contract.
 
 ## Concurrency: version checks (If-Match / ETag)
 
