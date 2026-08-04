@@ -1125,26 +1125,107 @@ uku-cli knowledge. Kept verbatim in this plan so the two stay in sync.
 
 ## 11. Open decisions — resolve before the phase that needs them
 
-### 11.1 Bash, or rewrite? — needed before Phase 6
+### 11.1 Bash, or rewrite in Go? — measured 2026-08-04
 
-**Keep bash if** the audience really is agents + developers on Unix. Bash's costs
-are Windows (`bin/uku` targets bash 3.2; "Windows"/"WSL"/"PowerShell" appear
-nowhere), static analysis, and OAuth. Its value is 51 commits of hard-won API
-archaeology, ~1000+ wire-level assertions against a real fixture server, and an
-adversarial security audit passed clean.
+CTO leaning: **maybe Go, time is not a constraint.** Here is the case, with the
+numbers rather than the vibes.
 
-**Rewrite if** signed cross-platform binaries and clean OAuth matter more than
-that suite. Note the suite is portable in spirit but not in code — a rewrite must
-pass the *existing behavioural tests*, which are bash harness + Python fixture
-server. That is a real port, not a copy.
+#### The claim that turned out to be wrong
 
-Bash 3.2 compatibility is genuinely maintained today, not merely claimed — no
-associative arrays, no `mapfile`, no `${var,,}`, hand-written `_ver_gt` and
-`_urlencode` (`bin/uku:4372`, `bin/uku:1145`). Whoever rewrites should know that
-discipline was real and is worth preserving in whatever replaces it.
+The old text here said the suite "is portable in spirit but not in code — a
+rewrite must pass the existing behavioural tests, which are bash harness +
+Python fixture server. That is a real port, not a copy." **Measured, that is
+false.** The harness drives the CLI as a **subprocess** — 301 `uku …`
+invocations, 18 `uku_stdin`, 5 `uku_tty`, all of which exec `$UKU_BIN` and
+assert on stdout/stderr/exit status and on what reached the fixture server. The
+fixture is a language-agnostic HTTP server.
 
-**Phases 0-3 are worth doing under either answer** — they are security, gates and
-correctness, not architecture. Decide before Phase 6, not before Phase 0.
+**A Go binary dropped at `bin/uku` would be held to all 1,410 assertions
+unchanged.** One case needs a different technique: `update-trust.sh` greps
+`bin/uku` for `UKU_INSTALL_URL_DEFAULT` / `UKU_UPDATE_URL_DEFAULT` as literal
+source text (`tests/cases/update-trust.sh:37,51`), which a compiled binary would
+have to expose some other way. Three cases use `--dump-surface`, but that is a
+published command, not an internal.
+
+This inverts the strongest argument for staying: the 51 commits of API
+archaeology are **not** locked in the bash. They are in the tests, the `.surface`
+table (403 facts) and `.api-released`, all of which survive a rewrite intact.
+The PRIME DIRECTIVE is enforceable against a Go binary on day one.
+
+#### What Go actually buys
+
+1. **OAuth, which is the real blocker.** Measured against the running local
+   server: `grant_types_supported: ["authorization_code", "refresh_token"]`
+   (`oauth_handlers.py:183`) and **no device-authorization endpoint** — the
+   `.well-known` document 404s. So the "device flow avoids the loopback
+   listener" escape hatch does **not** exist today. A CLI login needs PKCE S256
+   (SHA-256 + base64url), a **loopback HTTP listener**, JSON token parsing, and
+   atomic persistence of a rotating refresh pair with reuse detection. In bash
+   that is `python3` for three of the four, which contradicts the whole
+   "curl + bash, jq optional" premise. In Go it is standard library.
+2. **Distribution — the unfixed half of C1.** Phase 0 stopped the CLI installing
+   things by itself, but `curl | sh` is still the only channel. Go gives signed,
+   attested release binaries via Homebrew, Scoop, deb/rpm/apk, AUR and Nix, and
+   makes signing natural rather than bolted on. This is the single biggest
+   security improvement still available.
+3. **A whole bug class stops existing.** `curl -K` config files exist only
+   because argv is world-readable; they are why the key reaches the filesystem
+   at all, and `tests/cases/no-residue.sh` exists solely to police the cleanup.
+   In Go the credential goes in a header on an in-process request and never
+   touches disk. C9 (`..` traversal), C10 (unquoted `--fields` glob) and the
+   `IFS` hazards are likewise not expressible.
+4. **Static analysis.** shellcheck at severity `warning` versus a type system
+   plus `go vet` / `staticcheck`.
+5. **Concurrency.** The search fan-out is 5 sequential curls. Go does them at
+   once — a real latency win on the surface agents use most.
+6. **jq stops being a branch.** Every "without jq it warns instead" path
+   disappears, along with the matrix of tests covering them.
+7. **Windows.** Currently absent from the repo entirely.
+
+#### What it costs
+
+1. **Auditability, which is a genuine product claim.** "It is one bash file, read
+   it yourself" is worth something for a public CLI holding an accounting firm's
+   tenant-wide key. A binary is opaque; the answer is reproducible builds plus
+   signing, which is *more* trustworthy for most users but not for the ones who
+   currently read the script.
+2. **Release machinery.** Cross-compile matrix, signing key custody (already an
+   open decision), macOS notarisation/Gatekeeper, a Homebrew tap to maintain.
+3. **Two implementations, or a freeze.** Whichever way, there is a window where
+   the bash is frozen. Two CLIs is the state this project has already been in
+   once and correctly called "the worst state" (`reference/python-client/`).
+4. **Scale.** 4,894 lines, 192 functions, ~30 commands. Weeks, not days.
+5. **Drift the tests do not cover.** 1,410 assertions and 403 surface facts is a
+   lot, not everything.
+6. **bash 3.2 discipline is real and maintained** — no associative arrays, no
+   `mapfile`, hand-written `_ver_gt` and `_urlencode`. That care should carry
+   over rather than be discarded as legacy.
+
+#### Recommendation — sequence it, do not choose between them
+
+**Finish Phase 4 in bash first, then rewrite in Go.** Reasons:
+
+- Phase 4 is now **unblocked** (the API runs locally on `:8890`, 218 operations,
+  all four endpoints live). It is small: two task commands, a search union, and
+  `capabilities`. Doing it in bash costs days, not weeks.
+- Rewriting while the surface is still moving means porting a moving target and
+  paying for every change twice. After Phase 4 the surface is stable, and
+  `.surface` + the suite become a **frozen, executable specification** — which is
+  the best possible starting condition for a rewrite, and one this repo is almost
+  unique in having.
+- The rewrite then delivers Phase 6 (OAuth) and Phase 1 (signed distribution)
+  together, which is where Go earns its cost. Doing OAuth in bash first would be
+  work thrown away.
+
+**A third option worth pricing before committing:** ask the API to add
+**device flow** (`urn:ietf:params:oauth:grant-type:device_code`). It is modest
+server-side work, and it removes the loopback listener — the single hardest part
+of OAuth in bash — while also being the better UX over SSH and in headless
+agent environments. If that lands, "stay bash" becomes materially more viable
+and the decision should be re-taken.
+
+**Phases 0-3 were worth doing under either answer** — security, gates and
+correctness, not architecture. They are done, and they carry over.
 
 ### 11.2 Auto-update — opt-in, notify-only, or signed-and-on? (Phase 0)
 
