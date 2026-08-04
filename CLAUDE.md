@@ -165,6 +165,19 @@ Why it matters: a pasted *integration* key is **tenant-wide** and can carry `adm
 
 **Be honest about the cost in bash:** PKCE S256 needs SHA-256 + base64url, the flow needs a loopback HTTP listener, and the token exchange needs JSON parsing — in a tool whose selling point is bash + curl with `jq` optional. Shelling out to `python3` is pragmatic but dents the zero-dependency claim. This is the single strongest argument for a rewrite; weigh it honestly rather than forcing it.
 
+### Answered by the API team, 2026-08-04 — read `refactoring-cli.md` § 0 and § 9 before writing auth code
+
+Four things that change the design, all re-measured here:
+
+- **Discovery lives on the APP host, not api-v3.** `/.well-known/oauth-authorization-server` is 200 on `:8885`/`:8886` and 404 on `:8890`, because `oauth_handlers.py` registers via `tornroutes`, not FastAPI. An earlier note in this repo called it a 404 — that was a wrong-host probe, now corrected.
+- **Device flow does not exist.** A few days of API work, no blocking objection. Build the Go auth layer grant-agnostic so it is one branch later, not a rewrite.
+- **Device flow will be allow-listed to first-party `client_id`s**, because it removes the redirect host that the consent page's anti-phishing story depends on. So this CLI pins a `client_id` and never calls `/oauth/register`. That is not a drift violation — a `client_id` is a fact about the *client*, and endpoints still come from `.well-known`.
+- **Production 403s both `.well-known` documents** (`infra/.../block-scanners.conf:45` whitelists only acme-challenge; staging has the fix). OAuth cannot work in production until that is backported. Not this repo's to fix.
+
+Also: `scopes_supported` is `["read","write"]` — `financials` cannot be *requested* but can still be *granted* via the consent checkbox, and re-checked at every refresh. Read the granted scope from the token response, never from what was asked.
+
+**The drift gate is blind here.** `check-api.sh` reads `/api/v3/openapi.json`, which structurally cannot contain Tornado-served OAuth routes — so an `op` fact for one fails forever, and `.api-pending` deadlocks `release.sh`. Resolve before declaring any OAuth operation (`refactoring-cli.md` § 6.2.1).
+
 Also note the API now issues **refresh tokens** (24h access, 90d rotating refresh, with reuse detection that revokes the whole family). If you implement OAuth: persist the rotated pair atomically, never send a refresh token twice, and refuse to use a credential against an origin other than the one it was minted for.
 
 ---

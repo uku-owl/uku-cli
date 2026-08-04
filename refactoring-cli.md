@@ -52,81 +52,101 @@ session inherits the same tests through the subprocess boundary and the work
 should be done once. **CI on this branch is red on purpose. That is an accurate
 signal, not a broken build.**
 
-### Worth asking the API team before committing to the OAuth design
+### The API team's OAuth answers — ASKED AND ANSWERED 2026-08-04
 
-**Device flow** (`urn:ietf:params:oauth:grant-type:device_code`). Measured on a
-local server 2026-08-04: `grant_types_supported: ["authorization_code",
-"refresh_token"]`, and `.well-known/oauth-authorization-server` **404s**. Device
-flow removes the loopback listener, and is better UX over SSH and for headless
-agents whatever the language.
+The device-flow question was put to an agent in `uku_service` and came back
+answered. Each answer is kept next to its question, because an answer without
+its question reads as an unsourced assertion — the exact failure this repo
+guards against. **Every claim below was then re-measured here**; the one that
+was wrong was mine.
 
-### Hand-off prompt — API team, OAuth device flow
+**a. Does device flow exist?** No. Genuinely absent — zero matches for
+`device_code`, `device_authorization` or the grant URN across all six repos. The
+metadata is truthful: `authorization_code` + `refresh_token` are the only
+grants.
 
-Paste this into an agent working in `uku_service`. Written 2026-08-04.
+**d. Is `.well-known` public, and where?** Public, unauthenticated,
+`Cache-Control: public, max-age=300`. **My 404 was a wrong-host artifact** — the
+document is served by the main Tornado app, never by api-v3, because
+`oauth_handlers.py` registers via `tornroutes` on the app rather than as a
+FastAPI route. Re-measured here 2026-08-04:
 
-> **Question about API v3 OAuth: is device flow (RFC 8628) available, planned, or
-> possible?**
->
-> Context: `uku-cli` (the public CLI over API v3, separate repo `uku-owl/uku-cli`)
-> is being rewritten and needs to replace pasted integration keys with OAuth. A
-> pasted integration key is **tenant-wide** and can carry `admin`/`financials`;
-> an OAuth-minted key is person-scoped. Today every CLI user and every AI agent
-> holds the most powerful credential the platform issues, which is the single
-> biggest remaining security gap in that client.
->
-> **Please verify all of the following against a running server rather than
-> against my prose — I measured it from the outside and may be wrong about where
-> things live.**
->
-> What I measured on 2026-08-04, against a local API v3 server on `127.0.0.1:8890`
-> (branch `staging`, 218 operations):
->
-> 1. `backend/handlers/oauth_handlers.py:183` advertises
->    `"grant_types_supported": ["authorization_code", "refresh_token"]`.
-> 2. `GET /.well-known/oauth-authorization-server` returned **404** on that
->    server. If the metadata document is served somewhere else, tell me the
->    actual path — a client is supposed to discover endpoints from it (RFC 8414)
->    rather than hardcode them, and hardcoding is how clients drift.
-> 3. I found no device-authorization endpoint and no
->    `urn:ietf:params:oauth:grant-type:device_code` handling.
-> 4. `_valid_redirect_uri` already permits plain-http **loopback**, so the
->    authorization-code + PKCE flow needs no server change to work from a CLI.
->
-> **The questions:**
->
-> a. Does device flow exist anywhere I did not look, or is it genuinely absent?
->
-> b. If absent — how much work is it to add? Roughly: a
->    `POST /oauth/device_authorization` returning `device_code`, `user_code`,
->    `verification_uri`, `interval` and `expires_in`; a browser page where a
->    signed-in user enters the `user_code` and consents; and
->    `POST /oauth/token` accepting `grant_type=urn:ietf:params:oauth:grant-type:device_code`
->    with `authorization_pending` / `slow_down` / `expired_token` /
->    `access_denied` responses while polling.
->
-> c. Is there any objection to it on security or product grounds? It is a real
->    trade — the user types a short code rather than following a redirect, so the
->    code must be short-lived, rate-limited and bound to one client.
->
-> d. Is the `.well-known` document intended to be public? If yes, which path?
->
-> **Why it matters for the CLI**, so you can weigh it against other work:
-> authorization-code + PKCE requires the CLI to run a **loopback HTTP listener**
-> and hold a redirect open. That breaks in the three places this CLI is most
-> used — over SSH, on a headless box, and inside an AI agent with no browser on
-> the same machine. Device flow works in all three: print a code, the user
-> approves it anywhere, the CLI polls. It is why `basecamp/basecamp-cli` (the
-> closest comparable tool) prefers it.
->
-> **What I need back:** a yes/no on whether it exists, a rough effort estimate if
-> not, and any objection. I am not asking for it to be built now — I need to know
-> whether to design the CLI's auth around a loopback listener or around a code,
-> and that decision is hard to reverse later.
->
-> Also relevant while you are in there: two bugs are already filed from this
-> work — **UKU-849** (`/tasks/{id}/reopen` docstring wrongly claims a no-op for
-> status `new`; the code is correct and must not change) and **UKU-850**
-> (`/capabilities` reports `read: false` for readable resources).
+```
+https://127.0.0.1:8886/.well-known/oauth-authorization-server   200
+http://127.0.0.1:8885/.well-known/oauth-authorization-server    200
+http://127.0.0.1:8890/.well-known/oauth-authorization-server    404   <- my probe
+```
+
+Paths: `/.well-known/oauth-authorization-server` (RFC 8414),
+`/.well-known/oauth-protected-resource` (RFC 9728), and an `/mcp`-suffixed
+variant of each for SDKs that probe by path insertion — all four served 200
+locally. **Fetch discovery from the app base URL, not the api-v3 origin.**
+
+**b. Effort if added.** ~80% of the parts exist — `_mint_access_key`,
+`_issue_refresh_token`, `_effective_scopes`, `_token_response`, `_hash_code`,
+the consent shell with its company picker and financials checkbox, the Redis
+per-IP limiter, and `oauth_authorization_code` as a table template. Genuinely
+new: a device-code table, the `user_code` entry page, the polling branch with
+`authorization_pending`/`slow_down`/`expired_token`/`access_denied`, and
+brute-force limits on a ~20-bit `user_code` (needs both a per-code attempt cap
+and a global one). A few days, mostly consent page and abuse limits rather than
+protocol.
+
+**c. Objection — and it changes the CLI's design.** No blocking objection, but
+one that propagates: the consent page's whole trust story is *"trust the address
+above, not the name"*, because `client_name` is attacker-controlled free text
+from an unauthenticated `/oauth/register`. Device flow deletes that anchor — no
+redirect host means the page has nothing verifiable to say about who is asking,
+while training users to type codes from elsewhere into it. That is RFC 8628 §5.4
+remote phishing with the mitigation removed.
+
+Their recommendation, which this plan adopts: **device flow only for
+allow-listed first-party `client_id`s, never for dynamically-registered
+clients**, and `financials` barred over device flow entirely. Consequences for
+this CLI are in § 9.
+
+**Security premise confirmed, and worth leading the rewrite with.** OAuth tokens
+are real `api_key` rows: `kind='personal'`, person-scoped, `auth_type='oauth2'`,
+revocable in Settings → API Keys. They can **never** carry `admin` —
+`_granted_scopes` whitelists by exact canonical string and fails closed to
+`["read","write"]`, deliberately, because `/oauth/register` is unauthenticated
+and a pre-consent row can hold attacker-chosen scope text. `financials` only via
+the consent checkbox, gated on `MANAGE_ACCOUNT`, and **re-authorized at every
+mint including every refresh**, downgrading silently if the right was dropped.
+Against a pasted integration key that is tenant-wide, can carry `admin`, and
+never expires.
+
+### Production 403s OAuth discovery — a release gate, not a design input
+
+Found by the API team while answering the above, and re-measured here
+2026-08-04:
+
+```
+https://app.getuku.com/.well-known/oauth-authorization-server       403
+https://app.getuku.com/.well-known/oauth-protected-resource         403
+https://app.getuku.com/.well-known/acme-challenge/x                 302  <- the regex is what fires
+https://staging.getuku.com/.well-known/oauth-authorization-server   200
+```
+
+Cause is `infra/configs/nginx/includes/block-scanners.conf:45` — a dotfile
+blocker whose only whitelist is acme-challenge:
+
+```nginx
+location ~ /\.(?!well-known/acme-challenge) { return 403; }
+```
+
+Staging already carries the fix (`(acme-challenge|oauth-)`), so this is a proven
+backport, not a design decision. **It blocks nothing this repo is about to
+build** — staging serves discovery, and the OAuth handler's deployment status is
+a separate question from what the edge does with it. It does mean OAuth cannot
+work in production *at all* until it is backported, whichever grant type wins.
+
+`infra/` is production-only and access-restricted; do not touch it from here.
+Recorded in § 0.1 for whoever owns it.
+
+**Nothing currently measures this.** "OAuth discovery is reachable in
+production" is a shippability precondition of the same kind as `.api-pending`,
+and it lives outside the drift gate's reach for the reason in § 6.2.1.
 
 ---
 
@@ -144,6 +164,20 @@ Paste this into an agent working in `uku_service`. Written 2026-08-04.
 | **SOC 2** | `uku-cli` is in scope but absent from the asset inventory, subprocessor list and access-control matrix — same gap as `infra` and `mailbox`, plus `getuku-astro` deploy access, now a production trust root. Close together. |
 | **Local dev API key** | `api_key` id **184**, company 4, named "uku-cli-local-dev (delete me)", scopes read/write/admin/financials. Minted 2026-08-04 to verify Phase 4 against `127.0.0.1:8890`. Delete when done. |
 | **`reference/`** | Untracked in the working tree. Commit or remove. |
+| **nginx 403 on OAuth discovery** | Backport staging's `(acme-challenge\|oauth-)` whitelist to `infra/configs/nginx/includes/block-scanners.conf:45`. Blocks OAuth in production entirely, whichever grant type wins. `infra/` is access-restricted — not ours to touch. Detail + measurements in § 0. |
+
+**Needs the API:**
+
+- **Device flow** (RFC 8628) does not exist. A few days of work, no blocking
+  objection, ~80% of the parts already present (§ 0b). Not on the critical path
+  if the Go auth layer is built grant-agnostic (§ 9.0).
+- **A trust column on `OAuthClient`**, or a config allow-list, so device flow can
+  be restricted to first-party `client_id`s. This is the phishing mitigation
+  that makes device flow safe at all (§ 0c), and it is what lets this CLI pin a
+  `client_id`.
+- **A decision on `financials` over device flow.** If barred, invoice and billing
+  commands are unavailable on that path — a capability regression against pasted
+  keys (§ 9.1).
 
 **Needs the API deploy:**
 
@@ -1013,6 +1047,27 @@ Neither is optional if Phase 3 is to be worth building. Verify feasibility of th
 static half before committing to it; the executed half is the stronger of the two
 and should ship regardless.
 
+**A third hole, found 2026-08-04 and NOT closed: the gate cannot see the OAuth
+surface at all.** `SPEC_URL` is `app.getuku.com/api/v3/openapi.json`
+(`check-api.sh:54`) — FastAPI-generated from the api-v3 router table. But
+`/oauth/authorize`, `/oauth/token`, `/oauth/register` and every `.well-known`
+document are served by the **Tornado app**, not api-v3 (measured: 200 on `:8885`,
+404 on `:8890`). They can never appear in that spec, so:
+
+- an `op` fact for an OAuth endpoint fails check 1 **permanently** — production
+  does serve it, the spec just cannot say so; and
+- parking it in `.api-pending` silences check 1 but **deadlocks
+  `scripts/release.sh`**, which refuses while any entry remains. Permanently
+  pending is not a state the design has.
+
+So Phase 6 lands exactly where the gate is blind, and the obvious escape hatch
+makes it worse. Do not declare OAuth endpoints as `op` facts until this is
+resolved. Options, cheapest first: a second fact kind checked against the app
+origin rather than the spec; a `.well-known`-derived source of truth (it is
+public and machine-generated, which is the property that made `op` facts work);
+or accept the blind spot and cover OAuth by executed tests only, recording it
+here as a known gap. **Decide in the Go session, before writing the auth code.**
+
 ### 6.3 Files that change
 
 | File | Change |
@@ -1174,27 +1229,88 @@ Do this **after** Phase 4 so the surface has stopped moving. Every change here i
 
 ## 9. Phase 6 — the auth decision
 
-Unchanged from the handover, and still the single largest open question. A pasted
-integration key is **tenant-wide** and can carry `admin`/`financials`; an
-OAuth-minted key is **person-scoped**. Today every CLI user and every agent holds
-the most powerful credential the platform issues.
+Still the single largest open question, but **substantially narrowed by the API
+team's answers of 2026-08-04 (§ 0)**. A pasted integration key is **tenant-wide**
+and can carry `admin`/`financials`; an OAuth-minted key is **person-scoped**,
+cannot carry `admin` under any circumstances, and re-authorizes `financials` at
+every mint. Today every CLI user and every agent holds the most powerful
+credential the platform issues. That premise is confirmed against the code, not
+inferred — lead the rewrite with it.
 
-The server side is ready — `_valid_redirect_uri` already permits plain-http
-loopback, so a browser flow needs no server change. The cost is concentrated in
-bash: PKCE S256 needs SHA-256 + base64url, the flow needs a loopback listener,
-the exchange needs JSON parsing. Shelling to `python3` is pragmatic but dents the
-zero-dependency claim.
+### 9.0 What the answers settled, and what they cost
 
-Note the API now issues refresh tokens (24h access, 90d rotating refresh, reuse
-detection revoking the whole family). If implemented: persist the rotated pair
-atomically, never send a refresh token twice, and refuse to use a credential
-against an origin other than the one it was minted for (Lesson 10 — this bug has
-been found in *both* Uku CLIs, and one had the fence on its refresh token but not
-its access token).
+**Device flow does not exist.** It is a few days of API work, with no blocking
+objection, but it is not there today and the CLI cannot wait on it.
 
-Consider **device flow** over auth-code redirect, per the Basecamp reference: it
-works over SSH, headless, and when the browser is on another machine — all normal
-for this audience.
+**Recommended shape: build flow-agnostic, keep the grant pluggable.** Everything
+expensive is shared between the two flows — token storage, rotation with
+reuse-safety, the origin fence, RFC 8414 discovery with
+`follow_redirects=False`, scope handling, the error taxonomy. Only the grant
+branch differs. Build that layer in Go now with `authorization_code` + PKCE as
+the first grant; adding `device_code` later is one branch, not a rewrite.
+Nothing is wasted either way and the rewrite does not stall on an API
+dependency.
+
+**Discovery comes from the app origin, not api-v3.** Fetch
+`/.well-known/oauth-authorization-server` from the app base URL. `:8890` will
+404 forever — that is not a bug to work around, it is the wrong host.
+
+**The `client_id` must be pinned, and that is not a drift violation.** Device
+flow is to be allow-listed to first-party `client_id`s only (§ 0c), so this CLI
+ships a fixed `client_id` and never calls `/oauth/register`. It reads as a
+violation of *"never assert facts about the server"* and is not: a `client_id`
+is a fact about the **client**, and a client's own identity cannot drift without
+the client being reissued. Endpoints still come from `.well-known`. Only the
+identity is pinned, and pinning it is what lets the consent page name "Uku CLI"
+with authority instead of echoing attacker-controlled free text.
+
+Note this needs a **server-side change** — `OAuthClient` has `client_id`,
+`client_name` and `redirect_uris` and no trust column — so it is an API
+dependency, tracked in § 0.1.
+
+### 9.1 Scope handling — read what was granted, never what was asked
+
+`scopes_supported` is `["read","write"]`; `financials` is deliberately omitted so
+connectors cannot request it, yet it can still arrive via the consent checkbox.
+So the CLI **cannot request `financials` and may nonetheless receive it**. Two
+consequences:
+
+- Read the granted scope from the **token response**, never from what was
+  requested. It can also be *downgraded* at any refresh if the user lost
+  `MANAGE_ACCOUNT`.
+- When a financials command runs without the scope, fail pointing at the consent
+  checkbox — not a generic 403. An agent that sees "forbidden" retries; one that
+  is told "re-authorize and tick Financials" acts.
+
+**A product call, not a footnote:** if `financials` is barred over device flow
+(§ 0c), then invoice and billing commands are **unavailable on that path
+entirely**. That is a capability regression against pasted keys, and it needs a
+decision rather than a default.
+
+### 9.2 Distinguish a 403 from a redirect on the discovery fetch
+
+Production 403s `.well-known` today (§ 0). Collapsing that into "discovery
+failed" throws away the one signal that separates *your edge is misconfigured*
+from *your base URL is wrong* — and given § 0, the first is the likelier cause
+right now. Keep them distinct in the error path.
+
+### 9.3 Carried over, still true
+
+The server side of the browser flow is ready — `_valid_redirect_uri` permits
+plain-http loopback, so it needs no server change. The bash cost that motivated
+the Go decision was concentrated exactly here: PKCE S256 needs SHA-256 +
+base64url, the flow needs a loopback listener, the exchange needs JSON parsing.
+
+The API issues refresh tokens (24h access, 90d rotating refresh, reuse detection
+revoking the whole family). Persist the rotated pair atomically, never send a
+refresh token twice, and refuse to use a credential against an origin other than
+the one it was minted for (Lesson 10 — found in *both* Uku CLIs, and one had the
+fence on its refresh token but not its access token).
+
+Device flow remains the better end state for this audience — it works over SSH,
+headless, and when the browser is on another machine — per the Basecamp
+reference. It is now a question of when the API ships it, not whether to design
+around it.
 
 **Read `reference/python-client/src/oauth.py` before writing a line of this.** The
 audit called it "the best code in either repo", and it encodes one Uku-specific
@@ -1204,6 +1320,15 @@ trap that is not obvious from the RFCs:
 > which **defaults to `https://app.getuku.com` and is set in no dev ini**. So
 > `--base http://127.0.0.1:8885` against a local server sends the browser to
 > **production's** consent page and POSTs the code to production.
+
+**Reproduced first-hand 2026-08-04**, so this is no longer a borrowed claim —
+the local dev app really does serve `"issuer": "https://app.getuku.com"` and
+production endpoints, while `https://staging.getuku.com` correctly serves its
+own. The API team confirms `issuer` comes from `ApiV3Config.get_app_base_url()`
+and deliberately never from the `Host` header, which is what makes it stable to
+pin against — and, on an unconfigured dev box, exactly this trap. Expect strict
+RFC 8414 validation to **refuse a local server** until that ini value is set;
+that is the check working, not a bug to loosen.
 
 The defence is RFC 8414 §3.3 issuer validation with **`follow_redirects=False`**
 on the well-known fetch, anchored to the URL *the user asked for* rather than the
