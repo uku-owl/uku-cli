@@ -135,12 +135,29 @@ blocker whose only whitelist is acme-challenge:
 location ~ /\.(?!well-known/acme-challenge) { return 403; }
 ```
 
-Staging already carries the fix (`(acme-challenge|oauth-)`), so this is a proven
-backport, not a design decision. **It blocks nothing this repo is about to
-build** — staging serves discovery, and the OAuth handler's deployment status is
-a separate question from what the edge does with it. It does mean OAuth cannot
-work in production *at all* until it is backported, whichever grant type wins.
+Staging already carries the fix at
+`staging_infra/configs/nginx/includes/block-scanners.conf:52` —
+`(acme-challenge|oauth-)` — so this is a proven backport, not a design decision.
+Its comment records both the provenance (found 2026-07-23 testing the
+claude.ai/Claude Desktop OAuth connector) and the nginx gotcha that makes it
+necessary: **regex locations match in config order, not by specificity**, so the
+dotfile blocker 403s these paths before any OAuth location is reached, no matter
+what that location's own settings say.
 
+**Scope the backport carefully — it is one line, not two.** Staging also has an
+access-gate bypass at `staging_infra/configs/nginx/uku.conf:405` and `:843`, but
+that is **staging-specific**: it exists to get past staging's basic-auth gate.
+Verified 2026-08-04 that `infra/configs/nginx/uku.conf` contains no `auth_basic`
+and no oauth/well-known location at all, so prod has no gate to bypass. Copying
+that block into prod would be cargo-culting.
+
+**OAuth is blocked twice over in production, and the two are independent.** The
+edge 403s discovery *and* the OAuth handler is committed but not deployed. The
+measurement above is taken at the edge, so it says nothing about the second —
+fixing nginx alone will not make OAuth work. Treat deployment as a separate
+question.
+
+**It blocks nothing this repo is about to build** — staging serves discovery.
 `infra/` is production-only and access-restricted; do not touch it from here.
 Recorded in § 0.1 for whoever owns it.
 
@@ -164,7 +181,7 @@ and it lives outside the drift gate's reach for the reason in § 6.2.1.
 | **SOC 2** | `uku-cli` is in scope but absent from the asset inventory, subprocessor list and access-control matrix — same gap as `infra` and `mailbox`, plus `getuku-astro` deploy access, now a production trust root. Close together. |
 | **Local dev API key** | `api_key` id **184**, company 4, named "uku-cli-local-dev (delete me)", scopes read/write/admin/financials. Minted 2026-08-04 to verify Phase 4 against `127.0.0.1:8890`. Delete when done. |
 | **`reference/`** | Untracked in the working tree. Commit or remove. |
-| **nginx 403 on OAuth discovery** | Backport staging's `(acme-challenge\|oauth-)` whitelist to `infra/configs/nginx/includes/block-scanners.conf:45`. Blocks OAuth in production entirely, whichever grant type wins. `infra/` is access-restricted — not ours to touch. Detail + measurements in § 0. |
+| **nginx 403 on OAuth discovery** | Backport staging's `(acme-challenge\|oauth-)` whitelist to `infra/configs/nginx/includes/block-scanners.conf:45`. **That one line only** — staging's `uku.conf:405/843` bypass is staging-gate-specific and prod has no gate. Necessary but not sufficient: the OAuth handler is also committed-not-deployed. `infra/` is access-restricted — not ours to touch. Detail + measurements in § 0. |
 
 **Needs the API:**
 
@@ -204,7 +221,9 @@ and it lives outside the drift gate's reach for the reason in § 6.2.1.
   no-op. The CODE IS CORRECT and must not change: `status = 'new'` marks a
   recurring occurrence as untouched and therefore destroyable by the
   re-provisioning teardown, so any interaction must move it. Predicate:
-  `virtual_task_module.py:796`.
+  `virtual_task_module.py:796`. **Confirmed by the API team 2026-08-04 and now
+  recorded in `uku_service/CLAUDE.md`**, so the semantics survive outside the
+  ticket. The docstring fix itself is still open.
 - **UKU-850** — `/capabilities` reports `read: false` for `teams` and
   `workflow-templates`, which are readable; `/mcp-usage` and `/reports/*` are
   absent entirely. Until fixed, **no client may treat `/capabilities` as a route
