@@ -48,7 +48,24 @@ If a rewrite happens, the new implementation must pass the *existing* behavioura
 
 ## THE MOST IMPORTANT SECTION — how to know what the API actually does
 
-**Never take an API fact from prose. Not from this file, not from `README.md`, not from `--help`, not from a help-centre page, not from `llms-full.txt`.** Prose drifts and then lies with confidence. The phantom-search bug below is exactly that failure.
+> ### ⛔ READ THE INTERNAL DOCS FIRST. DO NOT PRESUME.
+>
+> **CTO instruction, 2026-08-04.** The know-how already exists in this codebase. Reasoning from what an API "probably" does — or from the shape of a URL — is guessing that looks like work, and it wastes the reader's time on a premise of *maybe*.
+>
+> **The ladder, in order, no skipping:** ① read the internal doc → ② if it does not answer, read the code → ③ if the code does not answer, **ask the agent that owns that repo**. Asking is cheap; a wrong premise carried into an implementation is not. If you cannot name where a fact came from, you do not have the fact.
+>
+> | Question | Where |
+> |---|---|
+> | API v3 — auth, scopes, conventions, resource map, rate limits, decisions | `../uku_service/CLAUDE/api/CLAUDE_API_V3.md` — **start here** |
+> | MCP server | `CLAUDE/api/CLAUDE_API_MCP_BUILD.md`, `CLAUDE/api/CLAUDE_MCP_BI.md` |
+> | Webhooks · capabilities · security | `CLAUDE/api/CLAUDE_API_V3_WEBHOOKS.md` · `CLAUDE/api/capabilities/` · `CLAUDE/CLAUDE_SECURITY.md` |
+> | Task status semantics | `../uku_service/CLAUDE.md` |
+> | What shipped when | `../uku_service/backend/api_v3/CHANGELOG.md` |
+> | OAuth internals · **how the tenant is chosen** | `backend/handlers/oauth_handlers.py` · `backend/api_v3/dependencies.py` |
+>
+> **Docs can go stale; code cannot. Both beat guessing.** Read the doc to learn the shape, confirm the specific fact in code, ask when neither is clear. Full ladder and file map: `refactoring-cli.md` § 0.
+
+**Never take an API fact from prose. Not from this file, not from `README.md`, not from `--help`, not from a help-centre page, not from `llms-full.txt`.** Prose drifts and then lies with confidence. The phantom-search bug below is exactly that failure. This is not in tension with the box above: **docs are for understanding, code and the live spec are for asserting.**
 
 There are two different machine-generated truths, and you need both:
 
@@ -165,18 +182,20 @@ Why it matters: a pasted *integration* key is **tenant-wide** and can carry `adm
 
 **Be honest about the cost in bash:** PKCE S256 needs SHA-256 + base64url, the flow needs a loopback HTTP listener, and the token exchange needs JSON parsing — in a tool whose selling point is bash + curl with `jq` optional. Shelling out to `python3` is pragmatic but dents the zero-dependency claim. This is the single strongest argument for a rewrite; weigh it honestly rather than forcing it.
 
-### Answered by the API team, 2026-08-04 — read `refactoring-cli.md` § 0 and § 9 before writing auth code
+### OAuth is NOT an API v3 feature — measured 2026-08-04
 
-Four things that change the design, all re-measured here:
+It is the **Tornado app's**, and it **shipped 2026-07-23** for the claude.ai / Claude Desktop **MCP connector** (`CLAUDE_API_V3.md:421`). API v3 does not implement OAuth; it *accepts* the credential OAuth mints. Getting this backwards is what produced a day of wrong analysis in this repo — discovery 200s on `:8885`/`:8886` (app) and 404s on `:8890` (api-v3).
 
-- **Discovery lives on the APP host, not api-v3.** `/.well-known/oauth-authorization-server` is 200 on `:8885`/`:8886` and 404 on `:8890`, because `oauth_handlers.py` registers via `tornroutes`, not FastAPI. An earlier note in this repo called it a 404 — that was a wrong-host probe, now corrected.
-- **Device flow does not exist.** A few days of API work, no blocking objection. Build the Go auth layer grant-agnostic so it is one branch later, not a rewrite.
-- **Device flow will be allow-listed to first-party `client_id`s**, because it removes the redirect host that the consent page's anti-phishing story depends on. So this CLI pins a `client_id` and never calls `/oauth/register`. That is not a drift violation — a `client_id` is a fact about the *client*, and endpoints still come from `.well-known`.
-- **Production 403s both `.well-known` documents** (`infra/.../block-scanners.conf:45` whitelists only acme-challenge; staging has the fix). OAuth cannot work in production until that is backported. Not this repo's to fix.
+**The one that changes the command surface** (`backend/api_v3/dependencies.py:170-183`): on the Bearer path, `X-API-Key` must be **absent**, and **`X-Uku-Company` is IGNORED, not rejected** — tenant comes from the key row. So `uku --company X` under an OAuth credential would silently act on a different company than the flag names. The CLI must **refuse** `--company` with an OAuth credential; multi-company becomes a *profiles* problem. That is a surface break needing `.surface-breaking` and a CTO ruling (`refactoring-cli.md` § 9.0).
 
-Also: `scopes_supported` is `["read","write"]` — `financials` cannot be *requested* but can still be *granted* via the consent checkbox, and re-checked at every refresh. Read the granted scope from the token response, never from what was asked.
+Also true, all measured in `backend/handlers/oauth_handlers.py`:
 
-**The drift gate is blind here.** `check-api.sh` reads `/api/v3/openapi.json`, which structurally cannot contain Tornado-served OAuth routes — so an `op` fact for one fails forever, and `.api-pending` deadlocks `release.sh`. Resolve before declaring any OAuth operation (`refactoring-cli.md` § 6.2.1).
+- **24h access token, 90d sliding refresh, rotation-on-use, reuse revokes the family.** `CLAUDE_API_V3.md:421` still calls these deferred and the key non-expiring — **that line is stale**; the code wins.
+- **Keys minted before refresh shipped have `expires_at IS NULL`** and no refresh token. NULL means *no expiry*, never *expired*.
+- **Device flow does not exist.** Build the Go auth layer grant-agnostic so adding it is one branch. It will be allow-listed to first-party `client_id`s, so this CLI pins a `client_id` and never calls `/oauth/register` — not a drift violation, since a `client_id` is a fact about the *client* and endpoints still come from `.well-known`.
+- **`financials` cannot be requested but can be granted** via the consent checkbox. Read the granted scope from the token response, never from what was asked.
+
+Production OAuth is blocked by a deploy and an nginx rule — `infra`'s to fix, filed, and irrelevant to what gets built here (staging serves discovery).
 
 Also note the API now issues **refresh tokens** (24h access, 90d rotating refresh, with reuse detection that revokes the whole family). If you implement OAuth: persist the rotated pair atomically, never send a refresh token twice, and refuse to use a credential against an origin other than the one it was minted for.
 

@@ -9,6 +9,58 @@ Go rewrite.** Start it in a fresh session; see § 0 below.
 
 ## 0. START HERE — next session
 
+> ## ⛔ READ THE INTERNAL DOCS. DO NOT PRESUME.
+>
+> **CTO instruction, 2026-08-04, after a presumption cost a full round trip.**
+> The know-how already exists in this codebase. Reasoning from what an API
+> "probably" does, or from the shape of a URL, is not work — it is guessing that
+> looks like work, and it wastes the reader's time on a premise of *maybe*.
+>
+> **The ladder, in order. Do not skip a rung:**
+>
+> 1. **Read the internal document.** The table below says which one.
+> 2. **If the doc does not answer it, read the code.** It cannot be stale.
+> 3. **If the code does not answer it, ASK the agent that owns that repo.**
+>    Asking is cheap. A wrong premise carried into an implementation is not.
+>
+> **Never** write a claim whose provenance is your own inference. If you cannot
+> name where a fact came from, you do not have the fact.
+>
+> ### Where the truth lives — `../uku_service`
+>
+> | Question | Document |
+> |---|---|
+> | API v3 — architecture, auth, scopes, conventions, resource map, rate limits, decisions log | `CLAUDE/api/CLAUDE_API_V3.md` — **the main one, read it first** |
+> | MCP server — tools, build, rollout | `CLAUDE/api/CLAUDE_API_MCP_BUILD.md`, `CLAUDE/api/CLAUDE_MCP_BI.md` |
+> | Webhooks | `CLAUDE/api/CLAUDE_API_V3_WEBHOOKS.md` |
+> | What a user can semantically do | `CLAUDE/api/capabilities/CLAUDE_CAPABILITIES.md` + the `*.yaml` beside it |
+> | Security posture | `CLAUDE/CLAUDE_SECURITY.md` |
+> | Task status semantics (`new` → `in_progress`) | `../uku_service/CLAUDE.md` |
+> | What shipped when | `backend/api_v3/CHANGELOG.md` |
+>
+> ### Where the truth lives — code, when a doc is silent or suspect
+>
+> | Question | File |
+> |---|---|
+> | OAuth: flow, token lifetimes, scope grants, refresh/rotation | `backend/handlers/oauth_handlers.py` |
+> | How a request is authenticated; **how the tenant is chosen** | `backend/api_v3/dependencies.py` |
+> | Idempotency coverage | `backend/api_v3/middleware/idempotency.py` |
+> | Optimistic locking / ETag | `backend/api_v3/services/_optimistic_lock.py` |
+> | What is **built** vs **released** | `CLAUDE/api/openapi.json` vs `curl app.getuku.com/api/v3/openapi.json` |
+>
+> ### Docs can go stale; code cannot. Both beat guessing.
+>
+> Proven twice on 2026-08-04. `CLAUDE_API_V3.md:421` still lists
+> "refresh/expiry" as deferred and calls OAuth keys non-expiring — the code has
+> shipped 24h access tokens and 90d sliding refresh since. And the same line is
+> the *only* place that says plainly where OAuth lives, which is the fact whose
+> absence caused the whole mess below.
+>
+> So: **read the doc to learn the shape, confirm the specific fact in code, and
+> ask when neither is clear.** The existing rule — *never take an API fact from
+> prose* — still stands and is not in tension with this. Docs are for
+> understanding; code and the live spec are for asserting.
+
 **The next piece of work is the Go rewrite.** The decision was taken 2026-08-04
 with the full argument and measurements in § 11.1. It is not provisional: the
 remaining roadmap (OAuth, signed cross-platform distribution, Windows) is exactly
@@ -52,118 +104,70 @@ session inherits the same tests through the subprocess boundary and the work
 should be done once. **CI on this branch is red on purpose. That is an accurate
 signal, not a broken build.**
 
-### The API team's OAuth answers — ASKED AND ANSWERED 2026-08-04
+### OAuth — what it actually is, measured 2026-08-04
 
-The device-flow question was put to an agent in `uku_service` and came back
-answered. Each answer is kept next to its question, because an answer without
-its question reads as an unsourced assertion — the exact failure this repo
-guards against. **Every claim below was then re-measured here**; the one that
-was wrong was mine.
+**Correcting a framing error of mine that this file carried for a day.** OAuth is
+not an API v3 feature. It is the **Tornado app's**, and it **shipped 2026-07-23**
+to unblock the claude.ai / Claude Desktop **MCP connector**
+(`CLAUDE_API_V3.md:421`). API v3 does not implement it — it *accepts* the
+credential OAuth mints.
 
-**a. Does device flow exist?** No. Genuinely absent — zero matches for
-`device_code`, `device_authorization` or the grant URN across all six repos. The
-metadata is truthful: `authorization_code` + `refresh_token` are the only
-grants.
-
-**d. Is `.well-known` public, and where?** Public, unauthenticated,
-`Cache-Control: public, max-age=300`. **My 404 was a wrong-host artifact** — the
-document is served by the main Tornado app, never by api-v3, because
-`oauth_handlers.py` registers via `tornroutes` on the app rather than as a
-FastAPI route. Re-measured here 2026-08-04:
+That distinction is the whole reason my earlier `.well-known` 404 looked like a
+missing feature. It was a wrong-host probe:
 
 ```
-https://127.0.0.1:8886/.well-known/oauth-authorization-server   200
-http://127.0.0.1:8885/.well-known/oauth-authorization-server    200
-http://127.0.0.1:8890/.well-known/oauth-authorization-server    404   <- my probe
+http://127.0.0.1:8885/.well-known/oauth-authorization-server    200   (app)
+https://127.0.0.1:8886/.well-known/oauth-authorization-server   200   (app)
+http://127.0.0.1:8890/.well-known/oauth-authorization-server    404   (api-v3 — never serves it)
 ```
 
-Paths: `/.well-known/oauth-authorization-server` (RFC 8414),
-`/.well-known/oauth-protected-resource` (RFC 9728), and an `/mcp`-suffixed
-variant of each for SDKs that probe by path insertion — all four served 200
-locally. **Fetch discovery from the app base URL, not the api-v3 origin.**
+So: **fetch discovery from the app base URL.** Paths are
+`/.well-known/oauth-authorization-server` (RFC 8414) and
+`/.well-known/oauth-protected-resource` (RFC 9728), each with an `/mcp`-suffixed
+variant; all four 200 locally, public and unauthenticated,
+`Cache-Control: public, max-age=300`.
 
-**b. Effort if added.** ~80% of the parts exist — `_mint_access_key`,
-`_issue_refresh_token`, `_effective_scopes`, `_token_response`, `_hash_code`,
-the consent shell with its company picker and financials checkbox, the Redis
-per-IP limiter, and `oauth_authorization_code` as a table template. Genuinely
-new: a device-code table, the `user_code` entry page, the polling branch with
-`authorization_pending`/`slow_down`/`expired_token`/`access_denied`, and
-brute-force limits on a ~20-bit `user_code` (needs both a per-code attempt cap
-and a global one). A few days, mostly consent page and abuse limits rather than
-protocol.
+**What the flow mints** (`oauth_handlers.py`): a real `api_key` row —
+`kind='personal'`, person-scoped, `auth_type='oauth2'`, revocable in Settings →
+API Keys. It can **never** carry `admin`: `_granted_scopes` whitelists by exact
+canonical string and fails closed to `["read","write"]`, deliberately, because
+`/oauth/register` is unauthenticated and a pre-consent row can hold
+attacker-chosen scope text. `financials` only via the consent checkbox, gated on
+`MANAGE_ACCOUNT`, re-checked at every mint including every refresh, downgrading
+silently if the right was dropped.
 
-**c. Objection — and it changes the CLI's design.** No blocking objection, but
-one that propagates: the consent page's whole trust story is *"trust the address
-above, not the name"*, because `client_name` is attacker-controlled free text
-from an unauthenticated `/oauth/register`. Device flow deletes that anchor — no
-redirect host means the page has nothing verifiable to say about who is asking,
-while training users to type codes from elsewhere into it. That is RFC 8628 §5.4
-remote phishing with the mitigation removed.
+**Token lifetimes — measured, because the upstream doc is stale here.**
+`oauth_handlers.py:13-26,77,526,546,556`: access token 24h on
+`api_key.expires_at`, refresh token 90d **sliding**, rotation-on-use, reuse
+revokes the whole family (RFC 9700 §4.14.2). `CLAUDE_API_V3.md:421` still lists
+"refresh/expiry" as deferred and calls the key non-expiring — that line predates
+the work. Cite the code, not either doc.
 
-Their recommendation, which this plan adopts: **device flow only for
-allow-listed first-party `client_id`s, never for dynamically-registered
-clients**, and `financials` barred over device flow entirely. Consequences for
-this CLI are in § 9.
+**Legacy credentials exist and must not be mishandled** (`oauth_handlers.py:25-26`):
+keys minted before refresh shipped have `expires_at IS NULL` and no refresh
+token. A fresh implementation must treat NULL as *"no expiry"*, never as
+*"expired"*.
 
-**Security premise confirmed, and worth leading the rewrite with.** OAuth tokens
-are real `api_key` rows: `kind='personal'`, person-scoped, `auth_type='oauth2'`,
-revocable in Settings → API Keys. They can **never** carry `admin` —
-`_granted_scopes` whitelists by exact canonical string and fails closed to
-`["read","write"]`, deliberately, because `/oauth/register` is unauthenticated
-and a pre-consent row can hold attacker-chosen scope text. `financials` only via
-the consent checkbox, gated on `MANAGE_ACCOUNT`, and **re-authorized at every
-mint including every refresh**, downgrading silently if the right was dropped.
-Against a pasted integration key that is tenant-wide, can carry `admin`, and
-never expires.
+**Device flow does not exist.** Confirmed absent — no `device_code`, no
+`device_authorization`, no grant URN anywhere. The metadata is truthful:
+`authorization_code` + `refresh_token` are the only grants. Adding it is a few
+days (~80% of the parts are already there: `_mint_access_key`,
+`_issue_refresh_token`, `_token_response`, `_hash_code`, the consent shell,
+the Redis limiter, `oauth_authorization_code` as a table template). The genuinely
+new parts are a device-code table, the `user_code` entry page, the polling
+branch, and brute-force limits on a ~20-bit code.
 
-### Production 403s OAuth discovery — a release gate, not a design input
+**One objection that propagates into this CLI's design.** The consent page's
+trust story is *"trust the address above, not the name"* — `client_name` is
+attacker-controlled free text from an unauthenticated `/oauth/register`. Device
+flow deletes that anchor, so it is to be allow-listed to first-party
+`client_id`s, with `financials` barred on that path. Consequences in § 9.
 
-Found by the API team while answering the above, and re-measured here
-2026-08-04:
-
-```
-https://app.getuku.com/.well-known/oauth-authorization-server       403
-https://app.getuku.com/.well-known/oauth-protected-resource         403
-https://app.getuku.com/.well-known/acme-challenge/x                 302  <- the regex is what fires
-https://staging.getuku.com/.well-known/oauth-authorization-server   200
-```
-
-Cause is `infra/configs/nginx/includes/block-scanners.conf:45` — a dotfile
-blocker whose only whitelist is acme-challenge:
-
-```nginx
-location ~ /\.(?!well-known/acme-challenge) { return 403; }
-```
-
-Staging already carries the fix at
-`staging_infra/configs/nginx/includes/block-scanners.conf:52` —
-`(acme-challenge|oauth-)` — so this is a proven backport, not a design decision.
-Its comment records both the provenance (found 2026-07-23 testing the
-claude.ai/Claude Desktop OAuth connector) and the nginx gotcha that makes it
-necessary: **regex locations match in config order, not by specificity**, so the
-dotfile blocker 403s these paths before any OAuth location is reached, no matter
-what that location's own settings say.
-
-**Scope the backport carefully — it is one line, not two.** Staging also has an
-access-gate bypass at `staging_infra/configs/nginx/uku.conf:405` and `:843`, but
-that is **staging-specific**: it exists to get past staging's basic-auth gate.
-Verified 2026-08-04 that `infra/configs/nginx/uku.conf` contains no `auth_basic`
-and no oauth/well-known location at all, so prod has no gate to bypass. Copying
-that block into prod would be cargo-culting.
-
-**OAuth is blocked twice over in production, and the two are independent.** The
-edge 403s discovery *and* the OAuth handler is committed but not deployed. The
-measurement above is taken at the edge, so it says nothing about the second —
-fixing nginx alone will not make OAuth work. Treat deployment as a separate
-question.
-
-**It blocks nothing this repo is about to build** — staging serves discovery.
-`infra/` is production-only and access-restricted; do not touch it from here.
-Recorded in § 0.1 for whoever owns it.
-
-**Nothing currently measures this.** "OAuth discovery is reachable in
-production" is a shippability precondition of the same kind as `.api-pending`,
-and it lives outside the drift gate's reach for the reason in § 6.2.1.
+**Not this repo's problem, recorded so it is not re-derived:** OAuth does not
+work in production yet — the edge 403s the discovery documents *and* the handler
+is not deployed. Both are `infra`/deploy work, filed for the team that owns
+them, and neither changes anything built here (staging serves discovery, which
+is where this CLI tests). Detail in § 0.1.
 
 ---
 
@@ -1066,26 +1070,13 @@ Neither is optional if Phase 3 is to be worth building. Verify feasibility of th
 static half before committing to it; the executed half is the stronger of the two
 and should ship regardless.
 
-**A third hole, found 2026-08-04 and NOT closed: the gate cannot see the OAuth
-surface at all.** `SPEC_URL` is `app.getuku.com/api/v3/openapi.json`
-(`check-api.sh:54`) — FastAPI-generated from the api-v3 router table. But
-`/oauth/authorize`, `/oauth/token`, `/oauth/register` and every `.well-known`
-document are served by the **Tornado app**, not api-v3 (measured: 200 on `:8885`,
-404 on `:8890`). They can never appear in that spec, so:
-
-- an `op` fact for an OAuth endpoint fails check 1 **permanently** — production
-  does serve it, the spec just cannot say so; and
-- parking it in `.api-pending` silences check 1 but **deadlocks
-  `scripts/release.sh`**, which refuses while any entry remains. Permanently
-  pending is not a state the design has.
-
-So Phase 6 lands exactly where the gate is blind, and the obvious escape hatch
-makes it worse. Do not declare OAuth endpoints as `op` facts until this is
-resolved. Options, cheapest first: a second fact kind checked against the app
-origin rather than the spec; a `.well-known`-derived source of truth (it is
-public and machine-generated, which is the property that made `op` facts work);
-or accept the blind spot and cover OAuth by executed tests only, recording it
-here as a known gap. **Decide in the Go session, before writing the auth code.**
+**Scope note, so nobody files it as a hole.** `op` facts are `/api/v3/*`
+operations by construction — `SPEC_URL` is the api-v3 OpenAPI document
+(`check-api.sh:54`). OAuth lives on the Tornado app and is **not an API v3
+operation**, so it is simply out of scope for this gate; cover it with executed
+tests instead. Declaring an `op` fact for `/oauth/token` would be a category
+error, not a discovery. *(An earlier revision of this file wrote that up as a
+serious gap. It was a symptom of conflating the two services — see § 0.)*
 
 ### 6.3 Files that change
 
@@ -1256,7 +1247,36 @@ every mint. Today every CLI user and every agent holds the most powerful
 credential the platform issues. That premise is confirmed against the code, not
 inferred — lead the rewrite with it.
 
-### 9.0 What the answers settled, and what they cost
+### 9.0 The surface consequence — `--company` cannot mean anything under OAuth
+
+**This is the finding that matters most, and it needs a CTO decision.** Measured
+at `backend/api_v3/dependencies.py:170-183`. On the Bearer path:
+
+- **`X-API-Key` must be absent.** The code only reads `Authorization` when
+  `x_api_key` is falsy. It is an either/or at the transport layer, not "send
+  both".
+- **`X-Uku-Company` is IGNORED — not rejected.** Verbatim from the source:
+  *"Tenant then comes from the key row itself and any `X-Uku-Company` header is
+  IGNORED (advisor 2026-07-23: derive, don't match — never trust a client tenant
+  header once OAuth is in play)."*
+- **One credential is bound to one company**, chosen at the consent page's
+  company picker.
+
+So `uku --company X` under an OAuth credential would operate on whatever company
+the token was minted for, silently, whatever `X` says. **Silent wrong-tenant is
+far worse than an error** — and on a platform holding 250 firms' accounting data
+it is the worst failure mode in this document.
+
+The CLI must refuse `--company` when the active credential is OAuth, rather than
+pass it and let it be ignored. That is a **surface change** under the PRIME
+DIRECTIVE and needs a `.surface-breaking` line. Multi-company then becomes a
+**profiles** problem — one profile per consented company — not a flag problem.
+Profiles already exist, so this is a routing decision, not new machinery.
+
+**Decision needed from the CTO**, and unlike the `financials` question there is
+no defensible third option: ignoring the flag silently is not on the table.
+
+### 9.0.1 What else the answers settled
 
 **Device flow does not exist.** It is a few days of API work, with no blocking
 objection, but it is not there today and the CLI cannot wait on it.
@@ -1306,14 +1326,7 @@ consequences:
 entirely**. That is a capability regression against pasted keys, and it needs a
 decision rather than a default.
 
-### 9.2 Distinguish a 403 from a redirect on the discovery fetch
-
-Production 403s `.well-known` today (§ 0). Collapsing that into "discovery
-failed" throws away the one signal that separates *your edge is misconfigured*
-from *your base URL is wrong* — and given § 0, the first is the likelier cause
-right now. Keep them distinct in the error path.
-
-### 9.3 Carried over, still true
+### 9.2 Carried over, still true
 
 The server side of the browser flow is ready — `_valid_redirect_uri` permits
 plain-http loopback, so it needs no server change. The bash cost that motivated
