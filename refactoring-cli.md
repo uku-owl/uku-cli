@@ -92,6 +92,40 @@ answers in when they arrive.
 suite is the specification. The bash tree is not the thing being replaced piece
 by piece — it is the reference the Go binary must satisfy.
 
+### The uku_service review, 2026-08-04 — five deltas, all verified here
+
+The API/MCP agent reviewed this repo's docs against production and their code.
+Most held. Five changed something, and **each was re-measured here before being
+written down**:
+
+1. **The live spec UNDER-REPORTS — this repo's foundational invariant was
+   false.** `CLAUDE.md` said the production `openapi.json` "cannot be wrong".
+   Measured: `GET /api/v3/webhooks/events` → **503** with our own error envelope
+   while the spec lists **0** webhook paths (a truly absent path 404s). Cause:
+   `main.py:392`, `include_in_schema=are_webhooks_enabled()`. The ship gate stays
+   conservative in that direction, but **probe a `.api-pending` op live before
+   believing the spec about it** — an entry can otherwise block a release forever
+   for something production already serves.
+2. **Sparse `fields=` and `If-None-Match` are silently ignored in production, not
+   404'd.** FastAPI drops unknown query params; an unrecognized `If-None-Match`
+   just yields no 304. Measured: prod declares `fields` on **0** operations, and
+   `/api/v3/health?bogus_param_xyz=1` → **200**. A CLI built on them and pointed
+   at prod gets full payloads while believing it is doing sparse fetches. The
+   path is identical, so **`op` facts structurally cannot catch this — it needs a
+   behavioural probe.** Phase 3's gate has no such probe today.
+3. **`/reports/kpi-summary` is wrong today — do not surface its task counts.**
+   Detail and the other three BI defects are in `CLAUDE.md` § Capability gaps.
+   Design `/reports/*` around `GET /api/v3/reports/bi/{shape}` (`6cc674d8ca`),
+   not around `kpi-summary`.
+4. **C13 sequences behind UKU-850**, else the CLI tells agents they cannot read
+   what they can.
+5. **The device-flow allow-list was a recommendation, not a ruling** — corrected
+   in § 0 and § 9.0.1. And production OAuth is blocked by **four** things
+   (UKU-600), not two.
+
+**(1) and (2) are the ones that change engineering work**, and both land in
+Phase 3's drift gate rather than the auth phase.
+
 ### What the rewrite inherits, and what it must honour
 
 | | |
@@ -182,11 +216,17 @@ the Redis limiter, `oauth_authorization_code` as a table template). The genuinel
 new parts are a device-code table, the `user_code` entry page, the polling
 branch, and brute-force limits on a ~20-bit code.
 
-**One objection that propagates into this CLI's design.** The consent page's
-trust story is *"trust the address above, not the name"* — `client_name` is
-attacker-controlled free text from an unauthenticated `/oauth/register`. Device
-flow deletes that anchor, so it is to be allow-listed to first-party
-`client_id`s, with `financials` barred on that path. Consequences in § 9.
+**One objection worth carrying, stated at its true strength.** The consent
+page's trust story is *"trust the address above, not the name"* — `client_name`
+is attacker-controlled free text from an unauthenticated `/oauth/register`.
+Device flow deletes that anchor, so the API team **recommends** allow-listing it
+to first-party `client_id`s with `financials` barred on that path.
+
+> **That is a recommendation, not a ruling.** Device flow has no ticket, no owner
+> and no schedule. Earlier revisions of this file recorded the allow-list as
+> decided and as something "this plan adopts" — **overreach, corrected
+> 2026-08-04.** Pinning a `client_id` stays a sensible CLI-side choice; nothing
+> on the platform side is promised. Do not build as though it were.
 
 **Not this repo's problem, recorded so it is not re-derived:** OAuth does not
 work in production yet — the edge 403s the discovery documents *and* the handler
@@ -1117,6 +1157,22 @@ Neither is optional if Phase 3 is to be worth building. Verify feasibility of th
 static half before committing to it; the executed half is the stronger of the two
 and should ship regardless.
 
+**Two real gaps, found by the uku_service review 2026-08-04 (§ 0), both live
+here rather than in the auth phase:**
+
+- **The spec under-reports, so `.api-pending` can stall forever.** A route can be
+  served and omitted from the spec (`include_in_schema=False` — measured on
+  `/webhooks/events`). `check-api.sh` diffs pending entries against the spec
+  only, so an op production already serves would stay "pending" and
+  `release.sh` would refuse indefinitely. **Fix: probe pending ops live**, not
+  just against the snapshot.
+- **`op` facts cannot see silently-ignored features.** Sparse `fields=` and
+  `If-None-Match` are dropped rather than rejected by production — same method,
+  same path, 200 either way. No surface fact can distinguish that. **Fix: a
+  behavioural probe** asserting the feature actually took effect (a sparse
+  response really is sparse; a matching `If-None-Match` really yields 304).
+  Without it, the CLI can ship a feature that silently does nothing.
+
 **Scope note, so nobody files it as a hole.** `op` facts are `/api/v3/*`
 operations by construction — `SPEC_URL` is the api-v3 OpenAPI document
 (`check-api.sh:54`). OAuth lives on the Tornado app and is **not an API v3
@@ -1341,8 +1397,9 @@ dependency.
 `/.well-known/oauth-authorization-server` from the app base URL. `:8890` will
 404 forever — that is not a bug to work around, it is the wrong host.
 
-**The `client_id` must be pinned, and that is not a drift violation.** Device
-flow is to be allow-listed to first-party `client_id`s only (§ 0c), so this CLI
+**The `client_id` must be pinned, and that is not a drift violation.** *If* the
+recommended first-party allow-list is ever built (§ 0 — recommendation, not a
+ruling, and unscheduled), this CLI
 ships a fixed `client_id` and never calls `/oauth/register`. It reads as a
 violation of *"never assert facts about the server"* and is not: a `client_id`
 is a fact about the **client**, and a client's own identity cannot drift without

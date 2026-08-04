@@ -71,12 +71,28 @@ There are two different machine-generated truths, and you need both:
 
 | Question | Command | Can it be wrong? |
 |---|---|---|
-| What is **released** (live in production)? | `curl -s https://app.getuku.com/api/v3/openapi.json` | **No.** FastAPI generates it from the live router table at request time. |
+| What is **released** (live in production)? | `curl -s https://app.getuku.com/api/v3/openapi.json` | **Yes — it UNDER-reports.** See the box below. |
 | What is **built** (merged, maybe not deployed)? | `uku_service/CLAUDE/api/openapi.json` | Only by being stale — regenerate from a running dev server. |
 | What can a *user* do, semantically? | `curl -s https://app.getuku.com/api/v3/capabilities` — **⚠ 404 in production as of 2026-08-03; built, not yet released.** Until it deploys, read it from a local/staging server. | No — built from the same enforcement tables the API uses. Unauthenticated by design. |
 | Narrative, conventions, gotchas | `/api/v3/llms-full.txt`, `uku_service/CLAUDE/api/CLAUDE_API_V3.md` | **Yes.** Useful for intent; never authoritative for surface. |
 
+> ### ⚠ The spec UNDER-REPORTS. Absence from it is not proof of absence.
+>
+> An earlier revision of the table said the live spec "cannot be wrong". **That is false**, and it was this repo's own foundational assumption. Measured against production 2026-08-04:
+>
+> ```
+> GET /api/v3/webhooks/events   -> 503 {"error":{"code":"WEBHOOKS_COMING_SOON",...}}
+> GET /api/v3/nonexistent-xyz   -> 404
+> webhook paths in prod openapi.json -> 0
+> ```
+>
+> The 503 carries our own error envelope, so the app is answering — production serves a route its spec omits. Cause: `backend/api_v3/main.py:392` mounts the router with `include_in_schema=ApiV3Config.are_webhooks_enabled()`.
+>
+> **What this does and does not break.** The direction measured is under-reporting, and the ship gate stays *conservative* against it — it would refuse an op that actually works, never green-light one that 404s. So `check-api.sh` still fails safe. But two things follow: a `.api-pending` entry can sit there forever for an op production already serves, and "not in the spec" must never be reported as "not implemented". **Probe a pending op live before believing the spec about it.**
+
 **Built ≠ released, and the gap is real.** On 2026-08-03 production served **182 operations** while the repo had **217**. A CLI implemented against the repo would ship commands that 404 for every customer. Any drift tooling must distinguish the two and refuse to ship ahead of production.
+
+**A second class of drift `op` facts cannot see: silently-ignored features.** Sparse `fields=` and `If-None-Match` are built but not released. Production does not 404 them — FastAPI **drops unknown query params**, and an unrecognized `If-None-Match` simply yields no 304. Measured 2026-08-04: prod's spec declares `fields` on **0** operations, and `GET /api/v3/health?bogus_param_xyz=1` returns **200**. So a CLI built against them and pointed at production gets full 200 payloads while believing it is doing sparse fetches and cache revalidation. The path is identical, so `op METHOD /path` cannot catch it — **these need a behavioural probe, not a surface fact.**
 
 The `/capabilities` caveat above is that same trap, caught in this very file within minutes of writing it — the author asserted an endpoint existed because it existed in the repo, then measured production and found a 404. **Assume this file is stale about the API. Re-measure.** That is the whole point of the table: the commands are durable, the facts around them are not.
 
@@ -168,6 +184,14 @@ This is a *product decision* honestly disclosed in `SECURITY.md`, not an oversig
 
 No OAuth (see § Auth). No cursor-pagination follow (`meta.next_cursor` is passed through but never followed). No `/search`, `/capabilities`, `/teams`, `/workflow-templates`, `/reports/*`, `/mcp-usage`.
 
+> **⚠ `/reports/*` — do NOT surface `kpi-summary`'s task counts.** `tasks_done` and `tasks_overdue` are wrong *today*: `bi_report_service.get_kpi_summary` sums every `chart.task_status_timeline` row, and that chart carries duplicate periods and spans past the requested window (measured: 70 rows across 16 distinct periods on a 12-month request; 2025-12 appeared 7×). Two more are customer-disputable — `clv_total_revenue` inflates N× on any multi-month view (168.0 × 8 months → 1344.0), and AR aging buckets are **structurally always 0** when served from snapshots. A fourth, same class: `chart.by_client`/`by_member`/`by_topic` are **not unique per `(entity, period)`** — 124 of 240 `(person_id, period)` keys duplicated on a real 12-month merge — so any consumer must aggregate by `(entity_id, period)` before reading a value, and percentage fields cannot be summed at all.
+>
+> The hours / production / margin KPIs are sound. All eight defects: `uku_service/CLAUDE/bi/CLAUDE_BI.md` § Known Limitations, tracked on **UKU-821**.
+>
+> **Design `/reports/*` around `GET /api/v3/reports/bi/{shape}`** (headline / series / breakdown, flat rows — commit `6cc674d8ca`, built, not deployed). It reduces 245 MB of BI to ~1 KB and is purpose-built for this case. `kpi-summary` alone is the wrong foundation.
+
+> **⚠ C13 is sequenced behind UKU-850.** Replacing the hand-maintained `--describe` with live `/capabilities` is right, but `/capabilities` currently reports `read: false` for resources that *are* readable. Build on it before that lands and the CLI confidently tells agents they cannot read things they can — worse than the stale map it replaces.
+
 ### Process
 
 No CI — `bin/ci` is "run before you push", i.e. discipline, not a gate. The test suite **never scripts an HTTP 400** and covers 422 once, yet 400 is what the API returns for the commonest misconfiguration (`MISSING_COMPANY`). No shellcheck. `LICENSE` is MIT here while the sibling Python client declared Proprietary — settle it.
@@ -182,7 +206,7 @@ Why it matters: a pasted *integration* key is **tenant-wide** and can carry `adm
 
 **Be honest about the cost in bash:** PKCE S256 needs SHA-256 + base64url, the flow needs a loopback HTTP listener, and the token exchange needs JSON parsing — in a tool whose selling point is bash + curl with `jq` optional. Shelling out to `python3` is pragmatic but dents the zero-dependency claim. This is the single strongest argument for a rewrite; weigh it honestly rather than forcing it.
 
-### OAuth is NOT an API v3 feature — measured 2026-08-04
+### OAuth is NOT an API v3 feature — see `CLAUDE_API_V3.md` §2 and §18g
 
 It is the **Tornado app's**, and it **shipped 2026-07-23** for the claude.ai / Claude Desktop **MCP connector** (`CLAUDE_API_V3.md:421`). API v3 does not implement OAuth; it *accepts* the credential OAuth mints. Getting this backwards is what produced a day of wrong analysis in this repo — discovery 200s on `:8885`/`:8886` (app) and 404s on `:8890` (api-v3).
 
@@ -190,12 +214,14 @@ It is the **Tornado app's**, and it **shipped 2026-07-23** for the claude.ai / C
 
 Also true, all measured in `backend/handlers/oauth_handlers.py`:
 
-- **24h access token, 90d sliding refresh, rotation-on-use, reuse revokes the family.** `CLAUDE_API_V3.md:421` still calls these deferred and the key non-expiring — **that line is stale**; the code wins.
+- **24h access token, 90d sliding refresh, rotation-on-use, reuse revokes the family.** (§18g. An older §2 line called these deferred; that was corrected upstream 2026-08-04.)
 - **Keys minted before refresh shipped have `expires_at IS NULL`** and no refresh token. NULL means *no expiry*, never *expired*.
-- **Device flow does not exist.** Build the Go auth layer grant-agnostic so adding it is one branch. It will be allow-listed to first-party `client_id`s, so this CLI pins a `client_id` and never calls `/oauth/register` — not a drift violation, since a `client_id` is a fact about the *client* and endpoints still come from `.well-known`.
-- **`financials` cannot be requested but can be granted** via the consent checkbox. Read the granted scope from the token response, never from what was asked.
+- **`financials` cannot be requested but can be granted** via the consent checkbox. Read the granted scope from the token response, never from what was asked. Per §95 it then reads the **whole company's** money data, not the acting person's rows — so say that at consent time.
+- **Device flow does not exist**, and has no ticket, owner or schedule. Build the Go auth layer grant-agnostic so adding it is one branch.
 
-Production OAuth is blocked by a deploy and an nginx rule — `infra`'s to fix, filed, and irrelevant to what gets built here (staging serves discovery).
+> **⚠ Do not record the first-party `client_id` allow-list as a platform commitment.** It was the API team's *recommendation* for how device flow should work if built — **not a ruling**. Earlier revisions of this repo's docs stated it as decided; that was overreach. Pinning a `client_id` remains a sensible CLI-side choice, but nothing on the platform side is promised.
+
+Production OAuth is further out than "a deploy and an nginx rule" — **four** things block it: both `.well-known` documents 403 at the edge, there is no `/mcp` location, no upstream, and no `uku-mcp.service` at all. Tracked on **UKU-600**. Irrelevant to what gets built here (staging serves discovery), but do not tell anyone it is close.
 
 Also note the API now issues **refresh tokens** (24h access, 90d rotating refresh, with reuse detection that revokes the whole family). If you implement OAuth: persist the rotated pair atomically, never send a refresh token twice, and refuse to use a credential against an origin other than the one it was minted for.
 
