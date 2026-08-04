@@ -3804,6 +3804,33 @@ cmd_capabilities() {
   return 0
 }
 
+# ── release signing (Phase 1) ────────────────────────────────────────
+# The PUBLIC half of the release key. Public by design — it is here to be read.
+# Empty until `scripts/sign.sh --keygen` is run and the key pasted in; while it
+# is empty the chain falls back to checksum-only, exactly as before, and says so.
+UKU_RELEASE_PUBKEY="$(cat <<'EOKEY'
+EOKEY
+)"
+
+# _verify_sig FILE SIGFILE
+#   0  signature verifies
+#   1  signature is present and WRONG  → always fatal
+#   2  no key configured in this build  → fall back, loudly
+#   3  key configured but openssl missing → fatal; the operator opted into this
+_verify_sig() {
+  [ -n "${UKU_RELEASE_PUBKEY:-}" ] || return 2
+  have openssl || return 3
+  local pub="" sig=""
+  _mktemp pub; _mktemp sig
+  printf '%s\n' "$UKU_RELEASE_PUBKEY" > "$pub"
+  # Normalise then -A: `openssl base64 -d` cannot decode an UNWRAPPED single
+  # line, and -A cannot decode a wrapped one. Stripping newlines first makes
+  # both forms work, which matters because a signature may arrive either way.
+  tr -d '\n' < "$2" | openssl base64 -d -A -out "$sig" 2>/dev/null || return 1
+  openssl dgst -sha256 -verify "$pub" -signature "$sig" "$1" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 cmd_update() {
   local url="$UKU_INSTALL_URL"
   local self; self="$(command -v uku 2>/dev/null || printf '%s' "$0")"
@@ -3815,8 +3842,34 @@ cmd_update() {
   else
     warn "Updating uku (current $UKU_VERSION) → channel '$chan' (UNVERIFIED — no checksum), into $dir"
   fi
+  # C1/Phase 1: the installer is DOWNLOADED, VERIFIED, then run — never piped
+  # straight into a shell. Piping means the bytes are executing before anything
+  # has looked at them, and this is the one path that runs unattended.
+  local script="" sigf=""
+  _mktemp script
+  curl -fsSL "$url" -o "$script" || die "could not download the installer from $url" "$EX_NET"
+  [ -s "$script" ] || die "the installer at $url was empty — refusing to run it." "$EX_NET"
+
+  _mktemp sigf
+  local sig_rc=2
+  if curl -fsSL "$url.sig" -o "$sigf" 2>/dev/null && [ -s "$sigf" ]; then
+    # `_verify_sig …; rc=$?` would exit under set -e before the assignment ran.
+    sig_rc=0; _verify_sig "$script" "$sigf" || sig_rc=$?
+  else
+    # A missing signature is not "skip the check": an attacker who can swap the
+    # installer can also drop its signature. If this build carries a key, the
+    # absence is fatal.
+    [ -n "${UKU_RELEASE_PUBKEY:-}" ] && sig_rc=1
+  fi
+  case "$sig_rc" in
+    0) info "Installer signature verified." ;;
+    1) die "the installer at $url does NOT match its signature. Nothing has been run. This is what a tampered release looks like — do not retry, report it." "$EX_API" ;;
+    3) die "this build requires a signed installer, but openssl is not available to check it. Nothing has been run." "$EX_USAGE" ;;
+    *) warn "this build carries no release key, so the installer was checked by transport security alone." ;;
+  esac
+
   # pin the install dir to where uku already lives (no second binary, T11) + skip the sign-in re-prompt (N14)
-  UKU_BIN_DIR="$dir" UKU_SKIP_SETUP=1 UKU_NO_AUTO_UPDATE=1 UKU_CHANNEL="$chan" curl -fsSL "$url" | sh
+  UKU_BIN_DIR="$dir" UKU_SKIP_SETUP=1 UKU_NO_AUTO_UPDATE=1 UKU_CHANNEL="$chan" sh "$script"
 }
 
 # ── THE COMMAND SURFACE TABLE ────────────────────────────────────────

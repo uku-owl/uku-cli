@@ -40,6 +40,12 @@ set -eu
 # vanity redirect to this same file — the published one-liner never changes
 # even if this target does.
 DL_BASE="${UKU_BASE_URL_DL:-https://raw.githubusercontent.com/uku-owl/uku-cli}"
+
+# The PUBLIC half of the release key (Phase 1). Public by design. Empty until
+# `scripts/sign.sh --keygen` is run and the key pasted in here AND in bin/uku.
+UKU_RELEASE_PUBKEY="$(cat <<'EOKEY'
+EOKEY
+)"
 VERSION="${UKU_VERSION:-}"
 CHANNEL="${UKU_CHANNEL:-release}"
 # `UKU_VERSION=main` is the obvious thing to type for "give me main"; accept it
@@ -104,8 +110,8 @@ else BIN_DIR="$HOME/.local/bin"; fi
 mkdir -p "$BIN_DIR"
 TARGET="$BIN_DIR/uku"
 
-TMP="$(mktemp)"; SUM="$(mktemp)"
-trap 'rm -f "$TMP" "$SUM"' EXIT
+TMP="$(mktemp)"; SUM="$(mktemp)"; SIG="$(mktemp)"; PUB="$(mktemp)"; SIGBIN="$(mktemp)"
+trap 'rm -f "$TMP" "$SUM" "$SIG" "$PUB" "$SIGBIN"' EXIT
 
 # ── download ──────────────────────────────────────────────────────────
 if [ "$REF" = "main" ]; then step "Downloading uku from $(bold 'main')…"
@@ -130,6 +136,25 @@ if [ "$REQUIRE_SUM" = "1" ]; then
   [ -n "$SHA_CMD" ] || err "neither sha256sum nor shasum is available, so the download cannot be verified — refusing to install uku v$VERSION unverified. Install coreutils (or Perl's shasum), or opt into the unverified rolling channel with UKU_CHANNEL=main."
   DL "$SRC.sha256" > "$SUM" 2>/dev/null && [ -s "$SUM" ] \
     || err "no checksum published at $SRC.sha256 — refusing to install uku v$VERSION unverified. (An attacker who could swap the binary could also simply omit the checksum, so a missing one is treated as a failure, never as 'skip the check'.)"
+  # The checksum proves the bytes are the ones the repo published. The
+  # SIGNATURE proves the repo's publication was made by someone holding a key
+  # that does not live in the repo — the only step here a repo compromise does
+  # not defeat. Verified over the checksum file, which covers bin/uku through it.
+  if [ -n "$UKU_RELEASE_PUBKEY" ]; then
+    command -v openssl >/dev/null 2>&1 \
+      || err "this installer requires a signed release, and openssl is not available to check the signature. Refusing to install unverified."
+    printf '%s\n' "$UKU_RELEASE_PUBKEY" > "$PUB"
+    DL "$SRC.sha256.sig" > "$SIG" 2>/dev/null && [ -s "$SIG" ] \
+      || err "no signature published at $SRC.sha256.sig — refusing to install uku v$VERSION unverified. A missing signature is never 'skip the check': whoever could swap the artefact could also drop its signature."
+    # Normalise then -A: openssl cannot decode an unwrapped single line without
+    # it, nor a wrapped one with it. Stripping newlines makes both work.
+    tr -d '\n' < "$SIG" | openssl base64 -d -A -out "$SIGBIN" 2>/dev/null \
+      || err "the signature at $SRC.sha256.sig is not valid base64. Refusing to install."
+    openssl dgst -sha256 -verify "$PUB" -signature "$SIGBIN" "$SUM" >/dev/null 2>&1 \
+      || err "$(red 'Signature does NOT verify.') The checksum file was not signed by the Uku release key.
+  Nothing has been installed. Do not retry — report it: security@getuku.com"
+    info "Signature verified  $(dim 'release key')"
+  fi
   want="$(cut -d' ' -f1 < "$SUM" | tr -d '[:space:]')"
   got="$($SHA_CMD < "$TMP" | cut -d' ' -f1)"
   if [ "$want" != "$got" ]; then
