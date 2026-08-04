@@ -1203,3 +1203,120 @@ every phase.
 **Also done, beyond the original list:** C5, C7 (decided *not* to do, with
 reasons), C9, C10, C11, C14, and `uku health`. **Outstanding and needing a
 ruling rather than an implementation:** C6 (§ 5.3).
+
+---
+
+## 14. Appendix A — Phase 4 wire contract, measured 2026-08-04
+
+Read from router source + the **built** `uku_service/CLAUDE/api/openapi.json`, not
+from prose. None of these four endpoints is live: production still serves 182
+operations and 404s on all of them (re-measured 2026-08-04). This appendix exists
+so Phase 4 is transcription rather than research on the day it deploys — **nothing
+here has been implemented, and no `op` fact was added.**
+
+### A.0 Six findings that would have produced a wrong implementation
+
+1. **The spec's per-endpoint error lists are decoration.** `main.py:362-384`
+   attaches one shared `COMMON_RESPONSES` (`schemas/_common_responses.py:20-70`)
+   to *every* router, so `GET /capabilities` — dependency-free, unauthenticated —
+   is documented as returning 401/403/404/409/412/428, none of which its handler
+   (`capabilities.py:54-61`) can emit. **Generate error handling from the routers,
+   not from `responses{}`.**
+2. **Two unrelated 422s, and the spec documents the dead one.** The spec's
+   `HTTPValidationError` never occurs: `main.py:305` converts every
+   `RequestValidationError` into a **400 `VALIDATION_ERROR`**
+   (`exceptions.py:55-92`). The *live* 422 on complete/reopen is
+   `ApiError(code="VALIDATION_ERROR", status_code=422)`
+   (`task_service.py:1472-1476`, `1595-1599`) with the `ErrorResponse` shape.
+3. **`VALIDATION_ERROR` is the code at both 400 and 422.** The status is the only
+   discriminator — directly relevant to C6's taxonomy (§ 5.3).
+4. **⚠ Likely API bug — `/reopen`'s docstring is false.** It claims
+   (`task_service.py:1564-1565`) that reopening an already-in-progress *or new*
+   task is a no-op 200. The guard tests `status == STATUS_IN_PROGRESS` only
+   (`task_service.py:1589`), and `STATUS_NEW != STATUS_IN_PROGRESS`
+   (`constants.py:1038-1039`). Reopening a task in status `new` therefore mutates
+   it, writes activities and fires the `task.updated` webhook. The parity suite
+   seeds `status="in_progress"` throughout, so it never covers this.
+   **→ file against `uku_service`.**
+5. **`/capabilities` is not a route index.** `GET /mcp-usage` (`mcp_usage.py:24`)
+   appears nowhere in it; `reports/*` only inside `curated_tools`
+   (`server.py:2291`), never as an entity. Its own text concedes the OpenAPI doc
+   is "wider in places" (`server.py:2216-2223`). **C13 cannot be built on
+   `/capabilities` alone** — it would silently drop real routes.
+6. **⚠ `entities` reports `read: false` for readable resources.** The build loop
+   (`server.py:2343-2393`) hardcodes all four verbs false for anything in the
+   exclusion tables. `workflow-templates` sits only in the *write* exclusion
+   (`server.py:1886-1889`) yet renders fully false, as does `teams`
+   (`server.py:1576-1577`) — both have working REST routes. A CLI branching on
+   `entities[x].read` would conclude the resource does not exist.
+   **→ file against `uku_service`.**
+
+### A.1 `POST /tasks/{task_id}/complete` and `/reopen`
+
+Path param is **`{task_id}`**, not `{id}` (`tasks.py:213`, `247`). No body, no
+query params. Response `SingleResponse[TaskOut]` (`tasks.py:214`, `248`);
+`warnings` is present but never populated on these two — only `patch_task` emits
+them (`tasks.py:208`). Scope `write:tasks` (`tasks.py:239`, `267`) plus
+`require_active_subscription` and the Elite plan gate.
+
+Both are **idempotency-covered**: `^/api/v3/tasks/\d+/(?:complete|reopen)$`
+(`idempotency.py:104`). The Redis key includes the concrete path
+(`idempotency.py:221`), so complete and reopen never replay each other despite
+both having an empty body.
+
+Errors: 400 `VALIDATION_ERROR` (completion rules — custom fields, blocking
+dependencies, checklist, required time entry/topic; `_bo_bridge.py:61-68`),
+404 `NOT_FOUND`, 422 `VALIDATION_ERROR` (no active client), 403
+`FORBIDDEN`/`SUBSCRIPTION_READ_ONLY`/`PLAN_UPGRADE_REQUIRED`, 409 idempotency.
+**412/428 are unreachable** — neither handler calls `require_if_match`.
+Reopen has no completion-style 400.
+
+Side effects confirming C2 — `complete` sets `finished_at`, resets the "my later"
+tag, arms `finished`-trigger automations (`task_service.py:1491`), writes a
+`task_finished` activity tagged `source=api`, notifies assignees, auto-finishes
+the client-portal side when `is_cp`, and — when `auto_fill_task_duration` is on
+and the task has an estimation but no tracked time — **inserts a real TimeEntry**
+(`task_service.py:1436-1439`). Already-finished is a genuine no-op 200.
+
+**Asymmetries `reopen` does not undo:** the "my later" tag, and `cp_status` /
+`cp_finished_at` — a reopened task stays finished on the client portal
+(`task_service.py:1567-1569`). It also sends **no** notification, which the
+docstring does not mention.
+
+### A.2 `GET /search`
+
+`q` (required; **≥2 chars after strip**, else 400 — `search_service.py:180-186`),
+`category` (default `all`; `all|invoice|contact|supplier|contract|task|note`,
+`search_service.py:50` — **the spec carries no enum for it**), `client_id`
+(**required when `category=note`**, `search_service.py:198-204`), `limit`
+(`ge=1,le=20`, default 5, **per category**).
+
+Response `SingleResponse[SearchResults]` with **exactly six always-present keys**
+— `invoices, contacts, suppliers, contracts, tasks, notes`, each defaulting to
+`[]`, never absent (`schemas/search.py:77-85`). **No pagination, no cursor.**
+Without `financials` the `invoices` bucket is withheld whole, not partially
+(`search_service.py:212-217`). No `require_scope` call at all — any valid key.
+
+This confirms § 1.1: the overlap with the CLI's fan-out is **tasks alone**, so the
+union stands and substitution would drop clients.
+
+### A.3 `GET /capabilities`
+
+**Unauthenticated by design** — zero `Depends()` (`capabilities.py:54-60`), and
+the built spec carries no `security` key on the operation, unlike every other
+route. Still rate-limited, via the per-IP floor bucket (`rate_limit.py:82-108`),
+so a pre-login `uku capabilities` works.
+
+**Envelope differs from everything else:** a bare
+`JSONResponse({"data": ...})` with no `response_model` (`capabilities.py:61`) —
+**no `warnings` key, ever.** Keys of `data`: `how_to_use`, `company_timezone`,
+`entities`, `curated_tools`, `not_available`. `surface=rest|mcp`; the `mcp`
+rendering is pinned byte-for-byte by a backend test.
+
+### A.4 Worth a CLI follow-up once released
+
+`GET/POST/PATCH/DELETE /teams` · `/workflow-templates` + `/apply`, `/push`,
+`/tasks` · `GET /reports/time-summary`, `/reports/kpi-summary` ·
+`GET /mcp-usage` · `POST /tasks/bulk-action` ·
+`POST /invoices/{invoice_id}/mark-unpaid` (idempotency-covered alongside
+`mark-paid` and `send`).
