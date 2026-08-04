@@ -67,6 +67,31 @@ remaining roadmap (OAuth, signed cross-platform distribution, Windows) is exactl
 where bash is weakest, and every one of the eight bugs found on 2026-08-04 was a
 bash bug rather than a logic bug.
 
+### Session boundary — where this stood when work stopped, 2026-08-04
+
+The session ended deliberately, on the CTO's call, **because the OAuth picture
+changed late and it was wiser to restart with correct information than to build
+on a day-old misunderstanding.** Read this before anything else.
+
+**What changed, late in the day.** OAuth was found to be the **Tornado app's**,
+not API v3's — shipped 2026-07-23 for the claude.ai MCP connector. Everything
+written earlier that treated it as an API v3 feature was corrected or deleted in
+`b2ce9c0`. If you find a claim in this file that assumes otherwise, it is a
+survivor of that error: **delete it, do not reconcile it.**
+
+**The single most important new fact** is § 9.0 — under OAuth, `X-Uku-Company`
+is ignored and the tenant comes from the key row, so `--company` cannot mean
+what it means today. It needs a CTO ruling and a `.surface-breaking` line.
+
+**Five claims are out for review with the API/MCP agent** (listed in § 0.1). They
+touch § 9 only. **They do NOT block starting the rewrite** — auth is Phase 6, the
+last phase, and everything before it is unaffected. Start the Go work; fold the
+answers in when they arrive.
+
+**Do not re-do this session's work.** Phases 0–5 shipped and are pushed. The
+suite is the specification. The bash tree is not the thing being replaced piece
+by piece — it is the reference the Go binary must satisfy.
+
 ### What the rewrite inherits, and what it must honour
 
 | | |
@@ -186,6 +211,28 @@ is where this CLI tests). Detail in § 0.1.
 | **Local dev API key** | `api_key` id **184**, company 4, named "uku-cli-local-dev (delete me)", scopes read/write/admin/financials. Minted 2026-08-04 to verify Phase 4 against `127.0.0.1:8890`. Delete when done. |
 | **`reference/`** | Untracked in the working tree. Commit or remove. |
 | **nginx 403 on OAuth discovery** | Backport staging's `(acme-challenge\|oauth-)` whitelist to `infra/configs/nginx/includes/block-scanners.conf:45`. **That one line only** — staging's `uku.conf:405/843` bypass is staging-gate-specific and prod has no gate. Necessary but not sufficient: the OAuth handler is also committed-not-deployed. `infra/` is access-restricted — not ours to touch. Detail + measurements in § 0. |
+
+**Needs a CTO ruling — both are Phase 6, neither blocks starting:**
+
+| Decision | Why it cannot be defaulted |
+|---|---|
+| **`--company` under an OAuth credential** | The flag is currently meaningful; under OAuth the header is *ignored*, so passing it through would silently act on the wrong tenant (§ 9.0). Refusing it is a surface break needing `.surface-breaking`. There is no defensible "ignore it quietly" option. |
+| **`financials` over device flow** | If barred (the API team's recommendation), invoice and billing commands do not exist on that auth path — a capability regression against pasted keys (§ 9.1). |
+
+**Out for review with the API/MCP agent, 2026-08-04 — answers may revise § 9:**
+
+1. Is refusing `--company` under OAuth correct, or is there a legitimate
+   multi-company OAuth path this plan has missed?
+2. Is one credential genuinely bound to one company, fixed at the consent
+   picker?
+3. Does pinning a `client_id` (never calling `/oauth/register`) hold up once the
+   device-flow allow-list exists?
+4. `CLAUDE_API_V3.md:95` says a `financials`-granted personal key reads the
+   **whole company's** money data in company-only DAO mode, not the acting
+   person's rows. If so the CLI should say at consent time that this widens
+   blast radius beyond the person. Correct reading?
+5. `CLAUDE_API_V3.md:91` says `read` is never enforced. Is that the cause of
+   UKU-850's `read: false`, or unrelated?
 
 **Needs the API:**
 
